@@ -257,11 +257,11 @@ std::vector<std::vector<std::pair<double, double>>> Detect::clustering(const sen
     double x_lf = r * cos(angle);
     double y_lf = r * sin(angle);
 
-    // ===== HJ ADDED: Filter out points on vehicle body =====
-    if (isPointOnVehicle(x_lf, y_lf)) {
-      continue;
-    }
-    // ===== HJ ADDED END =====
+    // // ===== HJ ADDED: Filter out points on vehicle body =====
+    // if (isPointOnVehicle(x_lf, y_lf)) {
+    //   continue;
+    // }
+    // // ===== HJ ADDED END =====
 
     double z_lf = -T_.z();
     tf::Vector3 pt_lf(x_lf, y_lf, z_lf);
