@@ -5,7 +5,7 @@ import copy
 import numpy as np
 import os
 import json
-from typing import Tuple  # ===== HJ ADDED =====
+from typing import Tuple, List  # ===== HJ ADDED =====
 
 import rospy
 from rospkg import RosPack
@@ -22,6 +22,7 @@ from vel_planner.vel_planner import calc_vel_profile
 
 import trajectory_planning_helpers as tph
 import configparser
+from frenet_converter.frenet_converter import FrenetConverter  # ===== HJ ADDED =====
 
 
 try:
@@ -161,7 +162,10 @@ class StateMachine:
         self.cur_static_avoidance_wpnts = WaypointData('static_avoidance_planner', False)
         self.cur_start_wpnts = WaypointData('start_planner', False)
         # ===== HJ MODIFIED: Use static_avoidance_planner params for smart_static =====
-        self.cur_smart_static_avoidance_wpnts = WaypointData('static_avoidance_planner', False)
+        self.cur_smart_static_avoidance_wpnts = WaypointData('static_avoidance_planner', True)
+        self.smart_frenet_converter = None  # Frenet converter for Smart Static path (initialized on first waypoints)
+        self.smart_track_length = None  # Track length from Smart Frenet converter
+        self.smart_wpnt_dist = None  # Waypoint distance from Smart Frenet converter
         # ===== HJ MODIFIED END =====
 
 
@@ -334,11 +338,13 @@ class StateMachine:
         self.behavior_strategy_pub = rospy.Publisher("behavior_strategy", BehaviorStrategy, queue_size=1)
         self.trailing_marker_pub = rospy.Publisher("/state_machine/trailing_target", Marker, queue_size=10)
         self.overtaking_marker_pub = rospy.Publisher("/state_machine/overtaking_target", Marker, queue_size=10)
+        self.obstacles_in_interest_marker_pub = rospy.Publisher("/state_machine/obstacles_in_interest", MarkerArray, queue_size=10)  # ===== HJ ADDED =====
 
         self.loc_wpnt_pub = rospy.Publisher("local_waypoints", WpntArray, queue_size=1)
         self.vis_loc_wpnt_pub = rospy.Publisher("local_waypoints/markers", MarkerArray, queue_size=10)
         self.state_pub = rospy.Publisher("state_machine", String, queue_size=1)
         self.state_mrk = rospy.Publisher("/state_marker", Marker, queue_size=10)
+        self.state_wpnts_src_marker = rospy.Publisher("/state_wpnts_src_marker", Marker, queue_size=10)  # ===== HJ ADDED =====
         self.emergency_pub = rospy.Publisher("/emergency_marker", Marker, queue_size=5) # for low voltage
         self.ot_section_check_pub = rospy.Publisher("/ot_section_check", Bool, queue_size=1)
         if self.measuring:
@@ -400,6 +406,22 @@ class StateMachine:
         """Smart static avoidance waypoints from GB optimizer fixed path"""
         self.smart_static_wpnts = data  # ===== HJ ADDED: Store raw message for _check_latest_wpnts =====
         self.cur_smart_static_avoidance_wpnts.initialize_traj(data)
+
+        # Initialize Frenet converter on first waypoints (or if not yet initialized)
+        if self.smart_frenet_converter is None and len(data.wpnts) > 0:
+            # Extract X and Y coordinates separately
+            waypoints_x = np.array([wpnt.x_m for wpnt in data.wpnts])
+            waypoints_y = np.array([wpnt.y_m for wpnt in data.wpnts])
+
+            # Create Frenet converter
+            self.smart_frenet_converter = FrenetConverter(waypoints_x, waypoints_y)
+
+            # Store track length and waypoint distance
+            self.smart_track_length = self.smart_frenet_converter.raceline_length
+            self.smart_wpnt_dist = self.smart_frenet_converter.waypoints_distance_m
+
+            rospy.loginfo(f"[{self.name}] Smart Frenet converter initialized: "
+                         f"track_length={self.smart_track_length:.2f}m, wpnt_dist={self.smart_wpnt_dist:.3f}m")
 
     def smart_static_active_cb(self, data):
         """Flag from spliner: is smart static mode currently active?"""
@@ -889,12 +911,15 @@ class StateMachine:
 
                 if obs.is_static:
                     
-                    if not wpnts_data.is_closed and gap > max_gap:
+
+                    if not wpnts_data.is_closed and gap > max_gap:   # Closed Wpnts is Short!!
                         is_free = False
                         if closest_obs is None or min_gap > gap:
                             closest_obs = obs
                             min_gap = gap
-                    elif gap < max_horizon:
+
+
+                    elif gap < max_horizon: # main
                         obs_d = obs.d_center
                         # Get d wrt to mincurv from the overtaking line
                         ot_d = 0
@@ -1258,12 +1283,6 @@ class StateMachine:
         """Obtain the waypoints by fusing those obtained by spliner with the
         global ones.
         """
-        # ===== HJ ADDED: Safety check for current_position =====
-        if self.current_position is None:
-            rospy.logwarn_throttle(1.0, "[StateMachine] current_position is None in get_splini_wpts, returning GB waypoints")
-            return self.get_gb_wpts()
-        # ===== HJ ADDED END =====
-
         # splini_glob = self.cur_gb_wpnts.list.copy()
 
         # Handle wrapping
@@ -1273,16 +1292,15 @@ class StateMachine:
         else:
             wpnts = self.cur_avoidance_wpnts
 
-
         diff = np.linalg.norm(wpnts.array[:, 0:2] - self.current_position[:2], axis=1)
         min_idx = np.argmin(diff)
         avoidance_wpnts = wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
 
         if len(avoidance_wpnts) < self.n_loc_wpnts:
-            glb_start_idx = int(wpnts.list[-1].s_m / self.wpnt_dist) + 1
-            extra_wpnts = [self.cur_gb_wpnts.list[(glb_start_idx + i) % len(self.cur_gb_wpnts.list)] 
-                        for i in range(self.n_loc_wpnts - len(avoidance_wpnts))]
-
+            # Use helper function to get extra waypoints (Smart or GB based on flag)
+            last_s_m = wpnts.list[-1].s_m
+            num_needed = self.n_loc_wpnts - len(avoidance_wpnts)
+            extra_wpnts = self.get_extra_waypoints(last_s_m, num_needed)
             avoidance_wpnts.extend(extra_wpnts)
         # rospy.logwarn(f"WORK WELL {self.last_valid_avoidance_wpnts.wpnts[-1].s_m}")
         return avoidance_wpnts
@@ -1301,29 +1319,93 @@ class StateMachine:
             wpnts = self.cur_recovery_wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
 
             if len(wpnts) < self.n_loc_wpnts:
-                glb_start_idx = int(self.cur_recovery_wpnts.list[-1].s_m / self.wpnt_dist)
-                extra_wpnts = [self.cur_gb_wpnts.list[(glb_start_idx + i) % len(self.cur_gb_wpnts.list)] 
-                            for i in range(self.n_loc_wpnts - len(wpnts))]
-
+                # Use helper function to get extra waypoints (Smart or GB based on flag)
+                last_s_m = self.cur_recovery_wpnts.list[-1].s_m
+                num_needed = self.n_loc_wpnts - len(wpnts)
+                extra_wpnts = self.get_extra_waypoints(last_s_m, num_needed)
                 wpnts.extend(extra_wpnts)
             # rospy.logwarn(f"WORK WELL {self.last_valid_avoidance_wpnts.wpnts[-1].s_m}")
             return wpnts
 
+    # ===== HJ ADDED: Helper function for waypoint shortage =====
+    def get_extra_waypoints(self, last_s_m: float, num_needed: int) -> List[Wpnt]:
+        """
+        Get extra waypoints to fill shortage.
+
+        If smart_static_active: wrap within Smart Static path (using s_m matching)
+        Otherwise: fill with GB waypoints (original behavior)
+
+        Args:
+            last_s_m: GB Frenet s coordinate of last waypoint in current list
+            num_needed: Number of extra waypoints needed
+
+        Returns:
+            List of extra waypoints
+        """
+        if self.smart_static_active and self.cur_smart_static_avoidance_wpnts.is_init and self.smart_track_length is not None:
+            # Smart mode: find Smart waypoint with s_m closest to last_s_m
+            track_length = self.smart_track_length
+
+            # Find index of waypoint with s_m closest to last_s_m (considering closed-loop wrap-around)
+            s_diffs = []
+            for wpnt in self.cur_smart_static_avoidance_wpnts.list:
+                forward_diff = (wpnt.s_m - last_s_m) % track_length
+                backward_diff = (last_s_m - wpnt.s_m) % track_length
+                s_diffs.append(min(forward_diff, backward_diff))
+
+            start_idx = np.argmin(s_diffs)
+            num_smart = len(self.cur_smart_static_avoidance_wpnts.list)
+
+            # Extract waypoints with modulo wrap-around
+            extra = [self.cur_smart_static_avoidance_wpnts.list[(start_idx + i) % num_smart]
+                     for i in range(num_needed)]
+
+            rospy.logdebug(f"[{self.name}] Shortage filled with Smart waypoints: start_idx={start_idx}, num={num_needed}")
+        else:
+            # GB mode: original behavior
+            gb_start_idx = int(last_s_m / self.wpnt_dist) + 1
+            extra = [self.cur_gb_wpnts.list[(gb_start_idx + i) % len(self.cur_gb_wpnts.list)]
+                     for i in range(num_needed)]
+
+            rospy.logdebug(f"[{self.name}] Shortage filled with GB waypoints: start_idx={gb_start_idx}, num={num_needed}")
+
+        return extra
+    # ===== HJ ADDED END =====
+
     # ===== HJ ADDED: Get smart static avoidance waypoints =====
     def get_smart_static_wpts(self) -> WpntArray:
-        """Obtain waypoints from smart static avoidance fixed path."""
-        if self.cur_smart_static_avoidance_wpnts.is_init:
-            diff = np.linalg.norm(self.cur_smart_static_avoidance_wpnts.array[:, 0:2] - self.current_position[:2], axis=1)
-            min_idx = np.argmin(diff)
-            wpnts = self.cur_smart_static_avoidance_wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
+        """Obtain waypoints from smart static avoidance fixed path.
 
-            if len(wpnts) < self.n_loc_wpnts:
-                glb_start_idx = int(self.cur_smart_static_avoidance_wpnts.list[-1].s_m / self.wpnt_dist)
-                extra_wpnts = [self.cur_gb_wpnts.list[(glb_start_idx + i) % len(self.cur_gb_wpnts.list)]
-                            for i in range(self.n_loc_wpnts - len(wpnts))]
-                wpnts.extend(extra_wpnts)
+        Finds closest waypoint by s_m value (with closed-loop wrap-around), then uses modulo for extraction.
+        """
+        if self.cur_smart_static_avoidance_wpnts.is_init:
+            # Get track length from Frenet converter (initialized in callback)
+            if self.smart_track_length is None:
+                rospy.logwarn_throttle(1.0, f"[{self.name}] Smart Frenet converter not yet initialized, using fallback")
+                # Fallback to distance-based method
+                return self.get_smart_static_wpts_distance_based()
+
+            track_length = self.smart_track_length
+
+            # Find index of waypoint with s_m closest to cur_s (considering closed-loop wrap-around)
+            s_diffs = []
+            for wpnt in self.cur_smart_static_avoidance_wpnts.list:
+                # Calculate signed difference (forward direction)
+                forward_diff = (wpnt.s_m - self.cur_s) % track_length
+                # Calculate backward difference
+                backward_diff = (self.cur_s - wpnt.s_m) % track_length
+                # Take minimum absolute distance
+                s_diffs.append(min(forward_diff, backward_diff))
+
+            min_idx = np.argmin(s_diffs)
+            num_smart_wpnts = len(self.cur_smart_static_avoidance_wpnts.list)
+
+            # Use modulo to wrap around - pure Smart waypoints, no GB fallback!
+            wpnts = [self.cur_smart_static_avoidance_wpnts.list[(min_idx + i) % num_smart_wpnts]
+                     for i in range(self.n_loc_wpnts)]
 
             return wpnts
+
     # ===== HJ ADDED END =====
 
     def get_start_wpts(self) -> WpntArray:
@@ -1467,6 +1549,40 @@ class StateMachine:
             mrk.color.g = 1.0
             mrk.color.b = 1.0
         self.state_mrk.publish(mrk)
+
+        # ===== HJ ADDED: Publish waypoint source + battery voltage text marker =====
+        # Get waypoint source string (from transition result)
+        wpnt_src_str = str(self.local_wpnts_src).replace("StateType.", "")
+
+        # Format battery voltage
+        voltage_str = f"{self.cur_volt:.1f}V" if hasattr(self, 'cur_volt') else "~V"
+
+        # Center both lines to the same width (use longer string as reference)
+        max_len = max(len(wpnt_src_str), len(voltage_str))
+        # Add extra padding for better centering
+        padding = 4
+        wpnt_centered = wpnt_src_str.center(max_len + padding)
+        voltage_centered = voltage_str.center(max_len + padding)
+
+        # Text marker (black text, smaller) - waypoint source + battery voltage
+        text_mrk = Marker()
+        text_mrk.type = Marker.TEXT_VIEW_FACING
+        text_mrk.id = 2  # Different ID from sphere marker
+        text_mrk.header.frame_id = "map"
+        text_mrk.header.stamp = rospy.Time.now()
+        text_mrk.pose.position.x = self.x_viz
+        text_mrk.pose.position.y = self.y_viz
+        text_mrk.pose.position.z = 1.5  # Above the sphere
+        text_mrk.pose.orientation.w = 1
+        text_mrk.scale.z = 0.2  # Smaller text height
+        text_mrk.color.r = 0.0  # Black text
+        text_mrk.color.g = 0.0
+        text_mrk.color.b = 0.0
+        text_mrk.color.a = 1.0
+        text_mrk.text = f"{wpnt_centered}\n {voltage_centered}"  # Both centered
+
+        self.state_wpnts_src_marker.publish(text_mrk)
+        # ===== HJ ADDED END =====
 
     def publish_not_ready_marker(self):
         """Publishes a text marker that warn the user that the car is not ready to run"""

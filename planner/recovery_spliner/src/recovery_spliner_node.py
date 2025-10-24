@@ -5,7 +5,7 @@ from typing import List, Any, Tuple
 import rospy
 import numpy as np
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Bool
 from visualization_msgs.msg import Marker, MarkerArray
 from scipy.interpolate import InterpolatedUnivariateSpline as Spline
 from scipy.interpolate import BPoly
@@ -63,11 +63,30 @@ class ObstacleSpliner:
         self.from_bag = rospy.get_param("/from_bag", False)
         self.measuring = rospy.get_param("/measure", False)
         self.inflection_points = None
+
+        # ===== IY ADDED: Fixed path tracking =====
+        self.use_fixed_path = False
+        self.cur_s_fixed = 0
+        self.cur_d_fixed = 0
+        self.cur_vs_fixed = 0
+        self.fixed_path_wpnts = OTWpntArray()
+        self.has_fixed_path = False
+        # ===== IY ADD : RECOVERY - Fixed path specific converter =====
+        self.fixed_path_converter = None
+        # ===== IY ADD END =====
+        # ===== IY ADDED END =====
+
         # Subscribe to the topics
         rospy.Subscriber("/car_state/odom_frenet", Odometry, self.state_frenet_cb)
         rospy.Subscriber("/car_state/odom", Odometry, self.state_cb)
         rospy.Subscriber("/global_waypoints", WpntArray, self.gb_cb)
         rospy.Subscriber("/global_waypoints_scaled", WpntArray, self.gb_scaled_cb)
+
+        # ===== IY ADDED: Subscribe to fixed path frenet and smart_static_active =====
+        rospy.Subscriber("/car_state/odom_frenet_fixed", Odometry, self.state_frenet_fixed_cb)
+        rospy.Subscriber("/planner/avoidance/smart_static_active", Bool, self.smart_static_active_cb)
+        rospy.Subscriber("/planner/avoidance/smart_static_otwpnts", OTWpntArray, self.fixed_path_wpnts_cb)
+        # ===== IY ADDED END =====
 
         self.mrks_pub = rospy.Publisher("/planner/recovery/markers", MarkerArray, queue_size=10)
         self.recovery_wpnts_pub = rospy.Publisher("/planner/recovery/wpnts", WpntArray, queue_size=10)
@@ -92,6 +111,26 @@ class ObstacleSpliner:
         self.cur_s = data.pose.pose.position.x
         self.cur_d = data.pose.pose.position.y
         self.cur_vs = data.twist.twist.linear.x
+
+    # ===== IY ADDED: Callback for fixed path frenet coordinates =====
+    def state_frenet_fixed_cb(self, data: Odometry):
+        self.cur_s_fixed = data.pose.pose.position.x
+        self.cur_d_fixed = data.pose.pose.position.y
+        self.cur_vs_fixed = data.twist.twist.linear.x
+
+    def smart_static_active_cb(self, data: Bool):
+        self.use_fixed_path = data.data
+
+    def fixed_path_wpnts_cb(self, data: OTWpntArray):
+        self.fixed_path_wpnts = data
+        self.has_fixed_path = True
+        # ===== IY ADD : RECOVERY - Initialize fixed path converter =====
+        if len(data.wpnts) > 1:
+            fixed_path_xy = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+            self.fixed_path_converter = FrenetConverter(fixed_path_xy[:, 0], fixed_path_xy[:, 1])
+            rospy.loginfo_throttle(5.0, f"[{self.name}] Fixed path converter initialized with {len(data.wpnts)} waypoints")
+        # ===== IY ADD END =====
+    # ===== IY ADDED END =====
 
     def state_cb(self, data: Odometry):
         self.cur_x = data.pose.pose.position.x
@@ -177,8 +216,18 @@ class ObstacleSpliner:
         while not rospy.is_shutdown():
             if self.measuring:
                 start = time.perf_counter()
-            # Sample data
-            gb_scaled_wpnts = self.gb_scaled_wpnts.wpnts
+
+            # ===== IY MODIFIED: Use appropriate waypoints based on use_fixed_path flag =====
+            if self.use_fixed_path and self.has_fixed_path:
+                # Use fixed path waypoints
+                reference_wpnts = self.fixed_path_wpnts.wpnts
+                rospy.loginfo_throttle(2.0, f"[{self.name}] Using FIXED PATH for recovery ({len(reference_wpnts)} waypoints)")
+            else:
+                # Use GB path waypoints
+                reference_wpnts = self.gb_scaled_wpnts.wpnts
+                rospy.loginfo_throttle(2.0, f"[{self.name}] Using GB PATH for recovery ({len(reference_wpnts)} waypoints)")
+            # ===== IY MODIFIED END =====
+
             wpnts = WpntArray()
             mrks = MarkerArray()
 
@@ -188,7 +237,7 @@ class ObstacleSpliner:
             mrks.markers.append(del_mrk)
             self.mrks_pub.publish(mrks)
 
-            wpnts, mrks = self.do_spline(gb_wpnts=gb_scaled_wpnts)
+            wpnts, mrks = self.do_spline(gb_wpnts=reference_wpnts)
 
             # Publish wpnts and markers
             if self.measuring:
@@ -264,26 +313,66 @@ class ObstacleSpliner:
         mrks = MarkerArray()
         wpnts = WpntArray()
 
+        # ===== IY ADD : RECOVERY - Safety check for empty waypoints =====
+        if len(gb_wpnts) < 2:
+            rospy.logwarn_throttle(2.0, f"[{self.name}] Not enough waypoints for recovery ({len(gb_wpnts)} < 2)")
+            return wpnts, mrks
+        # ===== IY ADD END =====
+
         # Get spacing between wpnts for rough approximations
         wpnt_dist = gb_wpnts[1].s_m - gb_wpnts[0].s_m
-        
-        cur_s = self.cur_s
-        cur_d = self.cur_d
+
+        # ===== IY ADD : RECOVERY - Use actual length for fixed path mode =====
+        if self.use_fixed_path:
+            ref_max_idx = len(gb_wpnts)  # 배열 길이를 사용 (모듈로 연산용)
+            rospy.loginfo_throttle(5.0, f"[{self.name}] Fixed path ref_max_idx: {ref_max_idx}")
+        else:
+            ref_max_idx = self.gb_max_idx
+
+        # 안전 체크
+        if ref_max_idx <= 0:
+            rospy.logwarn_throttle(2.0, f"[{self.name}] Invalid ref_max_idx: {ref_max_idx}")
+            return wpnts, mrks
+        # ===== IY ADD END =====
+
+        # ===== IY MODIFIED: Use appropriate frenet coordinates based on use_fixed_path flag =====
+        if self.use_fixed_path:
+            cur_s = self.cur_s_fixed
+            cur_d = self.cur_d_fixed
+        else:
+            cur_s = self.cur_s
+            cur_d = self.cur_d
+        # ===== IY MODIFIED END =====
         cur_s_idx = int(cur_s / wpnt_dist)
 
-        if len(self.inflection_points) != 0:
+        # ===== IY MODIFIED : RECOVERY - Fixed path에서는 inflection points를 사용하지 않음 =====
+        if self.use_fixed_path:
+            # Fixed path는 GB와 다른 형태이므로 inflection points 사용 안 함
+            candidate_len = int(ref_max_idx / 2)
+            rospy.loginfo_throttle(5.0, f"[{self.name}] Fixed path candidate_len: {candidate_len}")
+        elif len(self.inflection_points) != 0:
             infl_sector_idx = np.searchsorted(self.inflection_points, cur_s_idx)
 
             next_infl_sector_idx = self.inflection_points[(infl_sector_idx)%len(self.inflection_points)]
 
-            candidate_len = next_infl_sector_idx - cur_s_idx + self.gb_max_idx if infl_sector_idx == len(self.inflection_points) \
+            candidate_len = next_infl_sector_idx - cur_s_idx + ref_max_idx if infl_sector_idx == len(self.inflection_points) \
                                                                                 else next_infl_sector_idx - cur_s_idx
         else:
-            candidate_len = int(self.gb_max_idx/2)
-        
+            candidate_len = int(ref_max_idx/2)
+        # ===== IY MODIFIED END =====
+
         candidate_len = max(candidate_len, self.min_candidates_lookahead_n)
 
-        gb_idxs = [(cur_s_idx + i) % self.gb_max_idx for i in range(candidate_len)]
+        # ===== IY ADD : RECOVERY - Use ref_max_idx instead of gb_max_idx =====
+        gb_idxs = [(cur_s_idx + i) % ref_max_idx for i in range(candidate_len)]
+
+        # 안전 체크: 생성된 인덱스가 실제 배열 범위 내에 있는지 확인
+        max_available_idx = len(gb_wpnts) - 1
+        if any(idx > max_available_idx for idx in gb_idxs):
+            rospy.logwarn_throttle(2.0, f"[{self.name}] Index out of bounds! max_idx={max_available_idx}, ref_max_idx={ref_max_idx}")
+            # 인덱스를 안전한 범위로 제한
+            gb_idxs = [min(idx, max_available_idx) for idx in gb_idxs]
+        # ===== IY ADD END =====
 
         num_kappas_ = min(self.num_kappas, self.min_candidates_lookahead_n)
         kappas = np.array([gb_wpnts[gb_idx].kappa_radpm for gb_idx in gb_idxs[:num_kappas_]])
@@ -363,18 +452,33 @@ class ObstacleSpliner:
 
 
         # if samples.shape[0] < self.n_loc_wpnts:
+        # ===== IY ADD : RECOVERY - Use ref_max_idx instead of gb_max_idx =====
         n_additional = 80
         xy_additional = np.array([
             (
-                gb_wpnts[(tangent_idx + cur_s_idx + i + 1) % self.gb_max_idx].x_m,
-                gb_wpnts[(tangent_idx + cur_s_idx + i + 1) % self.gb_max_idx].y_m
+                gb_wpnts[(tangent_idx + cur_s_idx + i + 1) % ref_max_idx].x_m,
+                gb_wpnts[(tangent_idx + cur_s_idx + i + 1) % ref_max_idx].y_m
             )
             for i in range(n_additional)
         ])
+        # ===== IY ADD END =====
 
         samples = np.vstack([samples, xy_additional])
 
+        # # ===== IY ADD : RECOVERY - Use fixed path converter when in fixed path mode =====
+        # if self.use_fixed_path and self.fixed_path_converter is not None:
+        #     s_, d_ = self.fixed_path_converter.get_frenet(samples[:, 0], samples[:, 1])
+        #     rospy.loginfo_throttle(5.0, f"[{self.name}] Using fixed_path_converter for Frenet transformation")
+        # else:
+        #     s_, d_ = self.converter.get_frenet(samples[:, 0], samples[:, 1])
+        # # ===== IY ADD END =====
+
+        # ===== HJ MODIFIED: ALWAYS use GB converter for Frenet coordinates =====
+        # Recovery waypoints should always have s, d in GB Frenet coordinates
+        # regardless of whether we're in Smart mode or GB mode
         s_, d_ = self.converter.get_frenet(samples[:, 0], samples[:, 1])
+        rospy.loginfo_throttle(5.0, f"[{self.name}] Using GB converter for Frenet (use_fixed_path={self.use_fixed_path})")
+        # ===== HJ MODIFIED END =====
 
         psi_, kappa_ = tph.calc_head_curv_num.\
             calc_head_curv_num(
@@ -383,11 +487,13 @@ class ObstacleSpliner:
                 is_closed=False
             )
 
-        
+
         danger_flag = False
         for i in range(samples.shape[0]):
-            gb_wpnt_i = int((s_[i] / wpnt_dist) % self.gb_max_idx)
-            
+            # ===== IY ADD : RECOVERY - Use ref_max_idx instead of gb_max_idx =====
+            gb_wpnt_i = int((s_[i] / wpnt_dist) % ref_max_idx)
+            # ===== IY ADD END =====
+
             inside = self.map_filter.is_point_inside(samples[i, 0], samples[i, 1])
             if not inside:
                 rospy.loginfo_throttle_identical(
@@ -405,7 +511,7 @@ class ObstacleSpliner:
         # Fill the rest of OTWpnts
         wpnts.header.stamp = rospy.Time.now()
         wpnts.header.frame_id = "map"
-        
+
         if danger_flag:
             wpnts.wpnts = []
             mrks.markers = []
