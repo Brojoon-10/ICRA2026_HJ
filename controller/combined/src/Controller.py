@@ -511,18 +511,31 @@ class Controller:
     def calc_future_lateral_error_norm(self):
         """
         Calculates future lateral error
- 
+
         Returns:
            future lat_e_norm: normalization of the future lateral error
            future lateral_error: future distance from car's position to nearest waypoint
         """
+        # ===== HJ ADDED: NaN safety check =====
+        if np.any(np.isnan(self.future_position)):
+            rospy.logwarn_throttle(1.0, "[Controller] NaN in future_position, returning 0 for lateral error norm")
+            return 0.0, 0.0
+        # ===== HJ ADDED END =====
+
         future_position = self.future_position[0, :2]
         idx_future_local_wpnts = self.nearest_waypoint(future_position, self.waypoint_array_in_map[:, :2])
-        future_local_wpnts_d = abs(self.waypoint_array_in_map[idx_future_local_wpnts,8])
-        future_potision_s, future_position_d = self.converter.get_frenet([self.future_position[0,0]],[self.future_position[0,1]])
-        future_position_d = abs(future_position_d[0])
-        future_lat_err = future_position_d - future_local_wpnts_d
- 
+        # ===== HJ MODIFIED: Use signed d values, take abs() of difference =====
+        future_local_wpnts_d = self.waypoint_array_in_map[idx_future_local_wpnts,8]  # Keep sign
+
+        try:
+            future_potision_s, future_position_d = self.converter.get_frenet([self.future_position[0,0]],[self.future_position[0,1]])
+            future_position_d = future_position_d[0]  # Keep sign
+            future_lat_err = abs(future_position_d - future_local_wpnts_d)  # Distance between car and waypoint
+        except (ValueError, Exception) as e:
+            rospy.logwarn_throttle(1.0, f"[Controller] Frenet conversion failed: {e}, returning 0 for lateral error norm")
+            return 0.0, 0.0
+        # ===== HJ MODIFIED END =====
+
         max_lat_e = 1
         min_lat_e = 0.
         lat_e_clip = np.clip(future_lat_err, a_min=min_lat_e, a_max=max_lat_e)
@@ -644,30 +657,34 @@ class Controller:
         
         # 1. Compute geometric slip angle (basic model)
         beta_model = np.arctan((L_r / (L_f + L_r)) * np.tan(delta))
- 
+
+        # ===== HJ MODIFIED: Use model-based prediction only (no IMU fusion) =====
         # 2. Estimate slip angle indirectly using IMU yaw rate data
-        if abs(v) > 2.0:
-            # If speed is sufficient, estimate slip angle from IMU yaw rate
-            beta_imu = np.arcsin(np.clip(((L_f + L_r) * self.yaw_rate / v), -1.0, 1.0))
-        else:
-            beta_imu = beta_model  # Maintain basic model when speed is very low
- 
+        # if abs(v) > 2.0:
+        #     # If speed is sufficient, estimate slip angle from IMU yaw rate
+        #     beta_imu = np.arcsin(np.clip(((L_f + L_r) * self.yaw_rate / v), -1.0, 1.0))
+        # else:
+        #     beta_imu = beta_model  # Maintain basic model when speed is very low
+
         # 3. Fuse the geometric and IMU-based slip angles using weighted average
-        lambda_weight = 1.0
-        beta_fused = lambda_weight * beta_model + (1 - lambda_weight) * beta_imu
- 
+        # lambda_weight = 1.0
+        # beta_fused = lambda_weight * beta_model + (1 - lambda_weight) * beta_imu
+        beta_fused = beta_model  # Use model-based only
+
         # 4. Predict future position using the fused slip angle
         future_x = x_current + v * np.cos(psi_current + beta_fused) * T
         future_y = y_current + v * np.sin(psi_current + beta_fused) * T
- 
+
         # 5. Predict future heading:
         # Option A: Model-based prediction
         future_psi_model = psi_current + (v / (L_f + L_r)) * np.sin(beta_fused) * T
         # Option B: IMU-based prediction
-        future_psi_imu = psi_current + self.yaw_rate * T
+        # future_psi_imu = psi_current + self.yaw_rate * T
         # Fuse the two heading predictions using a weighted average
-        gamma_weight = 1.0
-        future_psi = gamma_weight * future_psi_model + (1 - gamma_weight) * future_psi_imu
+        # gamma_weight = 1.0
+        # future_psi = gamma_weight * future_psi_model + (1 - gamma_weight) * future_psi_imu
+        future_psi = future_psi_model  # Use model-based only
+        # ===== HJ MODIFIED END =====
         # Normalize heading to the range [-pi, pi]
         future_psi = np.arctan2(np.sin(future_psi), np.cos(future_psi))
         

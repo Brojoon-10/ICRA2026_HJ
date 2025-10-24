@@ -78,9 +78,12 @@ class GridFilter:
                 rospy.logerr(f"Failed to load image from {png_path}")
                 return False
 
-            # Convert to 0-255 scale (255: free, 0: occupied)
-            # Assuming PNG is already in correct format (white=free, black=occupied)
-            self.image = loaded_image
+            # ===== HJ MODIFIED: Flip Y-axis to match ROS coordinate system =====
+            # PNG images are in image coordinates (top-down)
+            # ROS OccupancyGrid is in ROS coordinates (bottom-up)
+            # Flip to match the coordinate system used by map_callback
+            self.image = cv2.flip(loaded_image, 0)
+            # ===== HJ MODIFIED END =====
 
             if self.debug:
                 cv2.imshow("Loaded Map from File", self.image)
