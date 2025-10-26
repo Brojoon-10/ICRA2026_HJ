@@ -159,6 +159,7 @@ class ObstacleSpliner:
 
         # Load GB optimizer parameters (loaded from global_planner_params.yaml in launch file)
         self.safety_width = rospy.get_param('~safety_width', 1.2)  # [m] safety width for GB optimizer
+        self.safety_width = 0.8
         # ===== HJ EDITED END =====
 
         # Subscribe to the topics
@@ -1996,6 +1997,25 @@ class ObstacleSpliner:
             bound_r_m = self._pixels_to_meters(bound_r_pixels, map_resolution, map_origin_x, map_origin_y, map_height)
             bound_l_m = self._pixels_to_meters(bound_l_pixels, map_resolution, map_origin_x, map_origin_y, map_height)
 
+            # ===== HJ ADDED: Interpolate centerline for uniform spacing =====
+            # Skeleton gives uneven spacing (~0.05m avg), interpolate to uniform stepsize
+            # Adjust centerline_stepsize for speed vs accuracy tradeoff:
+            #   0.1m = Global planner default (accurate, slower)
+            #   0.3m = 3x faster (recommended for real-time)
+            #   0.5m = 5x faster (speed priority)
+            from global_racetrajectory_optimization import helper_funcs_glob
+
+            centerline_stepsize = 0.1  # meters - ADJUST THIS VALUE
+
+            original_count = centerline_m.shape[0]
+            centerline_tmp = np.column_stack((centerline_m, np.zeros((centerline_m.shape[0], 2))))
+            centerline_m_int = helper_funcs_glob.src.interp_track.interp_track(
+                reftrack=centerline_tmp, stepsize_approx=centerline_stepsize
+            )
+            centerline_m = centerline_m_int[:, :2]  # Extract x, y only
+            rospy.loginfo(f"[{self.name}] Centerline interpolated: {original_count} → {centerline_m.shape[0]} points (stepsize={centerline_stepsize}m)")
+            # ===== HJ ADDED END =====
+
             # ===== HJ ADDED: Validate and correct centerline direction (same as global_planner_node.py) =====
             # Compare centerline direction with GB raceline direction at the same XY location
             # ===== HJ MODIFIED: Use signed area to determine direction (more robust for closed loops) =====
@@ -2150,7 +2170,7 @@ class ObstacleSpliner:
 
             # Replace the entire optim_opts_mincurv dictionary with tighter settings
             # This is more robust than trying to replace individual values
-            replacement = 'optim_opts_mincurv={"width_opt": 0.8,\n                    "iqp_iters_min": 15,\n                    "iqp_curverror_allowed": 0.01}'
+            replacement = 'optim_opts_mincurv={"width_opt": 0.8,\n                    "iqp_iters_min": 5,\n                    "iqp_curverror_allowed": 0.05}'
 
             ini_content_modified = re.sub(
                 r'optim_opts_mincurv=\{[^}]+\}',
@@ -2163,6 +2183,32 @@ class ObstacleSpliner:
             modified_match = re.search(r'optim_opts_mincurv=\{[^}]+\}', ini_content_modified, re.DOTALL)
             if modified_match:
                 rospy.loginfo(f"[{self.name}] AFTER: {modified_match.group()}")
+
+            # ===== HJ ADDED: Modify additional parameters for faster optimization =====
+            # Modify stepsize_opts for faster internal processing
+            # stepsize_prep: 0.05 → 0.1 (spline fitting 2x faster)
+            # stepsize_reg: 0.2 → 0.3 (optimization 1.5x faster)
+            # stepsize_interp_after_opt: 0.1 (keep for 10cm waypoint spacing)
+            stepsize_replacement = 'stepsize_opts={"stepsize_prep": 0.3,\n               "stepsize_reg": 0.3,\n               "stepsize_interp_after_opt": 0.1}'
+            ini_content_modified = re.sub(
+                r'stepsize_opts=\{[^}]+\}',
+                stepsize_replacement,
+                ini_content_modified,
+                flags=re.DOTALL
+            )
+
+            # NOTE: curv_calc_opts modification not needed - only used in mintime optimization
+            # We use mincurv_iqp which uses analytical curvature calculation (calc_head_curv_an)
+            # curv_replacement = 'curv_calc_opts = {"d_preview_curv": 1.0,\n                  "d_review_curv": 1.0,\n                  "d_preview_head": 0.5,\n                  "d_review_head": 0.5}'
+            # ini_content_modified = re.sub(
+            #     r'curv_calc_opts\s*=\s*\{[^}]+\}',
+            #     curv_replacement,
+            #     ini_content_modified,
+            #     flags=re.DOTALL
+            # )
+
+            rospy.loginfo(f"[{self.name}] Modified stepsize_opts for faster optimization")
+            # ===== HJ ADDED END =====
 
             # Write modified content back
             with open(temp_ini, 'w') as f:
@@ -2290,8 +2336,8 @@ class ObstacleSpliner:
         2. Drawing 0.4m thick line from circle to nearest wall (black pixel)
 
         NEW LOGIC (HJ):
-        - If nearest wall distance < 1.5m: Connect to nearest wall (any direction)
-        - If nearest wall distance >= 1.5m: Connect to closer GB boundary (left or right)
+        - If nearest wall distance < 2.0m: Connect to nearest wall (any direction)
+        - If nearest wall distance >= 2.0m: Connect to closer GB boundary (left or right)
 
         Args:
             bw: Binary image (255=free, 0=occupied)
@@ -2315,7 +2361,7 @@ class ObstacleSpliner:
         line_thickness_px = max(1, int(line_thickness_m / map_resolution))
 
         # ===== HJ ADDED: Load GB raceline boundaries for smart connection =====
-        WALL_CONNECTION_THRESHOLD = 1.5  # meters - threshold for smart boundary connection
+        WALL_CONNECTION_THRESHOLD = 2.0  # meters - threshold for smart boundary connection
         bound_r_original, bound_l_original = self._get_original_wall_boundaries()
         use_gb_boundaries = (bound_r_original is not None and bound_l_original is not None)
 
