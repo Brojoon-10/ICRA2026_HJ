@@ -9,7 +9,10 @@
 
 # speed_to_erpm_gain: 3017.79 # 2700.79
 # speed_to_erpm_gain: 3050.79 # 2700.79
-speed_to_erpm_gain: 3041.95 # 2700.79
+
+# speed_to_erpm_gain: 3041.95 # 2700.79
+speed_to_erpm_gain: 3447.54 # 2700.79
+
 speed_to_erpm_offset: 0.0
 
 tachometer_ticks_to_meters_gain: 0.00225
