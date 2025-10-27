@@ -28,6 +28,26 @@ from grid_filter.grid_filter import GridFilter
 import trajectory_planning_helpers as tph
 from rospkg import RosPack
 
+# ===== HJ ADDED: Optimization algorithm selection =====
+OPT_ALGORITHM_CHANGE = True  # True: GB-aware algorithm (check opposite space), False: Original centerline algorithm
+
+# GB-aware algorithm parameters
+OPPOSITE_SPACE_THRESHOLD = 1.0  # meters, if opposite wall has > this space, shift toward it
+
+# Safety width override
+OVERRIDE_SAFETY_WIDTH = True  # True: use SAFETY_WIDTH_VALUE, False: use ROS parameter
+SAFETY_WIDTH_VALUE = 1.0  # meters, used only if OVERRIDE_SAFETY_WIDTH is True
+# ===== HJ ADDED END =====
+
+# GB optimizer speed tuning parameters
+OPT_WIDTH_OPT = 0.8  # Optimization width factor (lower = faster, less aggressive)
+OPT_IQP_ITERS_MIN = 5  # Minimum IQP iterations (lower = faster, less precise)
+OPT_IQP_CURVERROR_ALLOWED = 0.05  # Allowed curvature error (higher = faster, less smooth) #--Very Important--#
+
+OPT_STEPSIZE_PREP = 0.3  # Spline fitting step size in meters (higher = faster)  #--Very Important--#
+OPT_STEPSIZE_REG = 0.3  # Optimization step size in meters (higher = faster)
+OPT_STEPSIZE_INTERP = 0.1  # Final interpolation step size in meters (waypoint spacing)
+
 # Add GB optimizer path to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../gb_optimizer/src'))
 from global_racetrajectory_optimization.trajectory_optimizer import trajectory_optimizer
@@ -56,7 +76,6 @@ class ObstacleSpliner:
     # This affects both do_spline and _generate_fixed_path waypoint s,d coordinates
 
     USE_FIXED_PATH_FRENET = True
-    # USE_FIXED_PATH_FRENET = False
 
     # ===== HJ ADDED END =====
 
@@ -173,9 +192,14 @@ class ObstacleSpliner:
         )
 
         # Load GB optimizer parameters (loaded from global_planner_params.yaml in launch file)
-        self.safety_width = rospy.get_param('~safety_width', 1.2)  # [m] safety width for GB optimizer
-        # self.safety_width = 0.8
-        # ===== HJ EDITED END =====
+        # ===== HJ MODIFIED: Allow global override of safety_width =====
+        if OVERRIDE_SAFETY_WIDTH:
+            self.safety_width = SAFETY_WIDTH_VALUE
+            rospy.logwarn(f"[{self.name}] OVERRIDE_SAFETY_WIDTH=True → Using safety_width={SAFETY_WIDTH_VALUE}m (ignoring ROS param)")
+        else:
+            self.safety_width = rospy.get_param('~safety_width', 1.2)  # [m] safety width for GB optimizer
+            rospy.loginfo(f"[{self.name}] Using ROS parameter safety_width={self.safety_width}m")
+        # ===== HJ MODIFIED END =====
 
         # Subscribe to the topics
         # ===== HJ EDITED START: Subscribe to tracking obstacles for smart static avoidance =====
@@ -2589,6 +2613,67 @@ class ObstacleSpliner:
 
         return shifted_centerline
 
+    def _decide_obstacle_strategy_gb_aware(
+        self,
+        obs_s: float,
+        obs_d: float,
+        obs_radius: float
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Decide obstacle handling strategy based on GB raceline waypoint properties.
+
+        Check opposite wall clearance:
+        - If opposite side has space: add obstacle to original side boundary, shift centerline away
+        - If opposite side no space: add obstacle to opposite boundary, shift centerline toward obstacle side
+
+        Args:
+            obs_s: Obstacle GB Frenet s coordinate
+            obs_d: Obstacle GB Frenet d coordinate (positive=left, negative=right)
+            obs_radius: Obstacle radius
+
+        Returns:
+            (bound_side, shift_direction) tuple
+            - bound_side: 'left' or 'right' (which boundary to add obstacle)
+            - shift_direction: 'left' or 'right' (centerline shift direction)
+        """
+        # 1. Find GB waypoint at obs_s
+        if self.gb_wpnts.wpnts is None or len(self.gb_wpnts.wpnts) == 0:
+            rospy.logwarn(f"[{self.name}] GB waypoints not available, falling back to default")
+            # Fallback: add to original side, shift to opposite
+            if obs_d > 0:
+                return ('left', 'right')
+            else:
+                return ('right', 'left')
+
+        # Find waypoint index from s coordinate
+        wpnt_dist = self.gb_wpnts.wpnts[1].s_m - self.gb_wpnts.wpnts[0].s_m
+        obs_s_idx = int(obs_s / wpnt_dist) % len(self.gb_wpnts.wpnts)
+        gb_wp = self.gb_wpnts.wpnts[obs_s_idx]
+
+        # 2. Handle based on obstacle side (left: d>0, right: d<0)
+        if obs_d > 0:  # Obstacle on left
+            opposite_space = gb_wp.d_right  # Distance to right wall
+
+            if opposite_space > OPPOSITE_SPACE_THRESHOLD:
+                # Right side has space → add to left bound, shift centerline right
+                rospy.loginfo(f"[{self.name}]   GB-aware: obs left, d_right={opposite_space:.2f}m > {OPPOSITE_SPACE_THRESHOLD}m → left bound, shift right")
+                return ('left', 'right')
+            else:
+                # Right side no space → add to right bound, shift centerline left
+                rospy.loginfo(f"[{self.name}]   GB-aware: obs left, d_right={opposite_space:.2f}m <= {OPPOSITE_SPACE_THRESHOLD}m → right bound, shift left")
+                return ('right', 'left')
+        else:  # Obstacle on right
+            opposite_space = gb_wp.d_left  # Distance to left wall
+
+            if opposite_space > OPPOSITE_SPACE_THRESHOLD:
+                # Left side has space → add to right bound, shift centerline left
+                rospy.loginfo(f"[{self.name}]   GB-aware: obs right, d_left={opposite_space:.2f}m > {OPPOSITE_SPACE_THRESHOLD}m → right bound, shift left")
+                return ('right', 'left')
+            else:
+                # Left side no space → add to left bound, shift centerline right
+                rospy.loginfo(f"[{self.name}]   GB-aware: obs right, d_left={opposite_space:.2f}m <= {OPPOSITE_SPACE_THRESHOLD}m → left bound, shift right")
+                return ('left', 'right')
+
     def _generate_spline_for_obstacle(
         self,
         centerline_original: np.ndarray,
@@ -2791,24 +2876,55 @@ class ObstacleSpliner:
             for i, (obs_pos, obs_radius) in enumerate(obstacles):
                 rospy.loginfo(f"[{self.name}] Processing obstacle {i+1}/{len(obstacles)}: pos={obs_pos}, r={obs_radius:.2f}m")
 
-                # Detect which side obstacle is on (using ORIGINAL centerline)
-                side, closest_idx, dist = self._detect_obstacle_side(obs_pos, centerline_original)
-                rospy.loginfo(f"[{self.name}]   Obstacle is on {side} side (dist={dist:.2f}m, idx={closest_idx})")
-
                 # Convert obstacle to centerline Frenet coordinates
                 obs_s_array, obs_d_array = centerline_converter.get_frenet(
                     np.array([obs_pos[0]]),
                     np.array([obs_pos[1]])
                 )
-                obs_s = float(obs_s_array[0])
-                obs_d = float(obs_d_array[0])
+                obs_s_centerline = float(obs_s_array[0])
+                obs_d_centerline = float(obs_d_array[0])
 
-                # Calculate clearance (d 방향 여유)
-                clearance = abs(obs_d) - obs_radius
-                rospy.loginfo(f"[{self.name}]   Centerline Frenet: s={obs_s:.2f}m, d={obs_d:.2f}m, clearance={clearance:.2f}m")
+                # ===== HJ MODIFIED: Algorithm selection based on OPT_ALGORITHM_CHANGE =====
+                if OPT_ALGORITHM_CHANGE:
+                    # NEW ALGORITHM: GB-aware strategy (check opposite wall space)
+                    # Convert obstacle to GB Frenet coordinates
+                    obs_s_gb_array, obs_d_gb_array = self.converter.get_frenet(
+                        np.array([obs_pos[0]]),
+                        np.array([obs_pos[1]])
+                    )
+                    obs_s_gb = float(obs_s_gb_array[0])
+                    obs_d_gb = float(obs_d_gb_array[0])
 
-                # ALWAYS add obstacle to appropriate bound
-                if side == 'left':
+                    rospy.loginfo(f"[{self.name}]   GB Frenet: s={obs_s_gb:.2f}m, d={obs_d_gb:.2f}m")
+                    rospy.loginfo(f"[{self.name}]   Centerline Frenet: s={obs_s_centerline:.2f}m, d={obs_d_centerline:.2f}m")
+
+                    # Decide strategy based on GB waypoint properties
+                    bound_side, shift_direction = self._decide_obstacle_strategy_gb_aware(
+                        obs_s_gb, obs_d_gb, obs_radius
+                    )
+
+                else:
+                    # ORIGINAL ALGORITHM: Centerline-based side detection + clearance check
+                    side, closest_idx, dist = self._detect_obstacle_side(obs_pos, centerline_original)
+                    rospy.loginfo(f"[{self.name}]   Obstacle is on {side} side (dist={dist:.2f}m, idx={closest_idx})")
+                    rospy.loginfo(f"[{self.name}]   Centerline Frenet: s={obs_s_centerline:.2f}m, d={obs_d_centerline:.2f}m")
+
+                    # Calculate clearance
+                    clearance = abs(obs_d_centerline) - obs_radius
+
+                    # Original strategy: add to detected side, shift if clearance < 30cm
+                    bound_side = side
+                    if clearance < 0.3:
+                        # Shift to opposite direction
+                        shift_direction = 'right' if side == 'left' else 'left'
+                        rospy.loginfo(f"[{self.name}]   Clearance={clearance:.2f}m < 30cm → Will shift centerline")
+                    else:
+                        shift_direction = None
+                        rospy.loginfo(f"[{self.name}]   Clearance={clearance:.2f}m >= 30cm → Bound only (no shift)")
+                # ===== HJ MODIFIED END =====
+
+                # Add obstacle to appropriate bound
+                if bound_side == 'left':
                     bound_l_modified = self._add_obstacle_to_bound(
                         bound_l_modified, obs_pos, obs_radius
                     )
@@ -2819,9 +2935,14 @@ class ObstacleSpliner:
                     )
                     rospy.loginfo(f"[{self.name}]   Added obstacle to RIGHT bound")
 
-                # CONDITIONALLY generate spline (only if clearance < 30cm)
-                if clearance < 0.3:
-                    rospy.loginfo(f"[{self.name}]   Clearance < 30cm → Generating spline for centerline shift")
+                # Generate spline if shift_direction is set
+                if shift_direction is not None:
+                    rospy.loginfo(f"[{self.name}]   Generating spline for centerline shift (direction={shift_direction})")
+
+                    # Convert shift_direction to obstacle_side for spline generation
+                    # shift_direction='right' means obstacle on left → obstacle_side='left'
+                    # shift_direction='left' means obstacle on right → obstacle_side='right'
+                    obstacle_side_for_spline = 'left' if shift_direction == 'right' else 'right'
 
                     # Generate spline for this obstacle (based on ORIGINAL centerline)
                     affected_indices, spline_points = self._generate_spline_for_obstacle(
@@ -2829,7 +2950,7 @@ class ObstacleSpliner:
                         centerline_converter=centerline_converter,
                         obs_pos=obs_pos,
                         obs_radius=obs_radius,
-                        obstacle_side=side
+                        obstacle_side=obstacle_side_for_spline
                     )
 
                     if len(affected_indices) > 0 and len(spline_points) > 0:
@@ -2843,7 +2964,7 @@ class ObstacleSpliner:
                     else:
                         rospy.logwarn(f"[{self.name}]   Failed to generate spline (no affected indices)")
                 else:
-                    rospy.loginfo(f"[{self.name}]   Clearance >= 30cm → Bound only (no centerline shift)")
+                    rospy.loginfo(f"[{self.name}]   No centerline shift (bound only)")
                     num_bound_only_obstacles += 1
 
             # Step 4: Apply averaged splines to centerline
@@ -2963,7 +3084,9 @@ class ObstacleSpliner:
 
             # Replace the entire optim_opts_mincurv dictionary with tighter settings
             # This is more robust than trying to replace individual values
-            replacement = 'optim_opts_mincurv={"width_opt": 0.8,\n                    "iqp_iters_min": 5,\n                    "iqp_curverror_allowed": 0.1}'
+            # Use global parameters for easy tuning
+
+            replacement = f'optim_opts_mincurv={{"width_opt": {OPT_WIDTH_OPT},\n                    "iqp_iters_min": {OPT_IQP_ITERS_MIN},\n                    "iqp_curverror_allowed": {OPT_IQP_CURVERROR_ALLOWED}}}'
 
             ini_content_modified = re.sub(
                 r'optim_opts_mincurv=\{[^}]+\}',
@@ -2979,10 +3102,8 @@ class ObstacleSpliner:
 
             # ===== HJ ADDED: Modify additional parameters for faster optimization =====
             # Modify stepsize_opts for faster internal processing
-            # stepsize_prep: 0.05 → 0.1 (spline fitting 2x faster)
-            # stepsize_reg: 0.2 → 0.3 (optimization 1.5x faster)
-            # stepsize_interp_after_opt: 0.1 (keep for 10cm waypoint spacing)
-            stepsize_replacement = 'stepsize_opts={"stepsize_prep": 0.3,\n               "stepsize_reg": 0.3,\n               "stepsize_interp_after_opt": 0.1}'
+            # Use global parameters for easy tuning
+            stepsize_replacement = f'stepsize_opts={{"stepsize_prep": {OPT_STEPSIZE_PREP},\n               "stepsize_reg": {OPT_STEPSIZE_REG},\n               "stepsize_interp_after_opt": {OPT_STEPSIZE_INTERP}}}'
             ini_content_modified = re.sub(
                 r'stepsize_opts=\{[^}]+\}',
                 stepsize_replacement,
@@ -3847,7 +3968,7 @@ class ObstacleSpliner:
 
                     # Use default obstacle size (0.5m diameter)
                     obs_radius = 0.25  # 0.5m / 2
-                    offset = 0.1  # 0.1m offset from obstacle edge
+                    offset = 0.0  # ~m offset from obstacle edge
                     num_points = 100  # Number of points around circle
 
                     # Determine which wall is closer to obstacle center

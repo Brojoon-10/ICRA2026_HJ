@@ -141,7 +141,7 @@ Visualization Manager:
               Marker Topic: /planner/avoidance/markers
               Name: AvoidanceMarkers
               Namespaces:
-                {}
+                "": true
               Queue Size: 100
               Value: true
             - Class: rviz/Marker
@@ -227,7 +227,7 @@ Visualization Manager:
           Marker Topic: /local_waypoints/markers
           Name: Local Waypoints
           Namespaces:
-            {}
+            "": true
           Queue Size: 100
           Value: true
       Enabled: true
@@ -346,7 +346,7 @@ Visualization Manager:
           Marker Topic: /state_marker
           Name: Sombrero
           Namespaces:
-            {}
+            "": true
           Queue Size: 100
           Value: true
       Enabled: true
@@ -358,7 +358,7 @@ Visualization Manager:
           Marker Topic: /lookahead_point
           Name: Lookahead
           Namespaces:
-            {}
+            "": true
           Queue Size: 100
           Value: true
       Enabled: true
@@ -368,7 +368,7 @@ Visualization Manager:
       Marker Topic: /detect/obstacles_markers_new
       Name: MarkerArray
       Namespaces:
-        {}
+        "": true
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -376,7 +376,7 @@ Visualization Manager:
       Marker Topic: /planner/recovery/markers
       Name: MarkerArray
       Namespaces:
-        {}
+        "": true
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -388,13 +388,13 @@ Visualization Manager:
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
-      Enabled: true
+      Enabled: false
       Marker Topic: /trackbounds/markers
       Name: MarkerArray
       Namespaces:
         {}
       Queue Size: 100
-      Value: true
+      Value: false
     - Alpha: 1
       Class: rviz/Axes
       Enabled: true
@@ -409,7 +409,7 @@ Visualization Manager:
       Marker Topic: /planner/avoidance/smart_markers
       Name: MarkerArray
       Namespaces:
-        {}
+        "": true
       Queue Size: 100
       Value: true
     - Alpha: 0.699999988079071
@@ -427,7 +427,7 @@ Visualization Manager:
       Marker Topic: /planner/avoidance/temp_do_spline_markers
       Name: MarkerArray
       Namespaces:
-        {}
+        spline_samples: true
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -435,7 +435,7 @@ Visualization Manager:
       Marker Topic: /state_machine/overtaking_target
       Name: Marker
       Namespaces:
-        {}
+        "": true
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -443,7 +443,7 @@ Visualization Manager:
       Marker Topic: /state_machine/trailing_target
       Name: Marker
       Namespaces:
-        {}
+        "": true
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -451,7 +451,7 @@ Visualization Manager:
       Marker Topic: /state_wpnts_src_marker
       Name: Marker
       Namespaces:
-        {}
+        "": true
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -459,7 +459,13 @@ Visualization Manager:
       Marker Topic: /centerline_modification_viz
       Name: MarkerArray
       Namespaces:
-        {}
+        modified_bound_l: true
+        modified_bound_r: true
+        modified_centerline: true
+        obstacles: true
+        original_bound_l: true
+        original_bound_r: true
+        original_centerline: true
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -467,7 +473,7 @@ Visualization Manager:
       Marker Topic: /planner/avoidance/smart_active_marker
       Name: MarkerArray
       Namespaces:
-        {}
+        "": true
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -476,6 +482,26 @@ Visualization Manager:
       Name: Marker
       Namespaces:
         {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /lap_marker
+      Name: Marker
+      Namespaces:
+        lap_max_d: true
+        lap_max_d_text: true
+        lap_min_dist: true
+        lap_min_dist_text: true
+        lap_trajectory: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /lap_data_vis
+      Name: Marker
+      Namespaces:
+        lap_info: true
       Queue Size: 100
       Value: true
   Enabled: true
@@ -505,7 +531,7 @@ Visualization Manager:
   Value: true
   Views:
     Current:
-      Angle: -1.5349998474121094
+      Angle: -1.5850002765655518
       Class: rviz/TopDownOrtho
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
@@ -515,10 +541,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 53.828433990478516
+      Scale: 72.04396057128906
       Target Frame: <Fixed Frame>
-      X: 1.3368663787841797
-      Y: 1.712948203086853
+      X: -0.7128244638442993
+      Y: 1.465514898300171
     Saved: ~
 Window Geometry:
   Displays:

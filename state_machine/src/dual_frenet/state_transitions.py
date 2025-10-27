@@ -11,8 +11,8 @@ import states
 if TYPE_CHECKING:
     from state_machine_node import StateMachine
 
-close_threshold_smart = 0.15
-close_threshold_gb = 0.15
+close_threshold_smart = 0.3
+close_threshold_gb = 0.3
 
 # ===== HJ ADDED: Debug logging helper - only logs when values change =====
 _debug_log_cache = {}
