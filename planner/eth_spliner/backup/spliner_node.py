@@ -311,6 +311,7 @@ class ObstacleSpliner:
                     candidate_d_apex_right = 0
                 rospy.logwarn_throttle(1.0, f"[{self.name}] _more_space: Choosing RIGHT (space_diff={space_to_right - space_to_left:.2f}m)")
                 return "right", candidate_d_apex_right
+            
 
     def do_spline(self, obstacles: ObstacleArray, gb_wpnts: WpntArray) -> Tuple[WpntArray, MarkerArray]:
         """

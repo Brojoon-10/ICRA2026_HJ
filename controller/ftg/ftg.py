@@ -12,12 +12,12 @@ class FTG:
     SAFETY_RADIUS = rospy.get_param('/state_machine/safety_radius')
     MAX_LIDAR_DIST = rospy.get_param('/state_machine/max_lidar_dist')
 
-    # Speed params
+    # Speed params - tuned for 2.5-4.5m wide tracks
     MAX_SPEED = rospy.get_param('/state_machine/max_speed', 1.5)
-    scale = 0.6  # .575 is  max
-    CORNERS_SPEED = 0.3 * MAX_SPEED * scale
-    MILD_CORNERS_SPEED = 0.45 * MAX_SPEED * scale
-    STRAIGHTS_SPEED = 0.8 * MAX_SPEED * scale
+    scale = 0.65  # Slightly increased from 0.6 for better performance on wide tracks
+    CORNERS_SPEED = 0.35 * MAX_SPEED * scale  # Increased from 0.3 for smoother cornering
+    MILD_CORNERS_SPEED = 0.5 * MAX_SPEED * scale  # Increased from 0.45 for better flow
+    STRAIGHTS_SPEED = 0.85 * MAX_SPEED * scale  # Increased from 0.8 for faster straights
     ULTRASTRAIGHTS_SPEED = MAX_SPEED * scale
     
     #Steering params
@@ -33,10 +33,11 @@ class FTG:
             mapping (bool): Flag indicating whether FTG is used for mapping or not.
         """
         self.mapping = mapping
-        
+
         self.radians_per_elem = None # used when calculating the angles of the LiDAR data
         self.range_offset = rospy.get_param('/state_machine/range_offset')
-        self.track_width = rospy.get_param('/state_machine/track_width', 2.0)
+        # Increased track_width for wider maps (2.5-4.5m range)
+        self.track_width = rospy.get_param('/state_machine/track_width', 3.5)
 
         self.velocity = 0
         self.scan = None
@@ -248,12 +249,17 @@ class FTG:
     def _get_radius(self) -> float:
         """
         Calculate the radius based on the track width and velocity.
+        Adjusted for wider tracks (2.5-4.5m) to look farther ahead and avoid spinning.
 
         Returns:
             float: The calculated radius.
         """
-        # Empirically determined that this radius choosing makes sense
-        return min(5., self.track_width / 2 + 2 * (self.velocity / self.MAX_SPEED))
+        # Increased lookahead for wider tracks: base radius + velocity-dependent component
+        # Max radius increased from 5m to 6.5m to handle wider sections
+        # Velocity multiplier increased from 2 to 2.5 for more aggressive forward vision
+        base_radius = self.track_width / 2
+        velocity_factor = 2.5 * (self.velocity / self.MAX_SPEED)
+        return min(6.5, base_radius + velocity_factor)
 
     def set_vel(self, velocity) -> None:
         """

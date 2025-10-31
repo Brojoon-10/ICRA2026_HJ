@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import rospy
 from dynamic_reconfigure.server import Server
-from spliner.cfg import dyn_spliner_tunerConfig
+from eth_spliner.cfg import dyn_eth_spliner_tunerConfig
 
 def callback(config, level):
     # Ensuring nice rounding by either 0.05 or 0.5
@@ -21,8 +21,8 @@ def callback(config, level):
     return config
 
 if __name__ == "__main__":
-    rospy.init_node("dynamic_spline_tuner_node", anonymous=False)
-    print('[Planner] Dynamic Spline Server Launched...')
-    srv = Server(dyn_spliner_tunerConfig, callback)
+    rospy.init_node("dynamic_eth_spline_tuner_node", anonymous=False)
+    print('[Planner] Dynamic ETH Spline Server Launched...')
+    srv = Server(dyn_eth_spliner_tunerConfig, callback)
     rospy.spin()
 

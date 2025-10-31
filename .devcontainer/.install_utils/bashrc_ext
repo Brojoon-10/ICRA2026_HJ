@@ -7,7 +7,8 @@ alias scripz='cd /home/${USER}/catkin_ws/src/race_stack/stack_master/scripts'
 alias switch_map='/home/${USER}/catkin_ws/src/race_stack/stack_master/scripts/switch_map.sh $1'
 alias record='/home/${USER}/catkin_ws/src/race_stack/stack_master/scripts/bag.sh'
 alias bag_mapping='/home/${USER}/catkin_ws/src/race_stack/stack_master/scripts/bag_mapping.sh'
-alias vel_change='cd /home/${USER}/catkin_ws/src/race_stack/stack_master/scripts && python3 global_velocity_planner.py'
+alias gb_vel_change='cd /home/${USER}/catkin_ws/src/race_stack/stack_master/scripts && python3 global_velocity_planner.py'
+alias both_vel_change='cd /home/${USER}/catkin_ws/src/race_stack/stack_master/scripts && python3 global_velocity_planner_for_both_opt.py'
 alias sb='source ~/.bashrc'
 
 echo "ROS_ROOT   $ROS_ROOT"

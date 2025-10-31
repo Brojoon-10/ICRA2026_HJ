@@ -35,6 +35,9 @@ ENABLE_STATIC_SECTOR_FILTERING = False
 HORIZON_FOR_TTL = 3.0
 
 MAX_VEL_RIGHT_BEFORE_STATIC_OT = 5.0
+
+# ===== HJ ADDED: Global flag for state transition debug logging =====
+DEBUG_STATE_TRANSITION = False  # Set to True to see state transition warnings
 # ===== HJ ADDED END =====
 
 def debug_log_on_change(tag, **kwargs):
@@ -2010,9 +2013,10 @@ class StateMachine:
             self.cur_state, self.local_wpnts_src = self.state_transitions[self.cur_state](self)
 
         # ===== HJ ADDED: Log state changes =====
-        if prev_state != self.cur_state or prev_wpnts_src != self.local_wpnts_src:
-            mode_tag = "SMART" if self.smart_static_active else "GB"
-            rospy.logwarn(f"[STATE CHANGE {mode_tag}] {prev_state.name} → {self.cur_state.name} | wpnts: {prev_wpnts_src.name} → {self.local_wpnts_src.name}")
+        if DEBUG_STATE_TRANSITION:
+            if prev_state != self.cur_state or prev_wpnts_src != self.local_wpnts_src:
+                mode_tag = "SMART" if self.smart_static_active else "GB"
+                rospy.logwarn(f"[STATE CHANGE {mode_tag}] {prev_state.name} → {self.cur_state.name} | wpnts: {prev_wpnts_src.name} → {self.local_wpnts_src.name}")
         # ===== HJ ADDED END =====
 
         if self.cur_state == StateType.TRAILING:
