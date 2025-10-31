@@ -1,8 +1,10 @@
 #!/bin/bash
 
 # HJ ADD: Create record directory if it doesn't exist
-BAG_DIR="/home/hj/catkin_ws/src/race_stack/stack_master/bag"
-RECORD_DIR="$BAG_DIR/record"
+# Automatically use current user's home directory
+USER_HOME="$HOME"
+BAG_DIR="$USER_HOME/catkin_ws/src/race_stack/stack_master/bag"
+MAPPING_DIR="$BAG_DIR/record"
 
 mkdir -p "$RECORD_DIR"
 
