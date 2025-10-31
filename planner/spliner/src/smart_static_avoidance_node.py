@@ -29,7 +29,7 @@ import trajectory_planning_helpers as tph
 from rospkg import RosPack
 
 # ===== HJ ADDED: GB-aware algorithm parameters =====
-OPPOSITE_SPACE_THRESHOLD = 1.0  # meters, if opposite wall has > this space, shift toward it
+OPPOSITE_SPACE_THRESHOLD = 1.3  # meters, if opposite wall has > this space, shift toward it
 
 # Safety width override
 OVERRIDE_SAFETY_WIDTH = True  # True: use SAFETY_WIDTH_VALUE, False: use ROS parameter

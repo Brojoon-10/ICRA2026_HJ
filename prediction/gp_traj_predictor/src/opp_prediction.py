@@ -37,7 +37,16 @@ class OppTrajPredictor:
         self.opp_traj_marker_pub = rospy.Publisher('/opponent_traj_markerarray', MarkerArray, queue_size=10)
         self.opp_marker_pub = rospy.Publisher('/opponent_prediction_markerarray', MarkerArray, queue_size=10)
 
-        # Subscriber
+        # Callback data - initialize BEFORE subscribing to avoid race condition
+        self.opponent_pos = ObstacleArray()
+        self.car_odom = Odometry()
+        self.wpnts_opponent = list()
+        self.wpnts_updated = list()
+        self.state = String()
+
+        self.speed_offset = 0 # m/s
+
+        # Subscriber - register AFTER initializing callback data
         rospy.Subscriber("/tracking/obstacles", ObstacleArray, self.opponent_state_cb)
         rospy.Subscriber("/car_state/odom_frenet", Odometry, self.odom_cb)
         rospy.Subscriber(self.opponent_traj_topic, OpponentTrajectory, self.opponent_trajectory_cb)
@@ -48,15 +57,6 @@ class OppTrajPredictor:
 
         # Service server
         rospy.Service('/init_opp_trajectory', SetBool, self.init_opp_bool)
-
-        # Callback data
-        self.opponent_pos = ObstacleArray()
-        self.car_odom = Odometry()
-        self.wpnts_opponent = list()
-        self.wpnts_updated = list()
-        self.state = String()
-
-        self.speed_offset = 0 # m/s
 
         # Simulation parameters
         self.time_steps = 200

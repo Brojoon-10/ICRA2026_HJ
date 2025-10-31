@@ -15,7 +15,7 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 generate_dynamic_reconfigure_options(
-  cfg/dyn_spliner_tuner.cfg
+  cfg/dyn_eth_spliner_tuner.cfg
 )
 
 ## System dependencies are found with CMake's conventions

@@ -236,8 +236,12 @@ def FTGOnlyTransition(state_machine: StateMachine) -> Tuple[StateType, StateType
             if (recovery_availability and smart_helper._check_free_frenet(state_machine.cur_recovery_wpnts)):
                 return StateType.RECOVERY, StateType.RECOVERY
 
-            if smart_helper._check_overtaking_mode() or smart_helper._check_static_overtaking_mode():
+            # ===== HJ MODIFIED: Disable dynamic overtaking in Smart mode =====
+            # In Smart mode: only static overtaking allowed (dynamic overtaking disabled)
+            if smart_helper._check_static_overtaking_mode():
                 return StateType.OVERTAKE, StateType.OVERTAKE
+            # Note: _check_overtaking_mode() (dynamic) is intentionally disabled in Smart mode
+            # ===== HJ MODIFIED END =====
             else:
                 return StateType.FTGONLY, StateType.FTGONLY
     else:
@@ -253,8 +257,13 @@ def FTGOnlyTransition(state_machine: StateMachine) -> Tuple[StateType, StateType
             if (recovery_availability and state_machine._check_free_frenet(state_machine.cur_recovery_wpnts)):
                 return StateType.RECOVERY, StateType.RECOVERY
 
-            if state_machine._check_overtaking_mode() or state_machine._check_static_overtaking_mode():
+            # ===== HJ MODIFIED: Disable dynamic overtaking when smart_static_active=true =====
+            if state_machine._check_static_overtaking_mode():
                 return StateType.OVERTAKE, StateType.OVERTAKE
+            # Dynamic overtaking only when smart_static is NOT active
+            if state_machine._check_overtaking_mode() and not state_machine.smart_static_active:
+                return StateType.OVERTAKE, StateType.OVERTAKE
+            # ===== HJ MODIFIED END =====
             else:
                 return StateType.FTGONLY, StateType.FTGONLY
 
@@ -405,8 +414,12 @@ def ObstacleTransition_SmartMode(state_machine: StateMachine, close_to_smart: bo
             return StateType.RECOVERY, StateType.RECOVERY
 
     # Priority 3: Overtaking check (use smart_helper for Fixed Frenet based checks)
-    if ot_mode or static_ot_mode:
+    # ===== HJ MODIFIED: Disable dynamic overtaking in Smart mode =====
+    # In Smart mode: only static overtaking allowed (dynamic overtaking disabled)
+    if static_ot_mode:
         return StateType.OVERTAKE, StateType.OVERTAKE
+    # Note: ot_mode (dynamic overtaking) is intentionally disabled in Smart mode
+    # ===== HJ MODIFIED END =====
 
     # Priority 4: TRAILING state - Smart mode always uses Smart path
     if wpnts_valid and close_to_smart:
@@ -484,9 +497,17 @@ def ObstacleTransition_GBMode(state_machine: StateMachine, close_to_gb: bool) ->
             return StateType.RECOVERY, StateType.RECOVERY
 
     # Priority 2: Overtaking check
-    if state_machine._check_overtaking_mode() or state_machine._check_static_overtaking_mode():
-        # rospy.logwarn(f"[Obstacle_GB→OVERTAKE] Overtaking triggered")
+    # ===== HJ MODIFIED: Disable dynamic overtaking when smart_static_active=true =====
+    # GB mode is called even when smart_static_active=true (during flag transitions)
+    # So we need to check the flag here too
+    if state_machine._check_static_overtaking_mode():
+        # rospy.logwarn(f"[Obstacle_GB→OVERTAKE] Static overtaking triggered")
         return StateType.OVERTAKE, StateType.OVERTAKE
+    # Dynamic overtaking only when smart_static is NOT active
+    if state_machine._check_overtaking_mode() and not state_machine.smart_static_active:
+        # rospy.logwarn(f"[Obstacle_GB→OVERTAKE] Dynamic overtaking triggered")
+        return StateType.OVERTAKE, StateType.OVERTAKE
+    # ===== HJ MODIFIED END =====
 
     # Priority 3: TRAILING state - GB mode logic
     if close_to_gb:

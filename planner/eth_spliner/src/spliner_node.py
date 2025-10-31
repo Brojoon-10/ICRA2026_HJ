@@ -19,7 +19,7 @@ class ObstacleSpliner:
     This class implements a ROS node that performs splining around obstacles.
 
     It subscribes to the following topics:
-        - `/perception/obstacles`: Subscribes to the obstacle array.
+        - `/tracking/obstacles`: Subscribes to the obstacle array.
         - `/car_state/odom_frenet`: Subscribes to the car state in Frenet coordinates.
         - `/global_waypoints`: Subscribes to global waypoints.
         - `/global_waypoints_scaled`: Subscribes to the scaled global waypoints.
@@ -50,29 +50,35 @@ class ObstacleSpliner:
         self.cur_d = 0
         self.cur_vs = 0
         self.gb_scaled_wpnts = WpntArray()
-        self.lookahead = 10  # in meters [m]
+        self.lookahead = 12  # in meters [m]
         self.last_switch_time = rospy.Time.now()
         self.last_ot_side = ""
+        # Safety parameters - only block extreme cases to prevent wall collisions
+        self.extreme_displacement_threshold = 0.65  # Block only if car is extremely displaced [m]
+        # Raceline return threshold - reset overtaking state when back on raceline
+        self.raceline_return_threshold = 0.20  # Consider on raceline if |d| < this value [m]
         self.from_bag = rospy.get_param("/from_bag", False)
         self.measuring = rospy.get_param("/measure", False)
 
         # Subscribe to the topics
-        rospy.Subscriber("/perception/obstacles", ObstacleArray, self.obs_cb)
+        rospy.Subscriber("/tracking/obstacles", ObstacleArray, self.obs_cb)
         rospy.Subscriber("/car_state/odom_frenet", Odometry, self.state_cb)
         rospy.Subscriber("/global_waypoints", WpntArray, self.gb_cb)
         rospy.Subscriber("/global_waypoints_scaled", WpntArray, self.gb_scaled_cb)
         # dyn params sub
-        self.pre_apex_0 = -4
+        self.pre_apex_0 = -5
         self.pre_apex_1 = -3
         self.pre_apex_2 = -1.5
-        self.post_apex_0 = 2
-        self.post_apex_1 = 3
-        self.post_apex_2 = 4
-        self.evasion_dist = 0.65
-        self.obs_traj_tresh = 0.3
-        self.spline_bound_mindist = 0.2
+        
+        self.post_apex_0 = 3
+        self.post_apex_1 = 4
+        self.post_apex_2 = 5
+        
+        self.evasion_dist = 0.7
+        self.obs_traj_tresh = 0.2
+        self.spline_bound_mindist = 0.3
         if not self.from_bag:
-            rospy.Subscriber("/dynamic_spline_tuner_node/parameter_updates", Config, self.dyn_param_cb)
+            rospy.Subscriber("/dynamic_eth_spline_tuner_node/parameter_updates", Config, self.dyn_param_cb)
 
         self.mrks_pub = rospy.Publisher("/planner/avoidance/markers", MarkerArray, queue_size=10)
         self.evasion_pub = rospy.Publisher("/planner/avoidance/otwpnts", OTWpntArray, queue_size=10)
@@ -117,19 +123,19 @@ class ObstacleSpliner:
         """
         Notices the change in the parameters and changes spline params
         """
-        self.pre_apex_0 = -1 * rospy.get_param("dynamic_spline_tuner_node/pre_apex_dist0", -4)
-        self.pre_apex_1 = -1 * rospy.get_param("dynamic_spline_tuner_node/pre_apex_dist1", -3)
-        self.pre_apex_2 = -1 * rospy.get_param("dynamic_spline_tuner_node/pre_apex_dist2", -1.5) + 0.1
-        self.post_apex_0 = rospy.get_param("dynamic_spline_tuner_node/post_apex_dist0", 2)
-        self.post_apex_1 = rospy.get_param("dynamic_spline_tuner_node/post_apex_dist1", 3)
-        self.post_apex_2 = rospy.get_param("dynamic_spline_tuner_node/post_apex_dist2", 4)
+        self.pre_apex_0 = -1 * rospy.get_param("dynamic_eth_spline_tuner_node/pre_apex_dist0", -4)
+        self.pre_apex_1 = -1 * rospy.get_param("dynamic_eth_spline_tuner_node/pre_apex_dist1", -3)
+        self.pre_apex_2 = -1 * rospy.get_param("dynamic_eth_spline_tuner_node/pre_apex_dist2", -1.5) + 0.1
+        self.post_apex_0 = rospy.get_param("dynamic_eth_spline_tuner_node/post_apex_dist0", 2)
+        self.post_apex_1 = rospy.get_param("dynamic_eth_spline_tuner_node/post_apex_dist1", 3)
+        self.post_apex_2 = rospy.get_param("dynamic_eth_spline_tuner_node/post_apex_dist2", 4)
 
-        self.evasion_dist = rospy.get_param("dynamic_spline_tuner_node/evasion_dist", 0.65)
-        self.obs_traj_tresh = rospy.get_param("dynamic_spline_tuner_node/obs_traj_tresh", 0.3)
-        self.spline_bound_mindist = rospy.get_param("dynamic_spline_tuner_node/spline_bound_mindist", 0.2)
+        self.evasion_dist = rospy.get_param("dynamic_eth_spline_tuner_node/evasion_dist", 0.65)
+        self.obs_traj_tresh = rospy.get_param("dynamic_eth_spline_tuner_node/obs_traj_tresh", 0.3)
+        self.spline_bound_mindist = rospy.get_param("dynamic_eth_spline_tuner_node/spline_bound_mindist", 0.2)
 
-        self.kd_obs_pred = rospy.get_param("dynamic_spline_tuner_node/kd_obs_pred")
-        self.fixed_pred_time = rospy.get_param("dynamic_spline_tuner_node/fixed_pred_time")
+        self.kd_obs_pred = rospy.get_param("dynamic_eth_spline_tuner_node/kd_obs_pred")
+        self.fixed_pred_time = rospy.get_param("dynamic_eth_spline_tuner_node/fixed_pred_time")
 
         spline_params = [
             self.pre_apex_0,
@@ -156,7 +162,7 @@ class ObstacleSpliner:
         rospy.wait_for_message("/global_waypoints", WpntArray)
         rospy.wait_for_message("/global_waypoints_scaled", WpntArray)
         rospy.wait_for_message("/car_state/odom", Odometry)
-        rospy.wait_for_message("/dynamic_spline_tuner_node/parameter_updates", Config)
+        rospy.wait_for_message("/dynamic_eth_spline_tuner_node/parameter_updates", Config)
         rospy.loginfo(f"[{self.name}] Ready!")
 
         while not rospy.is_shutdown():
@@ -201,39 +207,109 @@ class ObstacleSpliner:
 
         return converter
 
-    def _more_space(self, obstacle: Obstacle, gb_wpnts: List[Any], gb_idxs: List[int]) -> Tuple[str, float]:
-        left_gap = abs(gb_wpnts[gb_idxs[0]].d_left - obstacle.d_left)
-        right_gap = abs(gb_wpnts[gb_idxs[0]].d_right + obstacle.d_right)
-        min_space = self.evasion_dist + self.spline_bound_mindist
+    # def _more_space(self, obstacle: Obstacle, gb_wpnts: List[Any], gb_idxs: List[int]) -> Tuple[str, float]:
+    #     left_gap = abs(gb_wpnts[gb_idxs[0]].d_left - obstacle.d_left)
+    #     right_gap = abs(gb_wpnts[gb_idxs[0]].d_right + obstacle.d_right)
+    #     min_space = self.evasion_dist + self.spline_bound_mindist
 
+    #     if right_gap > min_space and left_gap < min_space:
+    #         # Compute apex distance to the right of the opponent
+    #         d_apex_right = obstacle.d_right - self.evasion_dist
+    #         # If we overtake to the right of the opponent BUT the apex is to the left of the raceline, then we set the apex to 0
+    #         if d_apex_right > 0:
+    #             d_apex_right = 0
+    #         return "right", d_apex_right
+
+    #     elif left_gap > min_space and right_gap < min_space:
+    #         # Compute apex distance to the left of the opponent
+    #         d_apex_left = obstacle.d_left + self.evasion_dist
+    #         # If we overtake to the left of the opponent BUT the apex is to the right of the raceline, then we set the apex to 0
+    #         if d_apex_left < 0:
+    #             d_apex_left = 0
+    #         return "left", d_apex_left
+    #     else:
+    #         candidate_d_apex_left = obstacle.d_left + self.evasion_dist
+    #         candidate_d_apex_right = obstacle.d_right - self.evasion_dist
+
+    #         if abs(candidate_d_apex_left) <= abs(candidate_d_apex_right):
+    #             # If we overtake to the left of the opponent BUT the apex is to the right of the raceline, then we set the apex to 0
+    #             if candidate_d_apex_left < 0:
+    #                 candidate_d_apex_left = 0
+    #             return "left", candidate_d_apex_left
+    #         else:
+    #             # If we overtake to the right of the opponent BUT the apex is to the left of the raceline, then we set the apex to 0
+    #             if candidate_d_apex_right > 0:
+    #                 candidate_d_apex_right = 0
+    #             return "right", candidate_d_apex_right
+            
+    def _more_space(self, obstacle: Obstacle, gb_wpnts: List[Any], gb_idxs: List[int]) -> Tuple[str, float]:
+        # Use GB waypoint bounds (d_left, d_right)
+        wpnt_d_left = gb_wpnts[gb_idxs[0]].d_left
+        wpnt_d_right = gb_wpnts[gb_idxs[0]].d_right
+ 
+        left_gap = abs(wpnt_d_left - obstacle.d_left)
+        right_gap = abs(wpnt_d_right + obstacle.d_right)
+        min_space = self.evasion_dist + self.spline_bound_mindist
+ 
         if right_gap > min_space and left_gap < min_space:
-            # Compute apex distance to the right of the opponent
+            # Only right side has enough space
             d_apex_right = obstacle.d_right - self.evasion_dist
-            # If we overtake to the right of the opponent BUT the apex is to the left of the raceline, then we set the apex to 0
             if d_apex_right > 0:
                 d_apex_right = 0
             return "right", d_apex_right
-
+ 
         elif left_gap > min_space and right_gap < min_space:
-            # Compute apex distance to the left of the opponent
+            # Only left side has enough space
             d_apex_left = obstacle.d_left + self.evasion_dist
-            # If we overtake to the left of the opponent BUT the apex is to the right of the raceline, then we set the apex to 0
             if d_apex_left < 0:
                 d_apex_left = 0
             return "left", d_apex_left
         else:
-            candidate_d_apex_left = obstacle.d_left + self.evasion_dist
-            candidate_d_apex_right = obstacle.d_right - self.evasion_dist
-
-            if abs(candidate_d_apex_left) <= abs(candidate_d_apex_right):
-                # If we overtake to the left of the opponent BUT the apex is to the right of the raceline, then we set the apex to 0
+            # Both sides have insufficient space, choose the side with MORE available space
+            # Calculate actual distance from obstacle center to each wall
+ 
+            # Get obstacle center XY coordinates (convert from Frenet to Cartesian)
+            obs_xy = self.converter.get_cartesian(
+                np.array([obstacle.s_center]),
+                np.array([obstacle.d_center])
+            )
+            obs_pos = np.array([obs_xy[0, 0], obs_xy[1, 0]])
+ 
+            # Extract wall bounds from GB waypoints
+            bound_l = np.array([[wp.x_m + wp.d_left * np.cos(wp.psi_rad + np.pi/2),
+                                wp.y_m + wp.d_left * np.sin(wp.psi_rad + np.pi/2)]
+                               for wp in gb_wpnts])
+            bound_r = np.array([[wp.x_m + wp.d_right * np.cos(wp.psi_rad - np.pi/2),
+                                wp.y_m + wp.d_right * np.sin(wp.psi_rad - np.pi/2)]
+                               for wp in gb_wpnts])
+ 
+            # Calculate minimum distance from obstacle center to each wall
+            dist_to_left_wall = np.min(np.linalg.norm(bound_l - obs_pos, axis=1))
+            dist_to_right_wall = np.min(np.linalg.norm(bound_r - obs_pos, axis=1))
+ 
+            # Calculate available space (subtract obstacle radius: 0.5m diameter = 0.3m radius)
+            obstacle_radius = 0.3  # meters
+            space_to_left = dist_to_left_wall - obstacle_radius
+            space_to_right = dist_to_right_wall - obstacle_radius
+ 
+            rospy.logwarn_throttle(1.0,
+                f"[{self.name}] _more_space: Both sides tight! "
+                f"dist_to_left_wall={dist_to_left_wall:.2f}m, dist_to_right_wall={dist_to_right_wall:.2f}m, "
+                f"space_to_left={space_to_left:.2f}m, space_to_right={space_to_right:.2f}m")
+ 
+            if space_to_left > space_to_right:
+                # More space on the left side
+                candidate_d_apex_left = obstacle.d_left + self.evasion_dist
                 if candidate_d_apex_left < 0:
                     candidate_d_apex_left = 0
+                rospy.logwarn_throttle(1.0, f"[{self.name}] _more_space: Choosing LEFT (space_diff={space_to_left - space_to_right:.2f}m)")
                 return "left", candidate_d_apex_left
             else:
-                # If we overtake to the right of the opponent BUT the apex is to the left of the raceline, then we set the apex to 0
+                # More space on the right side (or equal)
+                candidate_d_apex_right = obstacle.d_right - self.evasion_dist
                 if candidate_d_apex_right > 0:
                     candidate_d_apex_right = 0
+                rospy.logwarn_throttle(1.0, f"[{self.name}] _more_space: Choosing RIGHT (space_diff={space_to_right - space_to_left:.2f}m)")
                 return "right", candidate_d_apex_right
 
     def do_spline(self, obstacles: ObstacleArray, gb_wpnts: WpntArray) -> Tuple[WpntArray, MarkerArray]:
@@ -264,6 +340,15 @@ class ObstacleSpliner:
 
         # Only use obstacles that are within a threshold of the raceline, else we don't care about them
         close_obs = self._obs_filtering(obstacles=obstacles)
+
+        # Reset overtaking state when car returns to raceline with no obstacles
+        # This ensures each overtaking maneuver starts fresh without being affected by previous state
+        if len(close_obs) == 0 and abs(self.cur_d) < self.raceline_return_threshold:
+            if self.last_ot_side != "":
+                rospy.loginfo_throttle(2.0,
+                    f"[{self.name}]: Car returned to raceline (d={self.cur_d:.3f}m), "
+                    f"resetting overtaking state (was '{self.last_ot_side}')")
+                self.last_ot_side = ""
 
         # If there are obstacles within the lookahead distance, then we need to generate an evasion trajectory considering the closest one
         if len(close_obs) > 0:
@@ -304,7 +389,7 @@ class ObstacleSpliner:
                 dst = dst * np.clip(1.0 + self.cur_vs / self.gb_vmax, 1, 1.5)
                 # If we overtake on the outside, we smoothen the spline
                 if outside == more_space:
-                    si = s_apex + dst * 1.75 #TODO make parameter
+                    si = s_apex + dst * 1.8 #TODO make parameter
                 else:
                     si = s_apex + dst
                 di = d_apex if dst == 0 else 0
@@ -345,7 +430,7 @@ class ObstacleSpliner:
                         danger_flag = True
                         break
                 # Get V from gb wpnts and go slower if we are going through the inside
-                vi = gb_wpnts[gb_wpnt_i].vx_mps if outside == more_space else gb_wpnts[gb_wpnt_i].vx_mps * 0.9 # TODO make speed scaling ros param
+                vi = gb_wpnts[gb_wpnt_i].vx_mps * 0.9 if outside == more_space else gb_wpnts[gb_wpnt_i].vx_mps * 0.95 # TODO make speed scaling ros param
                 wpnts.wpnts.append(
                     self.xyv_to_wpnts(x=resp[0, i], y=resp[1, i], s=evasion_s[i], d=evasion_d[i], v=vi, wpnts=wpnts)
                 )
@@ -464,9 +549,31 @@ class ObstacleSpliner:
         return obs
     
     def _check_ot_side_possible(self, more_space) -> bool:
-        if abs(self.cur_d) > 0.25 and more_space != self.last_ot_side: # TODO make rosparam for cur_d threshold
-            rospy.loginfo(f"[{self.name}]: Can't switch sides, because we are not on the raceline")
-            return False
+        """
+        Check if overtaking to the specified side is safe - only block extreme cases.
+
+        Returns False only if:
+        - Car is EXTREMELY displaced (|d| > 0.8m) AND trying to go further in that direction
+        - This prevents wall collisions in extreme cases while allowing normal overtaking
+
+        Philosophy: Let the state machine handle most decisions, only intervene for safety.
+        """
+
+        # Only check if continuing same side (normal overtaking progression is always allowed)
+        if self.last_ot_side == more_space:
+            return True
+
+        # Check for EXTREME displacement to prevent wall collisions
+        # Only block if car is very far off and trying to go further in that direction
+        if abs(self.cur_d) > self.extreme_displacement_threshold:
+            if (self.cur_d < -self.extreme_displacement_threshold and more_space == "right") or \
+               (self.cur_d > self.extreme_displacement_threshold and more_space == "left"):
+                rospy.logwarn_throttle(1.0,
+                    f"[{self.name}]: EXTREME displacement detected! Car at d={self.cur_d:.3f}m, "
+                    f"blocking {more_space.upper()} overtaking to prevent wall collision.")
+                return False
+
+        # Allow everything else - trust the state machine and higher level logic
         return True
 
     ######################
