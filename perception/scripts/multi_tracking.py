@@ -108,7 +108,10 @@ class Opponent_state:
                          Opponent_state.track_length),x[1], x[2], x[3]])
 
     def target_velocity(self) :
-        idx_closest_waypoint =  int((self.dynamic_kf.x[0]*10)%Opponent_state.track_length)
+        # Wrap s-coordinate first, then convert to waypoint index
+        s_wrapped = self.dynamic_kf.x[0] % Opponent_state.track_length
+        idx_closest_waypoint = int(s_wrapped * 10)  # Convert meters to waypoint index (0.1m spacing)
+        idx_closest_waypoint = min(idx_closest_waypoint, len(Opponent_state.waypoints) - 1)  # Clamp to array bounds
         return Opponent_state.ratio_to_glob_path*Opponent_state.waypoints[idx_closest_waypoint].vx_mps
 
     # ---------------------------------------
@@ -141,14 +144,25 @@ class Opponent_state:
             (tracked_obstacle.measurments_d[-1] - tracked_obstacle.measurments_d[-2])*self.rate,
         ])
 
+        # ===== HJ MODIFIED: Unwrap measurement s to match Kalman filter state =====
+        # Get current Kalman filter state (in normalize_s range: [-track_length/2, track_length/2])
+        kf_s = self.dynamic_kf.x[0]
+        meas_s = z[0]
+
+        # Unwrap measurement to be close to Kalman state
+        # Try different wrapping offsets and pick closest
+        candidates = [meas_s, meas_s - Opponent_state.track_length, meas_s + Opponent_state.track_length]
+        meas_s_unwrapped = min(candidates, key=lambda s: abs(s - kf_s))
+
         self.dynamic_kf.update(
             np.array([
-                normalize_s(z[0],Opponent_state.track_length), z[1], z[2], z[3]
+                normalize_s(meas_s_unwrapped, Opponent_state.track_length), z[1], z[2], z[3]
             ]),
             Opponent_state.Hjac,
-            Opponent_state.hx, 
+            Opponent_state.hx,
             residual=Opponent_state.residual_h
         )
+        # ===== HJ MODIFIED END =====
         self.dynamic_kf.x[0] = normalize_s(self.dynamic_kf.x[0],Opponent_state.track_length)
 
         self.vs_list.append(self.dynamic_kf.x[1])
@@ -557,7 +571,21 @@ class StaticDynamic:
         return angle
 
     def update_tracked_obstacle(self, tracked_obstacle: ObstacleSD, meas_obstacle):
-        tracked_obstacle.measurments_s.append(meas_obstacle.s_center)
+        # ===== HJ ADDED: Unwrap s-coordinate to handle boundary crossings =====
+        new_s = meas_obstacle.s_center
+        if len(tracked_obstacle.measurments_s) > 0:
+            prev_s = tracked_obstacle.measurments_s[-1]
+            # Detect large jumps (> half track length) indicating boundary crossing
+            diff = new_s - prev_s
+            if diff > self.track_length / 2:
+                # Crossed from end to start: unwrap by subtracting track_length
+                new_s = new_s - self.track_length
+            elif diff < -self.track_length / 2:
+                # Crossed from start to end: unwrap by adding track_length
+                new_s = new_s + self.track_length
+        # ===== HJ ADDED END =====
+
+        tracked_obstacle.measurments_s.append(new_s)
         tracked_obstacle.measurments_d.append(meas_obstacle.d_center)
         # handle list lenght
         if(len(tracked_obstacle.measurments_s) > 30):
@@ -851,7 +879,7 @@ class StaticDynamic:
                 obs_msg.s_center = obs.measurments_s[-1]%self.track_length
                 obs_msg.d_center = obs.measurments_d[-1]
             elif obs.staticFlag :
-                obs_msg.s_center = obs.mean[0]
+                obs_msg.s_center = obs.mean[0]%self.track_length
                 obs_msg.d_center = obs.mean[1]
             else:
                 if obs.dynamic_state.isInitialised:
@@ -875,8 +903,8 @@ class StaticDynamic:
                     obs_msg.s_center = obs.measurments_s[-1]%self.track_length
                     obs_msg.d_center = obs.measurments_d[-1]
 
-            obs_msg.s_start = obs_msg.s_center-obs_msg.size/2%self.track_length
-            obs_msg.s_end   = obs_msg.s_center+obs_msg.size/2%self.track_length
+            obs_msg.s_start = (obs_msg.s_center-obs_msg.size/2)%self.track_length
+            obs_msg.s_end   = (obs_msg.s_center+obs_msg.size/2)%self.track_length
             obs_msg.d_right = obs_msg.d_center-obs_msg.size/2
             obs_msg.d_left  = obs_msg.d_center+obs_msg.size/2
 
