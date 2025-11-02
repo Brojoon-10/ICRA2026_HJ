@@ -1104,7 +1104,8 @@ class StateMachine:
                         obs_d = obs.d_center
                         # Get d wrt to mincurv from the overtaking line
                         ot_d = 0
-                        if not is_gb_track_wpnts:
+                        # HJ MODIFIED: Add safety check for empty list after clearing
+                        if not is_gb_track_wpnts and len(wpnts_data.list) > 0:
                             avoid_wpnt_idx = np.argmin(abs(wpnts_data.array[:,2] - obs_s))
                             ot_d = wpnts_data.list[avoid_wpnt_idx].d_m
                         min_dist = abs(ot_d - obs_d)
@@ -1978,19 +1979,19 @@ class StateMachine:
                     closest_target = smart_helper.cur_avoidance_wpnts.closest_target
                     local_wpnts_src = StateType.OVERTAKE
 
-                # # HJ MODIFIED: Add distance check for static avoidance
+                # HJ MODIFIED: Add distance check for static avoidance
 
-                # static_avoidance_closest_dist = float('inf')
-                # if len(smart_helper.cur_static_avoidance_wpnts.list) > 0:
-                #     forward_dists = [(w.s_m - smart_helper.cur_s) % smart_helper.max_s for w in smart_helper.cur_static_avoidance_wpnts.list]
-                #     static_avoidance_closest_dist = min(forward_dists)
+                static_avoidance_closest_dist = float('inf')
+                if len(smart_helper.cur_static_avoidance_wpnts.list) > 0:
+                    forward_dists = [(w.s_m - smart_helper.cur_s) % smart_helper.max_s for w in smart_helper.cur_static_avoidance_wpnts.list]
+                    static_avoidance_closest_dist = min(forward_dists)
 
-                # if smart_helper.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < smart_helper.cur_static_avoidance_wpnts.closest_gap and static_avoidance_closest_dist < 1.0:
-                #     closest_gap = smart_helper.cur_static_avoidance_wpnts.closest_gap
-                #     closest_target = smart_helper.cur_static_avoidance_wpnts.closest_target
-                #     local_wpnts_src = StateType.OVERTAKE
+                if smart_helper.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < smart_helper.cur_static_avoidance_wpnts.closest_gap and static_avoidance_closest_dist < 1.0:
+                    closest_gap = smart_helper.cur_static_avoidance_wpnts.closest_gap
+                    closest_target = smart_helper.cur_static_avoidance_wpnts.closest_target
+                    local_wpnts_src = StateType.OVERTAKE
 
-                # # HJ MODIFIED End #####################################
+                # HJ MODIFIED End #####################################
 
                 if smart_helper.cur_start_wpnts.closest_target is not None and closest_gap < smart_helper.cur_start_wpnts.closest_gap:
                     closest_gap = smart_helper.cur_start_wpnts.closest_gap
@@ -2006,19 +2007,19 @@ class StateMachine:
                     closest_target = smart_helper.cur_avoidance_wpnts.closest_target
                     local_wpnts_src = StateType.OVERTAKE
 
-                # # HJ MODIFIED: Add distance check for static avoidance
+                # HJ MODIFIED: Add distance check for static avoidance
 
-                # static_avoidance_closest_dist = float('inf')
-                # if len(smart_helper.cur_static_avoidance_wpnts.list) > 0:
-                #     forward_dists = [(w.s_m - smart_helper.cur_s) % smart_helper.max_s for w in smart_helper.cur_static_avoidance_wpnts.list]
-                #     static_avoidance_closest_dist = min(forward_dists)
+                static_avoidance_closest_dist = float('inf')
+                if len(smart_helper.cur_static_avoidance_wpnts.list) > 0:
+                    forward_dists = [(w.s_m - smart_helper.cur_s) % smart_helper.max_s for w in smart_helper.cur_static_avoidance_wpnts.list]
+                    static_avoidance_closest_dist = min(forward_dists)
 
-                # if smart_helper.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < smart_helper.cur_static_avoidance_wpnts.closest_gap and static_avoidance_closest_dist < 1.0:
-                #     closest_gap = smart_helper.cur_static_avoidance_wpnts.closest_gap
-                #     closest_target = smart_helper.cur_static_avoidance_wpnts.closest_target
-                #     local_wpnts_src = StateType.OVERTAKE
+                if smart_helper.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < smart_helper.cur_static_avoidance_wpnts.closest_gap and static_avoidance_closest_dist < 1.0:
+                    closest_gap = smart_helper.cur_static_avoidance_wpnts.closest_gap
+                    closest_target = smart_helper.cur_static_avoidance_wpnts.closest_target
+                    local_wpnts_src = StateType.OVERTAKE
 
-                # # HJ MODIFIED End #####################################
+                # HJ MODIFIED End #####################################
 
                 if smart_helper.cur_start_wpnts.closest_target is not None and closest_gap < smart_helper.cur_start_wpnts.closest_gap:
                     closest_gap = smart_helper.cur_start_wpnts.closest_gap
@@ -2033,33 +2034,33 @@ class StateMachine:
                 closest_gap = self.cur_gb_wpnts.closest_gap
 
 
-                # # ===== HJ MODIFIED: Add distance check to prevent using far trajectories =====
-                # # Check distance to closest waypoint in overtaking trajectory (same logic as get_splini_wpts)
-                # avoidance_closest_dist = float('inf')
-                # if len(self.cur_avoidance_wpnts.list) > 0:
-                #     forward_dists = [(w.s_m - self.cur_s) % self.max_s for w in self.cur_avoidance_wpnts.list]
-                #     avoidance_closest_dist = min(forward_dists)
+                # ===== HJ MODIFIED: Add distance check to prevent using far trajectories =====
+                # Check distance to closest waypoint in overtaking trajectory (same logic as get_splini_wpts)
+                avoidance_closest_dist = float('inf')
+                if len(self.cur_avoidance_wpnts.list) > 0:
+                    forward_dists = [(w.s_m - self.cur_s) % self.max_s for w in self.cur_avoidance_wpnts.list]
+                    avoidance_closest_dist = min(forward_dists)
 
-                # # Only use overtaking trajectory if closest waypoint is < 1m ahead
-                # if self.cur_avoidance_wpnts.closest_target is not None and closest_gap <= self.cur_avoidance_wpnts.closest_gap and avoidance_closest_dist < 1.0:
-                # # ===== HJ MODIFIED END =====
-                #     closest_gap = self.cur_avoidance_wpnts.closest_gap
-                #     closest_target = self.cur_avoidance_wpnts.closest_target
-                #     local_wpnts_src = StateType.OVERTAKE
+                # Only use overtaking trajectory if closest waypoint is < 1m ahead
+                if self.cur_avoidance_wpnts.closest_target is not None and closest_gap <= self.cur_avoidance_wpnts.closest_gap and avoidance_closest_dist < 1.0:
+                # ===== HJ MODIFIED END =====
+                    closest_gap = self.cur_avoidance_wpnts.closest_gap
+                    closest_target = self.cur_avoidance_wpnts.closest_target
+                    local_wpnts_src = StateType.OVERTAKE
 
-                # # HJ MODIFIED: Add distance check for static avoidance
+                # HJ MODIFIED: Add distance check for static avoidance
 
-                # static_avoidance_closest_dist = float('inf')
-                # if len(self.cur_static_avoidance_wpnts.list) > 0:
-                #     forward_dists = [(w.s_m - self.cur_s) % self.max_s for w in self.cur_static_avoidance_wpnts.list]
-                #     static_avoidance_closest_dist = min(forward_dists)
+                static_avoidance_closest_dist = float('inf')
+                if len(self.cur_static_avoidance_wpnts.list) > 0:
+                    forward_dists = [(w.s_m - self.cur_s) % self.max_s for w in self.cur_static_avoidance_wpnts.list]
+                    static_avoidance_closest_dist = min(forward_dists)
 
-                # if self.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < self.cur_static_avoidance_wpnts.closest_gap and static_avoidance_closest_dist < 1.0:
-                #     closest_gap = self.cur_static_avoidance_wpnts.closest_gap
-                #     closest_target = self.cur_static_avoidance_wpnts.closest_target
-                #     local_wpnts_src = StateType.OVERTAKE
+                if self.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < self.cur_static_avoidance_wpnts.closest_gap and static_avoidance_closest_dist < 1.0:
+                    closest_gap = self.cur_static_avoidance_wpnts.closest_gap
+                    closest_target = self.cur_static_avoidance_wpnts.closest_target
+                    local_wpnts_src = StateType.OVERTAKE
 
-                # # HJ MODIFIED End #####################################
+                # HJ MODIFIED End #####################################
 
                 if self.cur_start_wpnts.closest_target is not None and closest_gap < self.cur_start_wpnts.closest_gap:
                     closest_gap = self.cur_start_wpnts.closest_gap
@@ -2070,11 +2071,25 @@ class StateMachine:
             if local_wpnts_src == StateType.RECOVERY and self.cur_recovery_wpnts.closest_target is not None:
                 closest_target = self.cur_recovery_wpnts.closest_target
                 closest_gap = self.cur_recovery_wpnts.closest_gap
-                if self.cur_avoidance_wpnts.closest_target is not None and closest_gap < self.cur_avoidance_wpnts.closest_gap:
+
+                # HJ MODIFIED: Add distance check for dynamic avoidance
+                avoidance_closest_dist = float('inf')
+                if len(self.cur_avoidance_wpnts.list) > 0:
+                    forward_dists = [(w.s_m - self.cur_s) % self.max_s for w in self.cur_avoidance_wpnts.list]
+                    avoidance_closest_dist = min(forward_dists)
+
+                if self.cur_avoidance_wpnts.closest_target is not None and closest_gap < self.cur_avoidance_wpnts.closest_gap and avoidance_closest_dist < 1.0:
                     closest_gap = self.cur_avoidance_wpnts.closest_gap
                     closest_target = self.cur_avoidance_wpnts.closest_target
                     local_wpnts_src = StateType.OVERTAKE
-                if self.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < self.cur_static_avoidance_wpnts.closest_gap:
+
+                # HJ MODIFIED: Add distance check for static avoidance
+                static_avoidance_closest_dist = float('inf')
+                if len(self.cur_static_avoidance_wpnts.list) > 0:
+                    forward_dists = [(w.s_m - self.cur_s) % self.max_s for w in self.cur_static_avoidance_wpnts.list]
+                    static_avoidance_closest_dist = min(forward_dists)
+
+                if self.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < self.cur_static_avoidance_wpnts.closest_gap and static_avoidance_closest_dist < 1.0:
                     closest_gap = self.cur_static_avoidance_wpnts.closest_gap
                     closest_target = self.cur_static_avoidance_wpnts.closest_target
                     local_wpnts_src = StateType.OVERTAKE
@@ -2158,6 +2173,22 @@ class StateMachine:
             rospy.logwarn(f"[{self.name}] FTGONLY sector !!!")
         else:
             self.cur_state, self.local_wpnts_src = self.state_transitions[self.cur_state](self)
+
+        # ===== HJ ADDED: Clear old avoidance waypoints when returning to base trajectory =====
+        if prev_wpnts_src == StateType.OVERTAKE and self.local_wpnts_src in [StateType.GB_TRACK, StateType.SMART_STATIC]:
+            # Overtaking finished, uninitialize old avoidance trajectories
+            rospy.logwarn(f"[STATE MACHINE] Uninitializing old avoidance waypoints (OVERTAKE → {self.local_wpnts_src.name})")
+            self.cur_avoidance_wpnts.is_init = False
+            self.cur_avoidance_wpnts.list = []
+            self.cur_avoidance_wpnts.array = None
+            self.cur_avoidance_wpnts.closest_target = None
+            self.cur_static_avoidance_wpnts.is_init = False
+            self.cur_static_avoidance_wpnts.list = []
+            self.cur_static_avoidance_wpnts.array = None
+            self.cur_static_avoidance_wpnts.closest_target = None
+            if DEBUG_STATE_TRANSITION:
+                rospy.logwarn(f"[STATE CHANGE] Cleared: avoidance.is_init={self.cur_avoidance_wpnts.is_init}, static_avoidance.is_init={self.cur_static_avoidance_wpnts.is_init}")
+        # ===== HJ ADDED END =====
 
         # ===== HJ ADDED: Log state changes =====
         if DEBUG_STATE_TRANSITION:
