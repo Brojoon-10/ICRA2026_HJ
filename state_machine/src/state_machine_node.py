@@ -363,7 +363,10 @@ class StateMachine:
         if self.ot_planner == "spliner" or self.ot_planner == "predictive_spliner":
             rospy.Subscriber("/planner/avoidance/otwpnts", OTWpntArray, self.avoidance_cb)
             # ===== HJ ADDED: Subscribe to smart static avoidance waypoints and flag =====
-            rospy.Subscriber("/planner/avoidance/smart_static_otwpnts", OTWpntArray, self.smart_static_avoidance_cb)
+
+            rospy.Subscriber("/planner/avoidance/smart_static_otwpnts_scaled", OTWpntArray, self.smart_static_avoidance_cb)
+            # rospy.Subscriber("/planner/avoidance/smart_static_otwpnts", OTWpntArray, self.smart_static_avoidance_cb)
+
             from std_msgs.msg import Bool
             rospy.Subscriber("/planner/avoidance/smart_static_active", Bool, self.smart_static_active_cb)
             # ===== HJ ADDED END =====
@@ -510,8 +513,15 @@ class StateMachine:
         # ===== HJ MODIFIED END =====
 
     def smart_static_active_cb(self, data):
-        """Flag from spliner: is smart static mode currently active?"""
+        """Flag from spliner: is smart static mode currently active?
+        Only activate if smart waypoints are also ready.
+        """
+        if data.data and not self.cur_smart_static_avoidance_wpnts.is_init:
+            # Spliner wants smart mode but waypoints not ready yet - stay in current mode
+            rospy.logwarn_throttle(2.0, "[StateMachine] Smart mode requested but waypoints not ready, staying in current mode")
+            return
         self.smart_static_active = data.data
+
     # ===== HJ ADDED END =====
 
     def start_wpnts_cb(self, data: OTWpntArray):

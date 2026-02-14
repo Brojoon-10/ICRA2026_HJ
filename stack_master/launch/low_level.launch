@@ -9,10 +9,10 @@
   </node>
 
   <!-- IMU -->
-  <arg name="imu_config" default="$(find stack_master)/config/$(arg racecar_version)/devices/imu.yaml" />
+  <!-- <arg name="imu_config" default="$(find stack_master)/config/$(arg racecar_version)/devices/imu.yaml" />
   <node name="microstrain_inertial_driver" pkg="microstrain_inertial_driver" type="microstrain_inertial_driver_node" output="screen">
     <rosparam file="$(arg imu_config)" command="load" />
-  </node>
+  </node> -->
 
   <!-- VESC -->
   <group ns="vesc">
@@ -27,7 +27,7 @@
 
   <node pkg="stack_master" type="relay_node.py" name="relay_node" output="screen"/>
 
-  <node pkg="joy" type="joy_node" name="joy_node" output="screen"/>
+  <!-- <node pkg="joy" type="joy_node" name="joy_node" output="screen"/> -->
   <!-- <node pkg="joy" type="joy_node" name="joy_node"/> -->
 
 </launch>
