@@ -32,6 +32,11 @@ export ROS_IP=localhost
 
 # export ROS_HOSTNAME='192.168.50.38'
 # export ROS_IP='192.168.50.38'
-export CAR_NAME="SRX2"
+# export CAR_NAME="SRX2"
+
+export ROS_HOSTNAME='192.168.70.3'
+export ROS_IP='192.168.70.3'
+export CAR_NAME="FIESTA2"
+
 
 export ROS_MASTER_URI="http://${ROS_HOSTNAME}:11311"

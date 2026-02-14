@@ -498,8 +498,10 @@ class Controller_manager:
         
     def imu_cb(self, data):
         self.acc_now[1:] = self.acc_now[:-1]
-        self.acc_now[0] = -data.linear_acceleration.x # vesc is rotated 90 deg, so (-acc_y) == (long_acc)
-        
+        # self.acc_now[0] = -data.linear_acceleration.x # Micro Strain
+
+        self.acc_now[0] = -data.linear_acceleration.y # vesc is rotated 90 deg -y is +x dir
+
         self.yaw_rate = -data.angular_velocity.z # vesc is rotated 90 deg, so (-acc_y) == (long_acc)
         self.controller.yaw_rate = self.yaw_rate
 

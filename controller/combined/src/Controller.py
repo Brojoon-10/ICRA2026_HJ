@@ -256,16 +256,30 @@ class Controller:
  
         return speed, acceleration, jerk, steering_angle, L1_point, L1_distance, self.idx_nearest_waypoint, self.curvature_waypoints, self.future_position
  
+    # def AEB_for_weird_local_wpnt(self, speed):
+    #     nearest_local_wpnt = self.waypoint_array_in_map[self.idx_nearest_waypoint,:2]
+        
+    #     local_wpnt_dist = np.sqrt( (self.position_in_map[0,0] - nearest_local_wpnt[0])**2 + (self.position_in_map[0,1] - nearest_local_wpnt[1])**2)
+        
+    #     if local_wpnt_dist >= self.AEB_thres:
+    #         return 2.0
+    #     else :
+    #         return speed
+
+#-------------------------HJ Emergency Editing--------------------------
+
     def AEB_for_weird_local_wpnt(self, speed):
-        nearest_local_wpnt = self.waypoint_array_in_map[self.idx_nearest_waypoint,:2]
-        
-        local_wpnt_dist = np.sqrt( (self.position_in_map[0,0] - nearest_local_wpnt[0])**2 + (self.position_in_map[0,1] - nearest_local_wpnt[1])**2)
-        
+        # Calculate minimum distance directly to all waypoints (more robust)
+        dists = np.linalg.norm(self.waypoint_array_in_map[:, :2] - self.position_in_map[0, :2], axis=1)
+        local_wpnt_dist = np.min(dists)
+
         if local_wpnt_dist >= self.AEB_thres:
-            return 2.0
+            return speed
         else :
             return speed
- 
+        
+#-------------------------HJ Emergency Editing--------------------------
+
     def calc_steering_angle_for_future(self, future_L1_point, L1_distance, yaw, furture_lat_e_norm, v):
         """
         The purpose of this function is to calculate the steering angle based on the L1 point, desired lateral acceleration and velocity
