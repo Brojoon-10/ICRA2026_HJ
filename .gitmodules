@@ -11,9 +11,3 @@
 	path = state_estimation/glim
 	url = git@github.com:HangyoCho/GLIL_unicorn_racing.git
 	branch = feature/thirdparty-integration
-[submodule "state_estimation/glim_ros1"]
-	path = state_estimation/glim_ros1
-	url = git@github.com:HangyoCho/GLIL_ros1.git
-[submodule "state_estimation/glim_ext"]
-	path = state_estimation/glim_ext
-	url = https://github.com/koide3/glim_ext.git
