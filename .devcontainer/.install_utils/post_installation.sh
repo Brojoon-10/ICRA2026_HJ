@@ -35,7 +35,7 @@ chmod +x compile.sh
 # source
 source /opt/ros/noetic/setup.bash && source /home/${USER}/catkin_ws/devel/setup.bash
 
-catkin build perception
+catkin build abp_detection
 source /opt/ros/noetic/setup.bash && source /home/${USER}/catkin_ws/devel/setup.bash
 
 # python privileges

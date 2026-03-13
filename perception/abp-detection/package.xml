@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="2">
-  <name>abp-detection</name>
+  <name>abp_detection</name>
   <version>0.0.0</version>
   <description>The perception package</description>
 
@@ -66,6 +66,9 @@
   <build_depend>std_srvs</build_depend>
   <build_depend>image_transport</build_depend>
   <build_depend>f110_msgs</build_depend>
+  <build_depend>frenet_conversion</build_depend>
+  <build_depend>polygon_filter</build_depend>
+  <build_depend>grid_filter</build_depend>
 
   <build_export_depend>roscpp</build_export_depend>
   <build_export_depend>rospy</build_export_depend>
@@ -88,6 +91,9 @@
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>image_transport</exec_depend>
   <exec_depend>f110_msgs</exec_depend>
+  <exec_depend>frenet_conversion</exec_depend>
+  <exec_depend>polygon_filter</exec_depend>
+  <exec_depend>grid_filter</exec_depend>
 
 
 
