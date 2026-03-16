@@ -30,7 +30,7 @@ RUN . /.install_utils/cartographer_req.sh && . /.install_utils/install_abseil.sh
 
 # install particle filter
 # RUN . /.install_utils/dev_pf_setup.sh
-# istall livox driver
+# install livox driver & Livox-SDK2
 RUN . /.install_utils/dev_livox_setup.sh
 
 # ── GLIL dependencies ────────────────────────────────────────────────────────
