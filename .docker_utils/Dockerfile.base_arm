@@ -16,7 +16,7 @@ RUN apt-get update && xargs apt-get install -y < /.install_utils/linux_req_car.t
 RUN pip3 install "setuptools>=61,<65"
 RUN pip3 install -r /.install_utils/requirements.txt && \
         pip3 install numpy==1.18.1 --no-build-isolation && \
-        pip3 install casadi
+        pip3 install casadi open3d
 
 
 # install catkin build tools
