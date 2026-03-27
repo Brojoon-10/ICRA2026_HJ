@@ -23,9 +23,9 @@ class VelocityPlanner:
 
     # ===== HJ ADDED: Flag to save modified parameters to CSV files =====
 
-    SAVE_CONFIG = True  # Set to True to save modified parameters and backup originals
+    # SAVE_CONFIG = True  # Set to True to save modified parameters and backup originals
 
-    # SAVE_CONFIG = False  # Set to True to save modified parameters and backup originals
+    SAVE_CONFIG = False  # Set to True to save modified parameters and backup originals
 
     # ===== HJ ADDED END =====
 
@@ -63,11 +63,11 @@ class VelocityPlanner:
 
         self.v_max = 12.0
         self.ax_max_motor = 7
-        self.ax_max_brake = 8.5
-        self.dyn_model_exp = 1.15
+        self.ax_max_brake = 7
+        self.dyn_model_exp = 1.1
 
-        self.a_y_max = 6.5
-        self.a_x_max = 9.0
+        self.a_y_max = 5.5
+        self.a_x_max = 7.0
 #---------------------------------------
 
         # self.v_max = 10.0

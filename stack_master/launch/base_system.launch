@@ -12,7 +12,7 @@
     doc="If using the F110 Simulator, what tire model to use." />
   <arg name="scanalign" default="False"
     doc="Whether to launch the scan-align node that calculates localization accuracy." />
-  <arg name="use_vesc_imu" default="True" doc="whether use built-in vesc imu or microstrain" />
+  <arg name="use_vesc_imu" default="False" doc="whether use built-in vesc imu or microstrain" />
   <arg name="enable_smart_scaling" default="True" doc="Enable smart waypoints velocity scaling" />
 
   <param name="racecar_version" value="$(arg racecar_version)" />
