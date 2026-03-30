@@ -36,7 +36,25 @@ export ROS_IP=localhost
 
 export ROS_HOSTNAME='192.168.70.3'
 export ROS_IP='192.168.70.3'
-export CAR_NAME="FIESTA2"
+export CAR_NAME="SRX1"
 
 
 export ROS_MASTER_URI="http://${ROS_HOSTNAME}:11311"
+
+### HJ : permanently switch settings in ~/.bashrc
+# usage: set_car HOBAO
+set_car() {
+  sed -i "s/^export CAR_NAME=.*/export CAR_NAME=\"$1\"/" ~/.bashrc
+  export CAR_NAME="$1"
+  echo "CAR_NAME permanently set to $1"
+}
+# usage: set_ip 192.168.70.3
+set_ip() {
+  sed -i "s/^export ROS_HOSTNAME=.*/export ROS_HOSTNAME='$1'/" ~/.bashrc
+  sed -i "s/^export ROS_IP=.*/export ROS_IP='$1'/" ~/.bashrc
+  sed -i "s|^export ROS_MASTER_URI=.*|export ROS_MASTER_URI=\"http://$1:11311\"|" ~/.bashrc
+  export ROS_HOSTNAME="$1"
+  export ROS_IP="$1"
+  export ROS_MASTER_URI="http://$1:11311"
+  echo "ROS_HOSTNAME/IP/MASTER_URI permanently set to $1"
+}
