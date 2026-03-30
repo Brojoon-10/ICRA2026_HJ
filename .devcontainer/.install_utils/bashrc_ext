@@ -26,14 +26,6 @@ echo "ROS_DISTRO $ROS_DISTRO"
 export ROS_HOSTNAME=localhost
 export ROS_IP=localhost
 
-# export ROS_HOSTNAME='192.168.50.23'
-# export ROS_IP='192.168.50.23'
-# export CAR_NAME="SRX1"
-
-# export ROS_HOSTNAME='192.168.50.38'
-# export ROS_IP='192.168.50.38'
-# export CAR_NAME="SRX2"
-
 export ROS_HOSTNAME='192.168.70.3'
 export ROS_IP='192.168.70.3'
 export CAR_NAME="SRX1"
