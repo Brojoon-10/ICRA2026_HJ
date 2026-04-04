@@ -1,0 +1,19 @@
+<!-- -*- mode: XML -*- -->
+<!-- ### HJ : 3D version of sector_slicing.launch using 3D sector_tuner packages -->
+<launch>
+    <arg name="map"/>
+        <!-- Launch 3D Sector Slicer/Tuner from Utils -->
+        <node pkg="sector_tuner_3d" type="sector_slicing.py" name="sector_node_3d" output="screen">
+            <param name="save_dir" value="$(find stack_master)/maps/$(arg map)" />
+        </node>
+
+        <!-- Launch 3D Overtaking Sector Slicer/Tuner from Utils -->
+        <node pkg="overtaking_sector_tuner_3d" type="ot_sector_slicing.py" name="ot_sector_node_3d" output="screen">
+            <param name="save_dir" value="$(find stack_master)/maps/$(arg map)" />
+        </node>
+
+        <!-- Launch 3D Static Obstacle Sector Slicer/Tuner from Utils -->
+        <node pkg="static_obstacle_sector_tuner_3d" type="static_obs_sector_slicing.py" name="static_obs_sector_node_3d" output="screen">
+            <param name="save_dir" value="$(find stack_master)/maps/$(arg map)" />
+        </node>
+</launch>
