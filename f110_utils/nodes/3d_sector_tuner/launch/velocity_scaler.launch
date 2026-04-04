@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="debug_plot" default="False"/>
+    <arg name="enable_smart_scaling" default="False"/>
+
+    <!-- Launch basic velocity scaler (only GB) when smart scaling is disabled -->
+    <node pkg="sector_tuner" type="vel_scaler_node.py" name="velocity_scaler" output="screen" unless="$(arg enable_smart_scaling)">
+        <param name="debug_plot" value="$(arg debug_plot)"/>
+    </node>
+
+    <!-- Launch extended velocity scaler (GB + Smart) when smart scaling is enabled -->
+    <node pkg="sector_tuner" type="vel_scaler_node_for_both_opt.py" name="velocity_scaler" output="screen" if="$(arg enable_smart_scaling)">
+        <param name="debug_plot" value="$(arg debug_plot)"/>
+        <param name="enable_smart_scaling" value="$(arg enable_smart_scaling)"/>
+    </node>
+
+</launch>
+
