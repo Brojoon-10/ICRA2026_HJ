@@ -39,3 +39,9 @@ trailing_p_gain: 1.35
 trailing_vel_gain: 0.25
 v_max: 8.0
 velocity_step: 0.5
+# HJ: lateral error correction (0=none, 1=stanley, 2=predictive)
+lat_correction_mode: 0
+lat_K_stanley: 1.5
+lat_pred_horizon: 0.3
+lat_pred_alpha: 0.3
+speed_ff_gain: 0.0

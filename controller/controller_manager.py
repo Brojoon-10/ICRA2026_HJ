@@ -69,7 +69,7 @@ class Controller_manager:
         rospy.loginfo(f"[{self.name}] Using {self.LUT_name}")
         
         self.use_sim = rospy.get_param('/sim')
-        self.wheelbase = rospy.get_param('/vesc/wheelbase', 0.36) # NUCX
+        self.wheelbase = rospy.get_param('/vesc/wheelbase', 0.33) # NUCX
         self.measuring = rospy.get_param('/measure', False)
         
         self.state_machine_rate = rospy.get_param('state_machine/rate') #rate in hertz
@@ -357,6 +357,15 @@ class Controller_manager:
         self.controller.start_curvature_factor = self.start_curvature_factor
 
         self.controller.AEB_thres = self.AEB_thres
+
+        ### HJ : lateral correction params from dyn_reconfigure
+        lat_mode_int = rospy.get_param('dyn_controller/lat_correction_mode', 0)
+        self.controller.lat_correction_mode = ['none', 'stanley', 'predictive'][lat_mode_int]
+        self.controller.lat_K_stanley = rospy.get_param('dyn_controller/lat_K_stanley', 1.5)
+        self.controller.lat_pred_horizon = rospy.get_param('dyn_controller/lat_pred_horizon', 0.3)
+        self.controller.lat_pred_alpha = rospy.get_param('dyn_controller/lat_pred_alpha', 0.3)
+        self.controller.speed_ff_gain = rospy.get_param('dyn_controller/speed_ff_gain', 0.0)
+        ### HJ : end
 
         ## Trailing Control Parameters
         self.controller.trailing_gap = self.trailing_gap # Distance in meters
