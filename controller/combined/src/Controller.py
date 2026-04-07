@@ -157,6 +157,16 @@ class Controller:
         self.future_lat_e_norm = 0.0
         self.lat_acc = 0.0
         self.boost_mode = False
+
+        ### HJ : lateral correction params (updated via dyn_reconfigure)
+        lat_mode_int = rospy.get_param('L1_controller/lat_correction_mode', 0)
+        self.lat_correction_mode = ['none', 'stanley', 'predictive'][lat_mode_int]
+        self.lat_K_stanley = rospy.get_param('L1_controller/lat_K_stanley', 1.5)
+        self.lat_pred_horizon = rospy.get_param('L1_controller/lat_pred_horizon', 0.3)
+        self.lat_pred_alpha = rospy.get_param('L1_controller/lat_pred_alpha', 0.3)
+        rospy.loginfo(f"[Controller] Lateral correction mode: {self.lat_correction_mode}")
+        self.speed_ff_gain = rospy.get_param('L1_controller/speed_ff_gain', 0.0)
+        ### HJ : end
         self.future_position_z = 0.0  ### HJ : z from track spline for future position
 
     def main_loop(self, state, position_in_map, waypoint_array_in_map, speed_now, opponent, position_in_map_frenet, acc_now, track_length):
@@ -355,7 +365,12 @@ class Controller:
         # modifying steer based on heading
  
         steering_angle += self.compute_future_heading_correction(Future_L1_vector, yaw, dt, self.speed_now)
- 
+
+        ### HJ : lateral error correction modes (Stanley / Model-predictive)
+        signed_d = self.get_signed_lateral_error()
+        steering_angle = self.apply_lateral_correction(steering_angle, signed_d, yaw)
+        ### HJ : end
+
         # modifying steer based on acceleration
         #########################################
         steering_angle = self.acc_scaling(steering_angle)
@@ -380,11 +395,11 @@ class Controller:
         if abs(steering_angle - self.curr_steering_angle) > threshold:
             self.logger_info(f"steering angle clipped")
         steering_angle = np.clip(steering_angle, self.curr_steering_angle - threshold, self.curr_steering_angle + threshold)
-        # steering_angle = np.clip(steering_angle,-0.53,0.53)
+        steering_angle = np.clip(steering_angle,-0.53,0.53)
         
         #-------------------------0329 HJ-----------------------------
         # For HOBAO
-        steering_angle = np.clip(steering_angle,-0.6632,0.6632)
+        # steering_angle = np.clip(steering_angle,-0.6632,0.6632)
         #-------------------------0329 HJ-----------------------------
 
 
@@ -488,7 +503,13 @@ class Controller:
         # ===== HJ MODIFIED END =====
  
         speed_command = self.speed_adjust_lat_err(speed_command, lat_e_norm)
- 
+
+        ### HJ : acceleration feedforward — help VESC respond faster
+        if hasattr(self, 'speed_ff_gain') and self.speed_ff_gain > 0:
+            target_ax = self.waypoint_array_in_map[idx_la_position, 8]  # ax_mps2
+            speed_command += self.speed_ff_gain * target_ax
+        ### HJ : end
+
         return speed_command
     
     def trailing_controller(self, global_speed):
@@ -560,16 +581,85 @@ class Controller:
         steer *= factor
         return steer
  
+    ### HJ : lateral error correction ========================================
+
+    def get_signed_lateral_error(self):
+        """Get signed lateral error (d) from frenet coordinates.
+        Positive d = left of raceline, negative d = right of raceline."""
+        try:
+            _, d = self.converter.get_frenet_3d(
+                np.array([self.future_position[0, 0]]),
+                np.array([self.future_position[0, 1]]),
+                np.array([self.future_position_z]))
+            idx = self.nearest_waypoint(self.future_position[0, :2], self.waypoint_array_in_map[:, :2])
+            wpnt_d = self.waypoint_array_in_map[idx, 9] if self.waypoint_array_in_map.shape[1] > 9 else 0.0
+            return float(d[0] - wpnt_d)
+        except Exception:
+            return 0.0
+
+    def apply_lateral_correction(self, steering_angle, signed_d, yaw):
+        """Apply lateral error correction based on selected mode."""
+        if self.lat_correction_mode == 'stanley':
+            return self._stanley_correction(steering_angle, signed_d)
+        elif self.lat_correction_mode == 'predictive':
+            return self._predictive_correction(steering_angle, signed_d, yaw)
+        else:
+            return steering_angle  # 'none' — no correction
+
+    def _stanley_correction(self, steering_angle, signed_d):
+        """Stanley crosstrack correction: arctan(K * d / v)"""
+        v = max(self.speed_now, 0.5)
+        correction = np.arctan(self.lat_K_stanley * signed_d / v)
+        return steering_angle + correction
+
+    def _predictive_correction(self, steering_angle, signed_d, yaw):
+        """Model-predictive lateral correction using bicycle model.
+        1. Predict d_future with current steering (PP + heading corr applied)
+        2. Compute delta_optimal that makes d_future = 0
+        3. Blend: delta = delta + alpha * (delta_optimal - delta)
+        """
+        v = max(self.speed_now, 0.5)
+        T = self.lat_pred_horizon
+        L = self.wheelbase
+        alpha = self.lat_pred_alpha
+
+        # Heading error relative to raceline
+        idx = self.nearest_waypoint(self.future_position[0, :2], self.waypoint_array_in_map[:, :2])
+        wpnt_psi = self.waypoint_array_in_map[idx, 4]  # psi_rad
+        heading_err = yaw - wpnt_psi
+        heading_err = (heading_err + np.pi) % (2 * np.pi) - np.pi
+
+        # Predict d_future with current steering
+        delta_clipped = np.clip(steering_angle, -1.0, 1.0)
+        yaw_rate_pred = v * np.tan(delta_clipped) / L
+        heading_err_future = heading_err + yaw_rate_pred * T
+        d_future = signed_d + v * (np.sin(heading_err) + np.sin(heading_err_future)) / 2.0 * T
+
+        # Solve for delta_optimal: d_future = 0
+        # Linearized: d + v*sin(he)*T + 0.5*v^2*cos(he)*tan(delta)/L*T^2 = 0
+        denom = 0.5 * v**2 * np.cos(heading_err) * T**2
+        if abs(denom) < 1e-6:
+            return steering_angle
+
+        tan_delta_opt = -(signed_d + v * np.sin(heading_err) * T) * L / denom
+        tan_delta_opt = np.clip(tan_delta_opt, -2.0, 2.0)
+        delta_optimal = np.arctan(tan_delta_opt)
+
+        # Blend PP result with model prediction
+        return steering_angle + alpha * (delta_optimal - steering_angle)
+
+    ### HJ : end lateral error correction ====================================
+
     def steer_scaling_for_lat_err(self, steer, lateral_error):
-        
+
         if self.start_mode:
             return steer
-    
+
         factor = np.exp(np.log(2)*lateral_error)
- 
+
         steer *= factor
         return steer
-    
+
     def calc_future_lateral_error_norm(self):
         """
         Calculates future lateral error
