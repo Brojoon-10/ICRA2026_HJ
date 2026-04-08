@@ -94,6 +94,8 @@ class VelocityPlanner:
             'a_x_max': self.a_x_max,
             'grip_scale_exp': self.grip_scale_exp,
             'slope_correction': self.slope_correction,
+            'slope_brake_margin': self.slope_brake_margin,
+            'slope_brake_vmax': self.slope_brake_vmax,
         })
         # Reset changed flag — don't publish until user actually changes rqt
         self.dyn_reconfig_changed = False
@@ -111,6 +113,8 @@ class VelocityPlanner:
             self.a_x_max = params.get('a_x_max', 5.0)
             self.grip_scale_exp = params.get('grip_scale_exp', 0.7)
             self.slope_correction = params.get('slope_correction', 1.0)
+            self.slope_brake_margin = params.get('slope_brake_margin', 0.0)
+            self.slope_brake_vmax = params.get('slope_brake_vmax', 5.0)
             rospy.loginfo(f"[VelPlanner3D] Loaded params from {self.vel_planner_yaml}")
         else:
             rospy.logwarn(f"[VelPlanner3D] {self.vel_planner_yaml} not found, using defaults")
@@ -122,6 +126,8 @@ class VelocityPlanner:
             self.a_x_max = 5.0
             self.grip_scale_exp = 0.7
             self.slope_correction = 1.0
+            self.slope_brake_margin = 0.0
+            self.slope_brake_vmax = 5.0
 
     def _apply_params_to_ggv(self):
         """Apply current params to ggv/ax_max tables"""
@@ -141,6 +147,8 @@ class VelocityPlanner:
             'a_x_max': float(self.a_x_max),
             'grip_scale_exp': float(self.grip_scale_exp),
             'slope_correction': float(self.slope_correction),
+            'slope_brake_margin': float(self.slope_brake_margin),
+            'slope_brake_vmax': float(self.slope_brake_vmax),
         }
         with open(self.vel_planner_yaml, 'w') as f:
             yaml.dump(params, f, default_flow_style=False)
@@ -165,6 +173,8 @@ class VelocityPlanner:
         self.a_x_max = config.a_x_max
         self.grip_scale_exp = config.grip_scale_exp
         self.slope_correction = config.slope_correction
+        self.slope_brake_margin = config.slope_brake_margin
+        self.slope_brake_vmax = config.slope_brake_vmax
 
         self._apply_params_to_ggv()
 
@@ -183,6 +193,8 @@ class VelocityPlanner:
             config.a_x_max = self.a_x_max
             config.grip_scale_exp = self.grip_scale_exp
             config.slope_correction = self.slope_correction
+            config.slope_brake_margin = self.slope_brake_margin
+            config.slope_brake_vmax = self.slope_brake_vmax
             config.load_yaml = False
             rospy.loginfo("[VelPlanner3D] Reloaded from yaml")
 
@@ -196,7 +208,8 @@ class VelocityPlanner:
         rospy.loginfo(f"[VelPlanner3D] Reconfig: v_max={self.v_max}, ax={self.a_x_max}, ay={self.a_y_max}, "
                       f"motor={self.ax_max_motor}, brake={self.ax_max_brake}, "
                       f"dyn_exp={self.dyn_model_exp}, grip_exp={self.grip_scale_exp}, "
-                      f"slope_agg={self.slope_correction}")
+                      f"slope_corr={self.slope_correction}, "
+                      f"brake_margin={self.slope_brake_margin}m, brake_vmax={self.slope_brake_vmax}")
         return config
 
     def _save_modified_config(self, ggv_path, ax_max_path, b_ax_max_path):
@@ -298,6 +311,8 @@ class VelocityPlanner:
             'dmu_ds': dmu_ds,
             'h': self.h_cog,
             'slope_correction': self.slope_correction,
+            'slope_brake_margin': self.slope_brake_margin,
+            'slope_brake_vmax': self.slope_brake_vmax,
         }
 
         return track_3d_params, slope

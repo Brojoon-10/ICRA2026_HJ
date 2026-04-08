@@ -432,6 +432,27 @@ def __solver_fb_closed(p_ggv: np.ndarray,
                     v_gtilde_max = math.sqrt(9.81 * math.cos(mu_i) / dmu_i)
                     vx_profile[i] = min(vx_profile[i], v_gtilde_max)
 
+    # Pre-slope braking: Vmax from margin before slope entry through slope end
+    if track_3d_params is not None:
+        brake_margin = track_3d_params.get('slope_brake_margin', 0.0)
+        brake_vmax = track_3d_params.get('slope_brake_vmax', 5.0)
+        if brake_margin > 0:
+            mu_arr = track_3d_params['mu']
+            ds = el_lengths[0] if len(el_lengths) > 0 else 0.1
+            slope_threshold = math.radians(2.0)
+            in_slope = np.abs(mu_arr) > slope_threshold
+            slope_diff = np.diff(in_slope.astype(int))
+            slope_entries = np.where(slope_diff == 1)[0] + 1
+            slope_exits = np.where(slope_diff == -1)[0] + 1
+            margin_pts = int(round(brake_margin / ds))
+            for entry_idx in slope_entries:
+                exits_after = slope_exits[slope_exits > entry_idx]
+                exit_idx = exits_after[0] if len(exits_after) > 0 else len(vx_profile)
+                start_idx = max(0, entry_idx - margin_pts)
+                end_idx = min(len(vx_profile), exit_idx)
+                for j in range(start_idx, end_idx):
+                    vx_profile[j] = min(vx_profile[j], brake_vmax)
+
     """Use 3 laps and extract the middle lap to avoid boundary effects."""
 
     # Triple arrays (3 laps)
