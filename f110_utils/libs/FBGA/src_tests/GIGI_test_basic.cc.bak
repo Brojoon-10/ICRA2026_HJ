@@ -84,10 +84,8 @@ int main() {
   // GG::real total_time = fbga.compute(SS_eval_vec, KK_eval_vec, v_initial);
   // IY : add G_eval_vec (flat track, g = 9.81) for new 3D API
   std::vector<GG::real> G_eval_vec(SS_eval_vec.size(), 9.81);
-  std::vector<GG::real> MU_eval_vec(SS_eval_vec.size(), 0.0);   // HJ : flat track, no slope
-  std::vector<GG::real> DMU_eval_vec(SS_eval_vec.size(), 0.0);  // HJ : flat track, no slope rate
-  GG::real total_time = fbga.compute(SS_eval_vec, KK_eval_vec, G_eval_vec, MU_eval_vec, DMU_eval_vec, v_initial);
-  // IY+HJ : end
+  GG::real total_time = fbga.compute(SS_eval_vec, KK_eval_vec, G_eval_vec, v_initial);
+  // IY : end
   
   // 6. Extract results
   std::vector<GG::real> VX_eval_vec(SS_eval_vec.size());

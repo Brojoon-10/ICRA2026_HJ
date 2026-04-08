@@ -11,6 +11,7 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
   std_msgs
+  dynamic_reconfigure  ### HJ : for VelPlanner3D
 )
 
 ## System dependencies are found with CMake's conventions
@@ -92,6 +93,10 @@ find_package(catkin REQUIRED COMPONENTS
 #   cfg/DynReconf1.cfg
 #   cfg/DynReconf2.cfg
 # )
+### HJ : VelPlanner3D dynamic reconfigure
+generate_dynamic_reconfigure_options(
+  cfg/VelPlanner3D.cfg
+)
 
 ###################################
 ## catkin specific configuration ##
