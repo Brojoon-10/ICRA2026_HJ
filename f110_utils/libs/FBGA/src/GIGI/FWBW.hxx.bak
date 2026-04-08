@@ -54,8 +54,6 @@ private:
   std::function<real(real, real, real)> gg_Upper = nullptr; // Upper bound function (ay, v, g)
   std::function<real(real, real, real)> gg_Lower = nullptr; // Lower bound function (ay, v, g)
   // IY : end
-  // HJ : gg_exponent function for Vmax mu correction with exact diamond constraint
-  std::function<real(real, real)> gg_Exp = nullptr;  // (v, g) -> exponent p
   gg_range_max_min gg_range;     // Range of the curvature (struct with min and max functions)
   brentdekker BD;                // Solver
   solver_params solver_p;        // Solver parameters
@@ -66,10 +64,6 @@ private:
   // IY : apparent gravity per node (3D track support)
   std::vector<real> G_vec;       // Vector of apparent gravity values
   // IY : end
-  // HJ : slope angle per node for ax_tilde = ax - g*sin(mu) correction
-  std::vector<real> MU_vec;      // Vector of slope angles [rad]
-  // HJ : slope rate per node for g_tilde Vmax constraint (v < sqrt(g*cos(mu)/dmu_ds))
-  std::vector<real> DMU_vec;     // Vector of dmu/ds [rad/m]
   real v_I{0.0};                 // Initial velocity
   std::vector<int> dump_seg_id;  // Vector of segments with problems for debug
 public:
@@ -80,28 +74,23 @@ public:
   //   const gg_range_max_min &gg_range
   // );
   // IY : extend gg_Upper/gg_Lower signatures with g argument
-  // HJ : add gg_Exp for Vmax mu correction
   FWBW(
     const std::function<real(real, real, real)> &gg_Upper,
     const std::function<real(real, real, real)> &gg_Lower,
-    const gg_range_max_min &gg_range,
-    const std::function<real(real, real)> &gg_Exp = nullptr
+    const gg_range_max_min &gg_range
   );
-  // IY+HJ : end
+  // IY : end
   // main methods
   // core Forward-Backward method
   // real compute(std::vector<real> const &SS, std::vector<real> const &KK, real v0);
   // IY : add G_vec input (apparent gravity per node)
-  // HJ : add MU_vec + DMU_vec input for 3D slope correction
   real compute(
     std::vector<real> const &SS,
     std::vector<real> const &KK,
     std::vector<real> const &GG_,
-    std::vector<real> const &MU_,
-    std::vector<real> const &DMU_,
     real v0
   );
-  // IY+HJ : end
+  // IY : end
   // compute Vmax vector
   void compute_Vmax();
   // Forward step

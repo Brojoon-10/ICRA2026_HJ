@@ -19,8 +19,7 @@ def calc_vel_profile(ax_max_machines: np.ndarray,
                      v_end: float = None,
                      filt_window: int = None,
                      slope: np.ndarray = None,
-                     track_3d_params: dict = None,
-                     grip_scale_exp: float = 1.0) -> np.ndarray:  ### HJ : slope + track_3d_params + nonlinear grip
+                     track_3d_params: dict = None) -> np.ndarray:  ### HJ : slope + track_3d_params for g_tilde
     """
     author:
     Alexander Heilmeier
@@ -218,8 +217,7 @@ def calc_vel_profile(ax_max_machines: np.ndarray,
                                         op_mode=op_mode,
                                         b_ax_max_machines=b_ax_max_machines,
                                         slope=slope,
-                                        track_3d_params=track_3d_params,
-                                        grip_scale_exp=grip_scale_exp)  ### HJ : g_tilde + nonlinear grip
+                                        track_3d_params=track_3d_params)  ### HJ : g_tilde
 
     # ------------------------------------------------------------------------------------------------------------------
     # POSTPROCESSING ---------------------------------------------------------------------------------------------------
@@ -332,8 +330,7 @@ def __solver_fb_closed(p_ggv: np.ndarray,
                        mu: np.ndarray = None,
                        dyn_model_exp: float = 1.0,
                        slope: np.ndarray = None,
-                       track_3d_params: dict = None,
-                       grip_scale_exp: float = 1.0) -> np.ndarray:  ### HJ : g_tilde + nonlinear grip
+                       track_3d_params: dict = None) -> np.ndarray:  ### HJ : g_tilde
 
     # ------------------------------------------------------------------------------------------------------------------
     # FORWARD BACKWARD SOLVER ------------------------------------------------------------------------------------------
@@ -379,59 +376,6 @@ def __solver_fb_closed(p_ggv: np.ndarray,
     # cut vx_profile to car's top speed
     vx_profile[vx_profile > v_max] = v_max
 
-    ### HJ : g_tilde + mu 기반 Vmax 보정 (3d_gb_optimizer / FBGA와 동일 방식)
-    ###
-    ### 3d_gb_optimizer constraint: (|ax_tilde|/ax_max)^p + (|ay_tilde|/ay_max)^p <= 1
-    ### 등속(ax=0)이라도 경사에서 ax_tilde = -g*sin(mu) ≠ 0
-    ### → ay에 쓸 수 있는 그립 감소:
-    ###   ay_max_eff = ay_max * (1 - (|g*sin(mu)|/ax_max)^p)^(1/p)
-    ### → Vmax = sqrt(ay_max_eff / |kappa|)
-    ###
-    ### + crest(dmu/ds>0)에서 g_tilde=0 속도 상한
-    if track_3d_params is not None:
-        mu_arr = track_3d_params['mu']
-        dmu_ds_arr = track_3d_params['dmu_ds']
-        omega_y_arr = track_3d_params['omega_y']
-        omega_x_arr = track_3d_params['omega_x']
-        h_cog = track_3d_params['h']
-
-        for i in range(len(vx_profile)):
-            vx_i = vx_profile[i]
-            mu_i = mu_arr[i]
-
-            # g_tilde at current speed estimate
-            V_omega = omega_y_arr[i] * vx_i * vx_i
-            centrifugal = (omega_x_arr[i]**2 - omega_y_arr[i]**2) * h_cog * vx_i**2
-            g_tilde_i = max(-V_omega + centrifugal + 9.81 * math.cos(mu_i), 0.0)
-            ### HJ : nonlinear grip scaling (same as calc_ax_poss)
-            grip_scale_i = math.pow(g_tilde_i / 9.81, grip_scale_exp) if g_tilde_i > 0 else 0.0
-
-            # ay_max with grip_scale, ax_max WITHOUT grip_scale (for diamond ratio)
-            ay_max_i = mu_mean * np.interp(vx_i, p_ggv[0, :, 0], p_ggv[0, :, 2]) * grip_scale_i
-            ax_max_raw = mu_mean * np.interp(vx_i, p_ggv[0, :, 0], p_ggv[0, :, 1])  # original, no grip_scale
-
-            # (1) diamond constraint: mu gravity vs original tire ax capacity
-            slope_corr = track_3d_params.get('slope_correction', 1.0)
-            ax_grav = abs(9.81 * math.sin(mu_i)) * slope_corr
-            p = dyn_model_exp
-            if ax_max_raw > 1e-6 and ax_grav > 1e-6:
-                ratio = min(ax_grav / ax_max_raw, 1.0)
-                ay_max_eff = ay_max_i * math.pow(max(1.0 - math.pow(ratio, p), 0.0), 1.0 / p)
-            else:
-                ay_max_eff = ay_max_i
-
-            # (2) Vmax from lateral grip
-            if radii[i] < 1e4 and ay_max_eff > 0:
-                v_lat = math.sqrt(ay_max_eff * radii[i])
-                vx_profile[i] = min(vx_profile[i], v_lat)
-
-            # (3) crest (dmu_ds > 0): g_tilde=0 speed limit (only when slope_correction > 0)
-            if slope_corr > 0:
-                dmu_i = dmu_ds_arr[i]
-                if dmu_i > 1e-4:
-                    v_gtilde_max = math.sqrt(9.81 * math.cos(mu_i) / dmu_i)
-                    vx_profile[i] = min(vx_profile[i], v_gtilde_max)
-
     """Use 3 laps and extract the middle lap to avoid boundary effects."""
 
     # Triple arrays (3 laps)
@@ -467,8 +411,7 @@ def __solver_fb_closed(p_ggv: np.ndarray,
                                                 m_veh=m_veh,
                                                 b_ax_max_machines=b_ax_max_machines,
                                                 slope=slope_triple,
-                                                track_3d_params=track_3d_params_triple,
-                                                grip_scale_exp=grip_scale_exp)  ### HJ : g_tilde + nonlinear grip
+                                                track_3d_params=track_3d_params_triple)  ### HJ : g_tilde
 
     # Backward pass on 3 laps
     vx_profile_triple = __solver_fb_acc_profile(p_ggv=p_ggv_triple,
@@ -484,8 +427,7 @@ def __solver_fb_closed(p_ggv: np.ndarray,
                                                 m_veh=m_veh,
                                                 b_ax_max_machines=b_ax_max_machines,
                                                 slope=slope_triple,
-                                                track_3d_params=track_3d_params_triple,
-                                                grip_scale_exp=grip_scale_exp)  ### HJ : g_tilde + nonlinear grip
+                                                track_3d_params=track_3d_params_triple)  ### HJ : g_tilde
 
     # Extract middle lap (lap 2) - this has proper boundary conditions from both sides
     vx_profile = vx_profile_triple[no_points:2*no_points]
@@ -513,8 +455,7 @@ def __solver_fb_acc_profile(p_ggv: np.ndarray,
                             dyn_model_exp: float = 1.0,
                             backwards: bool = False,
                             slope: np.ndarray = None,
-                            track_3d_params: dict = None,
-                            grip_scale_exp: float = 1.0) -> np.ndarray:  ### HJ : g_tilde + nonlinear grip
+                            track_3d_params: dict = None) -> np.ndarray:  ### HJ : g_tilde
 
     # ------------------------------------------------------------------------------------------------------------------
     # PREPARATIONS -----------------------------------------------------------------------------------------------------
@@ -527,9 +468,6 @@ def __solver_fb_acc_profile(p_ggv: np.ndarray,
         slope = np.zeros(no_points)
 
     ### HJ : flipud track_3d_params arrays for backward pass
-    ### 주의: backward pass는 차가 역방향으로 달리는 게 아님.
-    ### 알고리즘이 역순으로 훑을 뿐, 물리적 경사 방향은 동일.
-    ### 따라서 flipud만 하고 부호 반전은 하지 않음.
     if track_3d_params is not None:
         if backwards:
             t3d_mod = {}
@@ -545,10 +483,8 @@ def __solver_fb_acc_profile(p_ggv: np.ndarray,
         radii_mod = np.flipud(radii)
         el_lengths_mod = np.flipud(el_lengths)
         mu_mod = np.flipud(mu)
-        ### HJ : backward pass에서는 진행 방향이 반대이므로 slope 부호 반전
-        ### 오르막(mu<0)이 내리막처럼 작용, 내리막(mu>0)이 오르막처럼 작용
         vx_profile = np.flipud(vx_profile)
-        slope_mod = np.flipud(slope)  ### HJ : flip slope order for backward pass (no sign change)
+        slope_mod = np.flipud(slope)  ### HJ : flip slope for backward pass
         mode = 'decel_backw'
     else:
         radii_mod = radii
@@ -598,11 +534,9 @@ def __solver_fb_acc_profile(p_ggv: np.ndarray,
                                            b_ax_max_machines=b_ax_max_machines,
                                            slope=slope_mod[i],
                                            track_3d_params=t3d_mod,
-                                           point_idx=i,
-                                           grip_scale_exp=grip_scale_exp)  ### HJ : g_tilde + nonlinear grip
+                                           point_idx=i)  ### HJ : g_tilde at point i
 
-            vx_possible_next_sq = math.pow(vx_profile[i], 2) + 2 * ax_possible_cur * el_lengths_mod[i]
-            vx_possible_next = math.sqrt(max(vx_possible_next_sq, 0.0))
+            vx_possible_next = math.sqrt(math.pow(vx_profile[i], 2) + 2 * ax_possible_cur * el_lengths_mod[i])
 
             if backwards:
                 """
@@ -627,11 +561,9 @@ def __solver_fb_acc_profile(p_ggv: np.ndarray,
                                                     b_ax_max_machines=b_ax_max_machines,
                                                     slope=slope_mod[i + 1],
                                                     track_3d_params=t3d_mod,
-                                                    point_idx=i + 1,
-                                                    grip_scale_exp=grip_scale_exp)  ### HJ : g_tilde + nonlinear grip
+                                                    point_idx=i + 1)  ### HJ : g_tilde at point i+1
 
-                    vx_tmp_sq = math.pow(vx_profile[i], 2) + 2 * ax_possible_next * el_lengths_mod[i]
-                    vx_tmp = math.sqrt(max(vx_tmp_sq, 0.0))
+                    vx_tmp = math.sqrt(math.pow(vx_profile[i], 2) + 2 * ax_possible_next * el_lengths_mod[i])
 
                     if vx_tmp < vx_possible_next:
                         vx_possible_next = vx_tmp
@@ -672,8 +604,7 @@ def calc_ax_poss(vx_start: float,
                  mode: str = 'accel_forw',
                  slope: float = 0.0,
                  track_3d_params: dict = None,
-                 point_idx: int = 0,
-                 grip_scale_exp: float = 1.0) -> float:  ### HJ : g_tilde + nonlinear grip
+                 point_idx: int = 0) -> float:  ### HJ : g_tilde with full 3D params
     """
     This function returns the possible longitudinal acceleration in the current step/point.
 
@@ -749,79 +680,65 @@ def calc_ax_poss(vx_start: float,
 
         # g_tilde = fmax(w_dot - V_omega + centrifugal + g*cos(mu)*cos(phi), 0)
         g_tilde = max(-V_omega + centrifugal + g * math.cos(mu_t) * math.cos(phi_t), 0.0)
-        ### HJ : nonlinear grip scaling: grip_scale = (g_tilde / g) ^ grip_scale_exp
-        grip_scale = math.pow(g_tilde / g, grip_scale_exp) if g_tilde > 0 else 0.0
+        grip_scale = g_tilde / g
     else:
-        # fallback: simple cos(slope) scaling with nonlinear exponent
-        grip_scale = math.pow(math.cos(slope), grip_scale_exp)
+        # fallback: simple cos(slope) scaling
+        grip_scale = math.cos(slope)
 
-    ### HJ : ax_tilde constraint inside Kamm circle (3d_gb_optimizer와 동일)
-    ###
-    ### 물리: ax_tilde = ax - g*sin(mu), constraint: |ax_tilde| <= ax_max_grip
-    ###       → 타이어 그립 중 g*sin(mu)만큼이 중력에 소모됨을 Kamm circle 안에서 고려
-    ###
-    ### backward pass는 flipud 역방향 시뮬레이션:
-    ###   역방향으로 달리면 오르막↔내리막 반전 → ax_gravity 부호 반전
-    ###
-    ### forward:  ax_gravity = +g*sin(mu)  (오르막 mu<0 → 가속 방해)
-    ### backward: ax_gravity = -g*sin(mu)  (오르막이 내리막이 됨 → 가속 도움)
-
-    # slope_correction: scale factor for longitudinal gravity effect (tunable)
-    slope_corr = track_3d_params.get('slope_correction', 1.0) if track_3d_params is not None else 1.0
-    ax_gravity = g * math.sin(slope) * slope_corr
-    if mode == 'decel_backw':
-        ax_gravity = -ax_gravity
-
-    # --- tire grip limits (tilde frame, g_tilde로 스케일링) ---
-    ax_max_tires_tilde = mu * np.interp(vx_start, ggv[:, 0], ggv[:, 1]) * grip_scale
+    # calculate possible and used accelerations (considering tires)
+    ax_max_tires = mu * np.interp(vx_start, ggv[:, 0], ggv[:, 1]) * grip_scale
     ay_max_tires = mu * np.interp(vx_start, ggv[:, 0], ggv[:, 2]) * grip_scale
     ay_used = math.pow(vx_start, 2) / radius
 
-    if mode in ['accel_forw', 'decel_backw'] and ax_max_tires_tilde < 0.0:
+    # during forward acceleration and backward deceleration ax_max_tires must be considered positive, during forward
+    # deceleration it must be considered negative
+    if mode in ['accel_forw', 'decel_backw'] and ax_max_tires < 0.0:
         print("WARNING: Inverting sign of ax_max_tires because it should be positive but was negative!")
-        ax_max_tires_tilde *= -1.0
-    elif mode == 'decel_forw' and ax_max_tires_tilde > 0.0:
+        ax_max_tires *= -1.0
+    elif mode == 'decel_forw' and ax_max_tires > 0.0:
         print("WARNING: Inverting sign of ax_max_tires because it should be negative but was positve!")
-        ax_max_tires_tilde *= -1.0
+        ax_max_tires *= -1.0
 
-    # --- Kamm circle in tilde frame ---
-    ### HJ : ay_max_tires가 0이면 그립 없음 → ax도 0
-    if abs(ay_max_tires) < 1e-6:
-        ax_avail_tilde = 0.0
+    radicand = 1.0 - math.pow(ay_used / ay_max_tires, dyn_model_exp)
+
+    if radicand > 0.0:
+        ax_avail_tires = ax_max_tires * math.pow(radicand, 1.0 / dyn_model_exp)
     else:
-        radicand = 1.0 - math.pow(ay_used / ay_max_tires, dyn_model_exp)
-        if radicand > 0.0:
-            ax_avail_tilde = ax_max_tires_tilde * math.pow(radicand, 1.0 / dyn_model_exp)
-        else:
-            ax_avail_tilde = 0.0
-
-    # --- tilde → real: ax_real = ax_tilde + g*sin(mu) ---
-    ax_avail_tires = ax_avail_tilde + ax_gravity
+        ax_avail_tires = 0.0
 
     # ------------------------------------------------------------------------------------------------------------------
     # CONSIDER MACHINE LIMITATIONS -------------------------------------------------------------------------------------
     # ------------------------------------------------------------------------------------------------------------------
 
+    # consider limitations imposed by electrical machines during forward acceleration
     if mode == 'accel_forw':
+        # interpolate machine acceleration to be able to consider varying gear ratios, efficiencies etc.
         ax_max_machines_tmp = np.interp(vx_start, ax_max_machines[:, 0], ax_max_machines[:, 1])
         ax_avail_vehicle = min(ax_avail_tires, ax_max_machines_tmp)
     else:
+        # ax_avail_vehicle = ax_avail_tires
         bx_max_machines_tmp = np.interp(vx_start, b_ax_max_machines[:, 0], b_ax_max_machines[:, 1])
         ax_avail_vehicle = min(ax_avail_tires, bx_max_machines_tmp)
-
+        # ax_avail_vehicle = b_ax_max_machines
     # ------------------------------------------------------------------------------------------------------------------
     # CONSIDER DRAG ----------------------------------------------------------------------------------------------------
     # ------------------------------------------------------------------------------------------------------------------
 
+    # calculate equivalent longitudinal acceleration of drag force at the current speed
     ax_drag = -math.pow(vx_start, 2) * drag_coeff / m_veh
 
-    ### HJ : gravity는 이미 ax_avail_tires에 포함됨, drag만 mode별 처리
-    ### forward: drag 그대로 (감속 방향)
-    ### backward: drag 반전 (역방향 시뮬레이션)
+    ### HJ : Effect 1 — longitudinal gravity force
+    ### slope convention: slope < 0 = uphill, slope > 0 = downhill
+    ### uphill: sin(slope) < 0 -> ax_gravity < 0 (resists acceleration)
+    ### downhill: sin(slope) > 0 -> ax_gravity > 0 (helps acceleration)
+    ax_gravity = 9.81 * math.sin(slope)
+
+    # drag and gravity reduce the possible acceleration in the forward case and increase it in the backward case
     if mode in ['accel_forw', 'decel_forw']:
-        ax_final = ax_avail_vehicle + ax_drag
+        ax_final = ax_avail_vehicle + ax_drag + ax_gravity  ### HJ : added gravity
+        # attention: this value will now be negative in forward direction if tire is entirely used for cornering
     else:
-        ax_final = ax_avail_vehicle - ax_drag
+        ax_final = ax_avail_vehicle - ax_drag - ax_gravity  ### HJ : backward pass reverses external forces
 
     return ax_final
 

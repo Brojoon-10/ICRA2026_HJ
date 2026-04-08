@@ -314,10 +314,8 @@ int main(int argc, char *argv[])
   // GG::real T = fwbw.compute(SS_gg_vec, KK_gg_vec, v_initial);
   // IY : add G_gg_vec (flat track, g = 9.81) for new 3D API
   std::vector<GG::real> G_gg_vec(SS_gg_vec.size(), 9.81);
-  std::vector<GG::real> MU_gg_vec(SS_gg_vec.size(), 0.0);   // HJ : flat track, no slope
-  std::vector<GG::real> DMU_gg_vec(SS_gg_vec.size(), 0.0);  // HJ : flat track, no slope rate
-  GG::real T = fwbw.compute(SS_gg_vec, KK_gg_vec, G_gg_vec, MU_gg_vec, DMU_gg_vec, v_initial);
-  // IY+HJ : end
+  GG::real T = fwbw.compute(SS_gg_vec, KK_gg_vec, G_gg_vec, v_initial);
+  // IY : end
   auto end = std::chrono::steady_clock::now();
 
   // ██████╗  ██████╗ ███████╗████████╗██████╗ ██████╗  ██████╗  ██████╗

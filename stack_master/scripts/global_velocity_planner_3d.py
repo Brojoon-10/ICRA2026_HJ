@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-### HJ : 3D version of global_velocity_planner — uses vel_planner_25d with g_tilde
+# 3D version of global_velocity_planner — uses vel_planner_25d with g_tilde
 
 import rospy
 import os
@@ -14,26 +14,22 @@ from std_msgs.msg import Float64
 import trajectory_planning_helpers as tph
 from rospkg import RosPack
 from f110_msgs.msg import ObstacleArray, OTWpntArray, WpntArray, Wpnt
-from vel_planner_25d.vel_planner import calc_vel_profile  ### HJ : 2.5D vel_planner with g_tilde
+from visualization_msgs.msg import Marker, MarkerArray
+from vel_planner_25d.vel_planner import calc_vel_profile
 
 from copy import deepcopy
 import configparser
 import shutil
+import yaml
+from dynamic_reconfigure.server import Server
+from stack_master.cfg import VelPlanner3DConfig
 
 class VelocityPlanner:
 
-    # ===== HJ ADDED: Flag to save modified parameters to CSV files =====
-
-    # SAVE_CONFIG = True  # Set to True to save modified parameters and backup originals
-
-    SAVE_CONFIG = False  # Set to True to save modified parameters and backup originals
-
-    # ===== HJ ADDED END =====
+    SAVE_CONFIG = False  # legacy CSV save flag (now controlled via rqt save_csv)
 
     def __init__(self):
-        """
-        Initialize the node, subscribe to topics, create publishers and set up member variables.
-        """
+        """Initialize the node, subscribe to topics, create publishers and set up member variables."""
 
         self.racecar_version = rospy.get_param("/racecar_version")
 
@@ -50,90 +46,171 @@ class VelocityPlanner:
         self.ggv, self.ax_max_machines = tph.import_veh_dyn_info.\
             import_veh_dyn_info(ggv_import_path=ggv_path,
                                 ax_max_machines_import_path=ax_max_path)
-            
+
         _, self.b_ax_max_machines = tph.import_veh_dyn_info.\
             import_veh_dyn_info(ggv_import_path=ggv_path,
                                 ax_max_machines_import_path=b_ax_max_path)
 
-                                
+
         self.v_max = self.pars["veh_params"]["v_max"]
         self.drag_coeff = self.pars["veh_params"]["dragcoeff"]
         self.m_veh = self.pars["veh_params"]["mass"]
         self.filt_window = self.pars["vel_calc_opts"]["vel_profile_conv_filt_window"]
-        self.dyn_model_exp = self.pars["vel_calc_opts"]["dyn_model_exp"] 
+        self.dyn_model_exp = self.pars["vel_calc_opts"]["dyn_model_exp"]
 
-        # self.v_max = 12.0
-        # self.ax_max_motor = 7
-        # self.ax_max_brake = 7
-        # self.dyn_model_exp = 1.1
+        # Load vel_planner tuning params from yaml
+        self.vel_planner_yaml = os.path.join(
+            RosPack().get_path('stack_master'), 'config', self.racecar_version, 'vel_planner.yaml')
+        self._load_vel_planner_params()
 
-        # self.a_y_max = 5.5
-        # self.a_x_max = 7.0
-#---------------------------------------
+        # Apply tuning params to ggv tables
+        self._apply_params_to_ggv()
 
-        self.v_max = 12.0
-        self.ax_max_motor = 5
-        self.ax_max_brake = 7
-        self.dyn_model_exp = 1.0
+        # CoG height for g_tilde calculation
+        self.h_cog = self.pars["veh_params"].get("cog_z", 0.074)
 
-        self.a_y_max = 4.5
-        self.a_x_max = 5
-#---------------------------------------
-        # self.v_max = 15.0
-        # self.ax_max_motor = 12.0
-        # self.ax_max_brake = 9.0
-        # self.dyn_model_exp = 1.4
+        # Publishers
+        self.glb_wpnts_pub = rospy.Publisher('/global_waypoints', WpntArray, queue_size=10)
+        self.smart_static_wpnts_pub = rospy.Publisher('/planner/avoidance/smart_static_otwpnts', OTWpntArray, queue_size=10)
+        # 2D (no 3D correction) vel markers for comparison
+        self.vel_markers_2d_pub = rospy.Publisher('/global_waypoints/vel_markers_2d', MarkerArray, queue_size=10)
 
-        # self.a_y_max = 8.0
-        # self.a_x_max = 13.0
-        #aggresive
-#---------------------------------------
+        # Subscribers
+        rospy.Subscriber("/global_waypoints", WpntArray, self.wpnts_callback)
+        rospy.Subscriber("/planner/avoidance/smart_static_otwpnts", OTWpntArray, self.smart_static_wpnts_callback)
 
-        # self.v_max = 12.0
-        # self.ax_max_motor = 7.0
-        # self.ax_max_brake = 9.0
-        # self.dyn_model_exp = 1.4
+        # Dynamic reconfigure server (rqt real-time tuning)
+        self.dyn_reconfig_initialized = False  # skip first callback (Server auto-calls on init)
+        self.dyn_reconfig_changed = False      # True after first rqt change
+        self.dyn_srv = Server(VelPlanner3DConfig, self._dyn_reconfig_callback)
 
-        # self.a_y_max = 6.5
-        # self.a_x_max = 9.3
+        # Push yaml values to dynamic_reconfigure server (overrides cfg defaults)
+        self.dyn_srv.update_configuration({
+            'v_max': self.v_max,
+            'ax_max_motor': self.ax_max_motor,
+            'ax_max_brake': self.ax_max_brake,
+            'dyn_model_exp': self.dyn_model_exp,
+            'a_y_max': self.a_y_max,
+            'a_x_max': self.a_x_max,
+            'grip_scale_exp': self.grip_scale_exp,
+            'slope_correction': self.slope_correction,
+        })
+        # Reset changed flag — don't publish until user actually changes rqt
+        self.dyn_reconfig_changed = False
 
-#---------------------------------------
+    def _load_vel_planner_params(self):
+        """Load vel planner params from yaml file"""
+        if os.path.exists(self.vel_planner_yaml):
+            with open(self.vel_planner_yaml) as f:
+                params = yaml.safe_load(f)
+            self.v_max = params.get('v_max', 12.0)
+            self.ax_max_motor = params.get('ax_max_motor', 5.0)
+            self.ax_max_brake = params.get('ax_max_brake', 7.0)
+            self.dyn_model_exp = params.get('dyn_model_exp', 1.0)
+            self.a_y_max = params.get('a_y_max', 4.5)
+            self.a_x_max = params.get('a_x_max', 5.0)
+            self.grip_scale_exp = params.get('grip_scale_exp', 0.7)
+            self.slope_correction = params.get('slope_correction', 1.0)
+            rospy.loginfo(f"[VelPlanner3D] Loaded params from {self.vel_planner_yaml}")
+        else:
+            rospy.logwarn(f"[VelPlanner3D] {self.vel_planner_yaml} not found, using defaults")
+            self.v_max = 12.0
+            self.ax_max_motor = 5.0
+            self.ax_max_brake = 7.0
+            self.dyn_model_exp = 1.0
+            self.a_y_max = 4.5
+            self.a_x_max = 5.0
+            self.grip_scale_exp = 0.7
+            self.slope_correction = 1.0
 
+    def _apply_params_to_ggv(self):
+        """Apply current params to ggv/ax_max tables"""
         self.ggv[:,1] = self.a_x_max
         self.ggv[:,2] = self.a_y_max
         self.ax_max_machines[:,1] = self.ax_max_motor
         self.b_ax_max_machines[:,1] = self.ax_max_brake
 
-        # ===== HJ ADDED: Save modified parameters to CSV if flag is enabled =====
-        if self.SAVE_CONFIG:
+    def _save_vel_planner_params(self):
+        """Save current params to yaml file"""
+        params = {
+            'v_max': float(self.v_max),
+            'ax_max_motor': float(self.ax_max_motor),
+            'ax_max_brake': float(self.ax_max_brake),
+            'dyn_model_exp': float(self.dyn_model_exp),
+            'a_y_max': float(self.a_y_max),
+            'a_x_max': float(self.a_x_max),
+            'grip_scale_exp': float(self.grip_scale_exp),
+            'slope_correction': float(self.slope_correction),
+        }
+        with open(self.vel_planner_yaml, 'w') as f:
+            yaml.dump(params, f, default_flow_style=False)
+        rospy.loginfo(f"[VelPlanner3D] Saved params to {self.vel_planner_yaml}")
+
+    def _dyn_reconfig_callback(self, config, level):
+        """Dynamic reconfigure callback — update params on rqt change"""
+        if not self.dyn_reconfig_initialized:
+            # First callback is auto-called by Server init — skip to preserve existing speeds
+            self.dyn_reconfig_initialized = True
+            rospy.loginfo("[VelPlanner3D] Dynamic reconfigure initialized (no publish)")
+            return config
+
+        # Mark as changed so wpnts_callback starts publishing
+        self.dyn_reconfig_changed = True
+
+        self.v_max = config.v_max
+        self.ax_max_motor = config.ax_max_motor
+        self.ax_max_brake = config.ax_max_brake
+        self.dyn_model_exp = config.dyn_model_exp
+        self.a_y_max = config.a_y_max
+        self.a_x_max = config.a_x_max
+        self.grip_scale_exp = config.grip_scale_exp
+        self.slope_correction = config.slope_correction
+
+        self._apply_params_to_ggv()
+
+        if config.save_config:
+            self._save_vel_planner_params()
+            config.save_config = False
+
+        if config.load_yaml:
+            self._load_vel_planner_params()
+            self._apply_params_to_ggv()
+            config.v_max = self.v_max
+            config.ax_max_motor = self.ax_max_motor
+            config.ax_max_brake = self.ax_max_brake
+            config.dyn_model_exp = self.dyn_model_exp
+            config.a_y_max = self.a_y_max
+            config.a_x_max = self.a_x_max
+            config.grip_scale_exp = self.grip_scale_exp
+            config.slope_correction = self.slope_correction
+            config.load_yaml = False
+            rospy.loginfo("[VelPlanner3D] Reloaded from yaml")
+
+        if config.save_csv:
+            ggv_path = os.path.join(RosPack().get_path('stack_master'), 'config', self.racecar_version, "veh_dyn_info", "ggv.csv")
+            ax_max_path = os.path.join(RosPack().get_path('stack_master'), 'config', self.racecar_version, "veh_dyn_info", "ax_max_machines.csv")
+            b_ax_max_path = os.path.join(RosPack().get_path('stack_master'), 'config', self.racecar_version, "veh_dyn_info", "b_ax_max_machines.csv")
             self._save_modified_config(ggv_path, ax_max_path, b_ax_max_path)
-        # ===== HJ ADDED END =====
+            config.save_csv = False
 
-        ### HJ : read cog_z for g_tilde calculation
-        self.h_cog = self.pars["veh_params"].get("cog_z", 0.074)
-
-        # Subscribe to the topics
-        self.glb_wpnts_pub = rospy.Publisher('/global_waypoints', WpntArray, queue_size=10)
-        self.smart_static_wpnts_pub = rospy.Publisher('/planner/avoidance/smart_static_otwpnts', OTWpntArray, queue_size=10)
-
-        rospy.Subscriber("/global_waypoints", WpntArray, self.wpnts_callback)
-        rospy.Subscriber("/planner/avoidance/smart_static_otwpnts", OTWpntArray, self.smart_static_wpnts_callback)
+        rospy.loginfo(f"[VelPlanner3D] Reconfig: v_max={self.v_max}, ax={self.a_x_max}, ay={self.a_y_max}, "
+                      f"motor={self.ax_max_motor}, brake={self.ax_max_brake}, "
+                      f"dyn_exp={self.dyn_model_exp}, grip_exp={self.grip_scale_exp}, "
+                      f"slope_agg={self.slope_correction}")
+        return config
 
     def _save_modified_config(self, ggv_path, ax_max_path, b_ax_max_path):
         """
         Save modified ggv and ax_max_machines parameters to CSV files.
         Backup original files to 'original/' folder (only if not already backed up).
         """
-        # Get directory where CSV files are located
         veh_dyn_dir = os.path.dirname(ggv_path)
         original_dir = os.path.join(veh_dyn_dir, 'original')
 
-        # Create original/ directory if it doesn't exist
         if not os.path.exists(original_dir):
             os.makedirs(original_dir)
-            rospy.loginfo(f"[VelocityPlanner] Created backup directory: {original_dir}")
+            rospy.loginfo(f"[VelPlanner3D] Created backup directory: {original_dir}")
 
-        # List of files to backup and save: (current_path, filename)
         files_to_process = [
             (ggv_path, 'ggv.csv'),
             (ax_max_path, 'ax_max_machines.csv'),
@@ -143,73 +220,61 @@ class VelocityPlanner:
         # Backup originals (only if not already backed up)
         for file_path, filename in files_to_process:
             backup_path = os.path.join(original_dir, filename)
-
-            # Check if backup file exists AND has content
             backup_exists = os.path.exists(backup_path) and os.path.getsize(backup_path) > 0
-
-            # Only backup if original doesn't exist or is empty (preserve true original)
             if not backup_exists:
                 if os.path.exists(file_path):
                     shutil.copy2(file_path, backup_path)
-                    rospy.loginfo(f"[VelocityPlanner] Backed up original: {filename} -> original/{filename}")
+                    rospy.loginfo(f"[VelPlanner3D] Backed up original: {filename} -> original/{filename}")
                 else:
-                    rospy.logwarn(f"[VelocityPlanner] Original file not found: {file_path}")
+                    rospy.logwarn(f"[VelPlanner3D] Original file not found: {file_path}")
             else:
-                rospy.loginfo(f"[VelocityPlanner] Original already backed up: {filename} (skipping backup)")
+                rospy.loginfo(f"[VelPlanner3D] Original already backed up: {filename} (skipping)")
 
-        # Save modified ggv
+        # Save modified files
         try:
             np.savetxt(ggv_path, self.ggv, delimiter=',', fmt='%.6f',
                       header='v_mps,ax_max_mps2,ay_max_mps2')
-            rospy.loginfo(f"[VelocityPlanner] Saved modified ggv.csv: ax_max={self.a_x_max}, ay_max={self.a_y_max}")
+            rospy.loginfo(f"[VelPlanner3D] Saved ggv.csv: ax_max={self.a_x_max}, ay_max={self.a_y_max}")
         except Exception as e:
-            rospy.logerr(f"[VelocityPlanner] Failed to save ggv.csv: {e}")
+            rospy.logerr(f"[VelPlanner3D] Failed to save ggv.csv: {e}")
 
-        # Save modified ax_max_machines
         try:
             np.savetxt(ax_max_path, self.ax_max_machines, delimiter=',', fmt='%.6f',
                       header='vx_mps,ax_max_machines_mps2')
-            rospy.loginfo(f"[VelocityPlanner] Saved modified ax_max_machines.csv: ax_max_motor={self.ax_max_motor}")
+            rospy.loginfo(f"[VelPlanner3D] Saved ax_max_machines.csv: ax_max_motor={self.ax_max_motor}")
         except Exception as e:
-            rospy.logerr(f"[VelocityPlanner] Failed to save ax_max_machines.csv: {e}")
+            rospy.logerr(f"[VelPlanner3D] Failed to save ax_max_machines.csv: {e}")
 
-        # Save modified b_ax_max_machines
         try:
             np.savetxt(b_ax_max_path, self.b_ax_max_machines, delimiter=',', fmt='%.6f',
                       header='vx_mps,ax_max_machines_mps2')
-            rospy.loginfo(f"[VelocityPlanner] Saved modified b_ax_max_machines.csv: ax_max_brake={self.ax_max_brake}")
+            rospy.loginfo(f"[VelPlanner3D] Saved b_ax_max_machines.csv: ax_max_brake={self.ax_max_brake}")
         except Exception as e:
-            rospy.logerr(f"[VelocityPlanner] Failed to save b_ax_max_machines.csv: {e}")
+            rospy.logerr(f"[VelPlanner3D] Failed to save b_ax_max_machines.csv: {e}")
 
-    ### HJ : build track_3d_params from waypoints — same calculation as trajectory_optimizer.py
     def _build_track_3d_params(self, wpnts):
         """
-        Extract slope, compute omega via Jacobian, build track_3d_params dict.
-        Same as trajectory_optimizer.py but from wpnt mu_rad instead of CSV.
+        Extract slope, compute angular rates via Euler->body Jacobian,
+        build track_3d_params dict from waypoint mu_rad.
         """
         n = len(wpnts)
         mu = np.array([wp.mu_rad for wp in wpnts])
         kappa = np.array([wp.kappa_radpm for wp in wpnts])
         s = np.array([wp.s_m for wp in wpnts])
 
-        # check if 3D data exists (mu_rad != 0 for at least some points)
+        # Check if 3D data exists
         if np.all(np.abs(mu) < 1e-8):
             return None, mu  # flat track, no 3D params needed
 
-        # slope = mu (already in waypoints)
         slope = mu
-
-        # dmu/ds from slope
         dmu_ds = np.gradient(slope, s)
 
-        # phi: from waypoints z we could estimate, but for no-bank tracks phi ≈ 0
-        # if needed, interpolate from CSV — for now use 0
+        # phi = 0 for no-bank tracks
         phi = np.zeros(n)
 
-        # omega via full Euler->body Jacobian J(mu, phi)
+        # Angular rates via Euler->body Jacobian
         # J = [[1, 0, -sin(mu)], [0, cos(phi), cos(mu)*sin(phi)], [0, -sin(phi), cos(mu)*cos(phi)]]
-        # omega = J . [dphi/ds, dmu/ds, dtheta/ds]
-        # dtheta/ds = kappa, dphi/ds ≈ 0
+        # omega = J . [dphi/ds, dmu/ds, dtheta/ds], dtheta/ds = kappa, dphi/ds ~ 0
         dphi_ds = np.gradient(phi, s)
         dtheta_ds = kappa
 
@@ -217,7 +282,6 @@ class VelocityPlanner:
         omega_y = np.cos(phi) * dmu_ds + np.cos(mu) * np.sin(phi) * dtheta_ds
         omega_z = -np.sin(phi) * dmu_ds + np.cos(mu) * np.cos(phi) * dtheta_ds
 
-        # d_omega
         d_omega_x = np.gradient(omega_x, s)
         d_omega_y = np.gradient(omega_y, s)
         d_omega_z = np.gradient(omega_z, s)
@@ -233,19 +297,27 @@ class VelocityPlanner:
             'd_omega_z': d_omega_z,
             'dmu_ds': dmu_ds,
             'h': self.h_cog,
+            'slope_correction': self.slope_correction,
         }
 
         return track_3d_params, slope
 
     def wpnts_callback(self, msg):
+        # Do not publish until rqt has been changed
+        if not self.dyn_reconfig_changed:
+            return
+        # Publish once per rqt change, then wait for next change
+        self.dyn_reconfig_changed = False
+
         wpnts = msg.wpnts
 
         kappa = np.array([wp.kappa_radpm for wp in wpnts])
         el_lengths = 0.1 * np.ones(len(kappa))
 
-        ### HJ : build 3D track params from waypoint mu_rad
+        # Build 3D track params from waypoint mu_rad
         track_3d_params, slope = self._build_track_3d_params(wpnts)
 
+        # 3D velocity profile (with slope + g_tilde correction)
         vx_profile = calc_vel_profile(ggv=self.ggv,
                                       ax_max_machines=self.ax_max_machines,
                                       b_ax_max_machines=self.b_ax_max_machines,
@@ -258,7 +330,8 @@ class VelocityPlanner:
                                       drag_coeff=self.drag_coeff,
                                       m_veh=self.m_veh,
                                       slope=slope,
-                                      track_3d_params=track_3d_params)
+                                      track_3d_params=track_3d_params,
+                                      grip_scale_exp=self.grip_scale_exp)
 
         for i in range(len(vx_profile)):
             wpnts[i].vx_mps = vx_profile[i]
@@ -275,14 +348,29 @@ class VelocityPlanner:
         print("NEW 3D Vel Profile Pub")
         self.glb_wpnts_pub.publish(msg)
 
+        # 2D velocity profile (no 3D correction) for comparison markers
+        vx_profile_2d = calc_vel_profile(ggv=self.ggv,
+                                          ax_max_machines=self.ax_max_machines,
+                                          b_ax_max_machines=self.b_ax_max_machines,
+                                          v_max=self.v_max,
+                                          kappa=kappa,
+                                          el_lengths=el_lengths,
+                                          closed=True,
+                                          filt_window=self.filt_window,
+                                          dyn_model_exp=self.dyn_model_exp,
+                                          drag_coeff=self.drag_coeff,
+                                          m_veh=self.m_veh)
+        self._publish_2d_vel_markers(wpnts, vx_profile_2d)
+
     def smart_static_wpnts_callback(self, msg):
-        """Callback for smart_static_otwpnts topic - calculate velocity profile with 3D correction"""
+        """Callback for smart_static_otwpnts — velocity profile with 3D correction"""
+        if not self.dyn_reconfig_changed:
+            return
         wpnts = msg.wpnts
 
         kappa = np.array([wp.kappa_radpm for wp in wpnts])
         el_lengths = 0.1 * np.ones(len(kappa))
 
-        ### HJ : build 3D track params from waypoint mu_rad
         track_3d_params, slope = self._build_track_3d_params(wpnts)
 
         vx_profile = calc_vel_profile(ggv=self.ggv,
@@ -297,7 +385,8 @@ class VelocityPlanner:
                                       drag_coeff=self.drag_coeff,
                                       m_veh=self.m_veh,
                                       slope=slope,
-                                      track_3d_params=track_3d_params)
+                                      track_3d_params=track_3d_params,
+                                      grip_scale_exp=self.grip_scale_exp)
 
         for i in range(len(vx_profile)):
             wpnts[i].vx_mps = vx_profile[i]
@@ -315,7 +404,32 @@ class VelocityPlanner:
         print("NEW 3D Smart Static Vel Profile Pub")
         self.smart_static_wpnts_pub.publish(msg)
 
-
+    def _publish_2d_vel_markers(self, wpnts, vx_2d):
+        """Publish 2D velocity profile as yellow cylinder markers (same style as vel_markers)"""
+        VEL_SCALE = 0.1317  # same scale factor as vel_markers
+        marker_array = MarkerArray()
+        for i, wp in enumerate(wpnts):
+            height = vx_2d[i] * VEL_SCALE
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = rospy.Time.now()
+            marker.ns = ""
+            marker.id = i
+            marker.type = Marker.CYLINDER
+            marker.action = Marker.ADD
+            marker.pose.position.x = wp.x_m
+            marker.pose.position.y = wp.y_m
+            marker.pose.position.z = height * 0.5
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.1
+            marker.scale.y = 0.1
+            marker.scale.z = height
+            marker.color.r = 1.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            marker.color.a = 0.5
+            marker_array.markers.append(marker)
+        self.vel_markers_2d_pub.publish(marker_array)
 
 
 if __name__ == '__main__':

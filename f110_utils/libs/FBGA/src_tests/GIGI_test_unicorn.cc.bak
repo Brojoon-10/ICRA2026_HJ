@@ -126,7 +126,6 @@ struct GGModel {
   std::function<GG::real(GG::real, GG::real, GG::real)> upper;   // (ay, v, g) -> ax_max
   std::function<GG::real(GG::real, GG::real, GG::real)> lower;   // (ay, v, g) -> ax_min
   GG::gg_range_max_min range;                                    // (v, g) -> ay_min/max
-  std::function<GG::real(GG::real, GG::real)> exp_func;          // HJ : (v, g) -> exponent p
 };
 
 GGModel make_lookup(const VehicleParams& /*params*/, const GGTable& tbl) {
@@ -152,13 +151,9 @@ GGModel make_lookup(const VehicleParams& /*params*/, const GGTable& tbl) {
     [&tbl](GG::real v, GG::real g) { return -tbl.ay_max_at(v, g); },
     [&tbl](GG::real v, GG::real g) { return  tbl.ay_max_at(v, g); }
   };
-  // HJ : exponent function for Vmax mu correction
-  auto exp_func = [&tbl](GG::real v, GG::real g) -> GG::real {
-    return tbl.gg_exp_at(v, g);
-  };
-  return {upper, lower, range, exp_func};
+  return {upper, lower, range};
 }
-// IY+HJ : end Step B/C/D/E
+// IY : end Step B/C/D/E
 
 
 // ███╗   ███╗ █████╗ ██╗███╗   ██╗
@@ -218,31 +213,12 @@ int main(int argc, char *argv[])
   std::vector<GG::real> SS_vec = doc.GetColumn<GG::real>("s");
   std::vector<GG::real> KK_vec = doc.GetColumn<GG::real>("kappa");
   std::vector<GG::real> G_vec  = doc.GetColumn<GG::real>("g_tilde");
-  // HJ : read mu column for ax_tilde = ax - g*sin(mu) correction
-  std::vector<GG::real> MU_vec;
-  try {
-    MU_vec = doc.GetColumn<GG::real>("mu");
-  } catch (...) {
-    MU_vec.assign(SS_vec.size(), 0.0);
-    std::cout << " > WARNING: no 'mu' column in input CSV, slope correction disabled\n";
-  }
-  // HJ : read dmu_ds column for g_tilde Vmax constraint
-  std::vector<GG::real> DMU_vec;
-  try {
-    DMU_vec = doc.GetColumn<GG::real>("dmu_ds");
-  } catch (...) {
-    DMU_vec.assign(SS_vec.size(), 0.0);
-    std::cout << " > WARNING: no 'dmu_ds' column in input CSV, g_tilde Vmax constraint disabled\n";
-  }
 
-  if (SS_vec.size() != KK_vec.size() || SS_vec.size() != G_vec.size()
-      || SS_vec.size() != MU_vec.size() || SS_vec.size() != DMU_vec.size()) {
+  if (SS_vec.size() != KK_vec.size() || SS_vec.size() != G_vec.size()) {
     std::cerr << "Input CSV column size mismatch: "
               << "s=" << SS_vec.size()
               << " kappa=" << KK_vec.size()
-              << " g_tilde=" << G_vec.size()
-              << " mu=" << MU_vec.size()
-              << " dmu_ds=" << DMU_vec.size() << "\n";
+              << " g_tilde=" << G_vec.size() << "\n";
     return 1;
   }
 
@@ -295,13 +271,11 @@ int main(int argc, char *argv[])
 
   // ── run FWBW ──
   // IY : Step H — instantiate FWBW with the selected model and compute
-  // HJ : pass gg_Exp for Vmax mu correction
-  GG::FWBW fwbw(model.upper, model.lower, model.range, model.exp_func);
+  GG::FWBW fwbw(model.upper, model.lower, model.range);
 
   std::cout << " + FWBW computation started\n";
   auto start = std::chrono::steady_clock::now();
-  // HJ : pass MU_vec + DMU_vec for 3D slope corrections
-  GG::real T = fwbw.compute(SS_vec, KK_vec, G_vec, MU_vec, DMU_vec, v_initial);
+  GG::real T = fwbw.compute(SS_vec, KK_vec, G_vec, v_initial);
   auto end   = std::chrono::steady_clock::now();
   std::cout << " + FWBW computation finished\n";
 
