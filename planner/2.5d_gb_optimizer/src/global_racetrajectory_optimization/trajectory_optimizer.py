@@ -603,7 +603,15 @@ def trajectory_optimizer(input_path: str,
         ax1.set_zlabel('z [m]')
         ax1.set_title('3D Raceline — Elevation (laptime: %.2fs)' % t_profile_cl[-1])
         ax1.legend(fontsize=7)
-        ax1.set_box_aspect([1, 1, 0.3])
+        ### HJ : equal aspect for x/y/z
+        all_x1 = np.concatenate([reftrack_imp[:, 0], bound_r_plt[:, 0], bound_l_plt[:, 0], raceline_interp[:, 0]])
+        all_y1 = np.concatenate([reftrack_imp[:, 1], bound_r_plt[:, 1], bound_l_plt[:, 1], raceline_interp[:, 1]])
+        all_z1 = np.concatenate([z_centerline_plt, z_bounds_plt, z_fine])
+        range_x1, range_y1, range_z1 = all_x1.ptp(), all_y1.ptp(), all_z1.ptp()
+        max_range1 = max(range_x1, range_y1, range_z1)
+        ax1.set_box_aspect([range_x1/max_range1 if range_x1 > 0 else 1,
+                            range_y1/max_range1 if range_y1 > 0 else 1,
+                            range_z1/max_range1 if range_z1 > 0 else 0.3])
         ax1.view_init(elev=90, azim=-90)  ### HJ : default top-down view
 
         # ====== Figure 2: velocity profile (same style as result_plots.py racetraj_vel_3d) ======
@@ -642,7 +650,14 @@ def trajectory_optimizer(input_path: str,
         ax2.set_zlabel('v [m/s]')
         ax2.set_title('Velocity Profile (laptime: %.2fs)' % t_profile_cl[-1])
         ax2.legend(fontsize=7)
-        ax2.set_box_aspect([1, 1, 0.3])
+        ### HJ : equal aspect for x/y, z scaled for velocity
+        all_x2 = np.concatenate([reftrack_imp[:, 0], bound_r_plt[:, 0], bound_l_plt[:, 0], raceline_interp[:, 0]])
+        all_y2 = np.concatenate([reftrack_imp[:, 1], bound_r_plt[:, 1], bound_l_plt[:, 1], raceline_interp[:, 1]])
+        range_x2, range_y2 = all_x2.ptp(), all_y2.ptp()
+        max_range2 = max(range_x2, range_y2)
+        ax2.set_box_aspect([range_x2/max_range2 if range_x2 > 0 else 1,
+                            range_y2/max_range2 if range_y2 > 0 else 1,
+                            0.3])
         ax2.view_init(elev=90, azim=-90)  ### HJ : default top-down view
 
         plt.show()

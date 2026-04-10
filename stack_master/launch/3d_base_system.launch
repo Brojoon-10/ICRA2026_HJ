@@ -1,5 +1,5 @@
 <!-- ### HJ : 3D base system launch — inherits base_system.launch structure for 3D maps -->
-<!-- Localization: GLIL (real) run separately, Gazebo (sim) on remote machine -->
+<!-- Localization: GLIL (real) included below, Gazebo (sim) on remote machine -->
 <!-- Controller + State machine: run separately via 3d_headtohead.launch -->
 <launch>
   <arg name="map"                  default="gazebo_wall_3d_rc_car_10th_timeoptimal"
@@ -68,11 +68,11 @@
     <param name="map" value="$(arg map)" />
   </node>
 
-  <!-- Speed sector server + velocity scaler -->
+  <!-- ### HJ : 3D speed sector server + velocity scaler -->
   <rosparam ns="map_params" command="load"
     file="$(find stack_master)/maps/$(arg map)/speed_scaling.yaml"/>
-  <node pkg="sector_tuner" type="sector_server.py" name="dyn_sector_speed" output="screen" />
-  <node pkg="sector_tuner" type="vel_scaler_node.py" name="velocity_scaler" output="screen">
+  <node pkg="sector_tuner_3d" type="sector_server.py" name="dyn_sector_speed" output="screen" />
+  <node pkg="sector_tuner_3d" type="vel_scaler_node.py" name="velocity_scaler" output="screen">
     <param name="enable_smart_scaling" value="$(arg enable_smart_scaling)" />
     <!-- ### IY : remap when local racing line mux is active -->
     <remap if="$(arg use_local_racing_line)"
@@ -95,16 +95,16 @@
     </node>
   </group>
 
-  <!-- Overtaking sector server -->
+  <!-- ### HJ : 3D overtaking sector server -->
   <rosparam ns="ot_map_params" command="load"
     file="$(find stack_master)/maps/$(arg map)/ot_sectors.yaml" />
-  <node pkg="overtaking_sector_tuner" type="ot_sector_server.py" name="dyn_sector_overtake" output="screen" />
-  <node pkg="overtaking_sector_tuner" type="ot_interpolator.py" name="ot_interpolator" output="screen"/>
+  <node pkg="overtaking_sector_tuner_3d" type="ot_sector_server.py" name="dyn_sector_overtake" output="screen" />
+  <node pkg="overtaking_sector_tuner_3d" type="ot_interpolator.py" name="ot_interpolator" output="screen"/>
 
-  <!-- Static obstacle sector server -->
+  <!-- ### HJ : 3D static obstacle sector server -->
   <rosparam ns="static_obs_map_params" command="load"
     file="$(find stack_master)/maps/$(arg map)/static_obs_sectors.yaml" />
-  <node pkg="static_obstacle_sector_tuner" type="static_obs_sector_server.py"
+  <node pkg="static_obstacle_sector_tuner_3d" type="static_obs_sector_server.py"
         name="dyn_sector_static_obstacle" output="screen" />
 
   <!-- Friction sector tuner -->

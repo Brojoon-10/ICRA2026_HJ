@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-### HJ : 3D version of static_obs_sector_slicing.py — matplotlib 3D with slider/button
+### HJ : 3D version of static_obs_sector_slicing.py — loads from global_waypoints.json (no topic dependency)
 import rospy, rospkg
-import yaml, os, subprocess, time
-from f110_msgs.msg import WpntArray
-from visualization_msgs.msg import MarkerArray
+import yaml, os, subprocess, time, json
+from rospy_message_converter import message_converter
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button
@@ -13,32 +12,23 @@ class StaticObstacleSectorSlicer:
     def __init__(self):
         rospy.init_node('static_obs_sector_slicer_node', anonymous=True)
 
-        self.glb_wpnts = None
-        self.track_bounds = None
-
         self.sector_pnts_indices = [0]
-
-        rospy.Subscriber('/global_waypoints', WpntArray, self.glb_wpnts_cb)
-        rospy.Subscriber('/trackbounds/markers', MarkerArray, self.bounds_cb)
 
         self.yaml_dir = rospy.get_param('~save_dir')
 
-    def glb_wpnts_cb(self, data):
-        self.glb_wpnts = data
-
-    def bounds_cb(self, data):
-        self.track_bounds = data
+    def load_from_json(self):
+        """### HJ : load waypoints and bounds from global_waypoints.json"""
+        json_path = os.path.join(self.yaml_dir, 'global_waypoints.json')
+        rospy.loginfo(f'Loading from {json_path}...')
+        with open(json_path, 'r') as f:
+            d = json.load(f)
+        self.glb_wpnts = message_converter.convert_dictionary_to_ros_message(
+            'f110_msgs/WpntArray', d['global_traj_wpnts_iqp'])
+        self.track_bounds = message_converter.convert_dictionary_to_ros_message(
+            'visualization_msgs/MarkerArray', d['trackbounds_markers'])
 
     def slice_loop(self):
-        rospy.loginfo('Waiting for global waypoints...')
-        rospy.wait_for_message('/global_waypoints', WpntArray)
-        while self.glb_wpnts is None and not rospy.is_shutdown():
-            rospy.sleep(0.1)
-        rospy.loginfo('Waiting for track bounds...')
-        rospy.wait_for_message('/trackbounds/markers', MarkerArray)
-        while self.track_bounds is None and not rospy.is_shutdown():
-            rospy.sleep(0.1)
-        rospy.loginfo('Waypoints and bounds received. Starting 3D GUI.')
+        self.load_from_json()
 
         self.sector_gui()
         rospy.loginfo(f'Selected Static Obstacle Sector Indices: {self.sector_pnts_indices}')
@@ -51,9 +41,15 @@ class StaticObstacleSectorSlicer:
         z = np.array([w.z_m for w in self.glb_wpnts.wpnts])
         s = np.array([w.s_m for w in self.glb_wpnts.wpnts])
 
-        bnd_x = np.array([m.pose.position.x for m in self.track_bounds.markers])
-        bnd_y = np.array([m.pose.position.y for m in self.track_bounds.markers])
-        bnd_z = np.array([m.pose.position.z for m in self.track_bounds.markers])
+        ### HJ : split right/left bounds by color (right: b=0.5, left: g=1.0)
+        r_markers = [m for m in self.track_bounds.markers if m.color.b > 0.4]
+        l_markers = [m for m in self.track_bounds.markers if m.color.g > 0.9]
+        bnd_rx = np.array([m.pose.position.x for m in r_markers])
+        bnd_ry = np.array([m.pose.position.y for m in r_markers])
+        bnd_rz = np.array([m.pose.position.z for m in r_markers])
+        bnd_lx = np.array([m.pose.position.x for m in l_markers])
+        bnd_ly = np.array([m.pose.position.y for m in l_markers])
+        bnd_lz = np.array([m.pose.position.z for m in l_markers])
 
         fig = plt.figure(figsize=(12, 10))
         ax1 = fig.add_axes([0.05, 0.25, 0.9, 0.7], projection='3d')
@@ -61,10 +57,16 @@ class StaticObstacleSectorSlicer:
         axselect = fig.add_axes([0.15, 0.08, 0.3, 0.05])
         axfinish = fig.add_axes([0.55, 0.08, 0.3, 0.05])
 
+        ### HJ : save/restore view angle across updates
+        self._view = {'elev': 90, 'azim': -90}
+
         def update_map(cur_idx):
+            self._view['elev'] = ax1.elev
+            self._view['azim'] = ax1.azim
             ax1.cla()
             ax1.plot(x, y, z, 'm-', linewidth=0.7)
-            ax1.plot(bnd_x, bnd_y, bnd_z, 'g-', linewidth=0.4)
+            ax1.plot(bnd_rx, bnd_ry, bnd_rz, 'g-', linewidth=0.4)
+            ax1.plot(bnd_lx, bnd_ly, bnd_lz, 'g-', linewidth=0.4)
             ax1.scatter(x[cur_idx], y[cur_idx], z[cur_idx], c='red', s=50, zorder=10)
             if len(self.sector_pnts_indices) > 0:
                 ax1.scatter(x[self.sector_pnts_indices], y[self.sector_pnts_indices],
@@ -73,7 +75,16 @@ class StaticObstacleSectorSlicer:
             ax1.set_ylabel('y [m]')
             ax1.set_zlabel('z [m]')
             ax1.set_title('Static Obs Sector Slicing (idx=%d, s=%.1fm)' % (cur_idx, s[cur_idx]))
-            ax1.view_init(elev=90, azim=-90)
+            ax1.view_init(elev=self._view['elev'], azim=self._view['azim'])
+            ### HJ : equal aspect for x/y/z
+            all_x = np.concatenate([x, bnd_rx, bnd_lx])
+            all_y = np.concatenate([y, bnd_ry, bnd_ly])
+            all_z = np.concatenate([z, bnd_rz, bnd_lz])
+            mid_x, mid_y, mid_z = (all_x.max()+all_x.min())/2, (all_y.max()+all_y.min())/2, (all_z.max()+all_z.min())/2
+            half = max(all_x.max()-all_x.min(), all_y.max()-all_y.min(), all_z.max()-all_z.min()) / 2 * 1.05
+            ax1.set_xlim(mid_x - half, mid_x + half)
+            ax1.set_ylim(mid_y - half, mid_y + half)
+            ax1.set_zlim(mid_z - half, mid_z + half)
 
         update_map(0)
 
@@ -144,9 +155,10 @@ class StaticObstacleSectorSlicer:
             rospy.loginfo(f'Dumping to {cfg_yaml_path}: {dict_file}')
             yaml.dump(dict_file, file, default_flow_style=False, sort_keys=False)
 
+        ### HJ : rebuild 3D package
         time.sleep(1)
         rospy.loginfo('Building static_obstacle_sector_tuner_3d...')
-        shell_dir = os.path.join(ros_path, 'scripts/finish_sector.sh')
+        shell_dir = os.path.join(ros_path, 'scripts/finish_sector_3d.sh')
         if os.path.exists(shell_dir):
             subprocess.Popen(shell_dir, shell=True)
 
