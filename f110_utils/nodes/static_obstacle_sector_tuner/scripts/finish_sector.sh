@@ -2,8 +2,11 @@
 
 source ~/.bashrc
 
-cd ~/catkin_ws 
+cd ~/catkin_ws
 
-#Clean and build sector tuner to force refresh of dynamic reconfigure
-catkin clean static_obstacle_sector_tuner
+### HJ : remove generated Config to force regeneration (catkin clean fails on merged develspace)
+rm -f devel/lib/python3/dist-packages/static_obstacle_sector_tuner/cfg/static_obs_dyn_sect_tunerConfig.py
+rm -f devel/lib/python3/dist-packages/static_obstacle_sector_tuner/cfg/__pycache__/static_obs_dyn_sect_tunerConfig*.pyc
+rm -f devel/include/static_obstacle_sector_tuner/static_obs_dyn_sect_tunerConfig.h
+
 catkin build static_obstacle_sector_tuner
