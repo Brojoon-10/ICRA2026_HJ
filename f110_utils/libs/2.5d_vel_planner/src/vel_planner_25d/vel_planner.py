@@ -217,11 +217,31 @@ def calc_vel_profile(ax_max_machines: np.ndarray,
             pass
 
     # Store friction cache as module-level for access from calc_ax_poss
-    # regardless of whether track_3d_params is None or not
     global _g_friction_cache
     _g_friction_cache = _friction_cache
     if track_3d_params is not None:
         track_3d_params['_friction_cache'] = _friction_cache
+
+    # Apply sector friction to mu before passing to solvers (both closed and unclosed)
+    # Uses s-based lookup when available, falls back to index-based
+    if _friction_cache is not None:
+        if mu is None:
+            mu = np.ones(kappa.size)
+        else:
+            mu = mu.copy()
+        fric_limit = _friction_cache.get('global_friction_limit', 1.0)
+        s_arr = np.concatenate([[0], np.cumsum(el_lengths)])
+        for j in range(len(mu)):
+            s_j = s_arr[j] if j < len(s_arr) else s_arr[-1]
+            for sec in _friction_cache['sectors']:
+                if sec.get('s_start', -1) >= 0:
+                    if sec['s_start'] <= s_j <= sec['s_end']:
+                        mu[j] *= min(sec['friction'], fric_limit)
+                        break
+                else:
+                    if sec['start'] <= j <= sec['end']:
+                        mu[j] *= min(sec['friction'], fric_limit)
+                        break
 
     # call solver
     if not closed:
@@ -377,7 +397,7 @@ def __solver_fb_closed(p_ggv: np.ndarray,
 
     no_points = radii.size
 
-    # handle mu
+    # handle mu (friction already applied in calc_vel_profile)
     if mu is None:
         mu = np.ones(no_points)
         mu_mean = 1.0
@@ -416,6 +436,7 @@ def __solver_fb_closed(p_ggv: np.ndarray,
     vx_profile[vx_profile > v_max] = v_max
 
     ### HJ : g_tilde + mu 기반 Vmax 보정 (3d_gb_optimizer / FBGA와 동일 방식)
+    ### Skip when grip_scale_exp=0 and slope_correction=0 (pure 2D equivalent)
     ###
     ### 3d_gb_optimizer constraint: (|ax_tilde|/ax_max)^p + (|ay_tilde|/ay_max)^p <= 1
     ### 등속(ax=0)이라도 경사에서 ax_tilde = -g*sin(mu) ≠ 0
@@ -424,7 +445,8 @@ def __solver_fb_closed(p_ggv: np.ndarray,
     ### → Vmax = sqrt(ay_max_eff / |kappa|)
     ###
     ### + crest(dmu/ds>0)에서 g_tilde=0 속도 상한
-    if track_3d_params is not None:
+    slope_corr_val = track_3d_params.get('slope_correction', 0.0) if track_3d_params is not None else 0.0
+    if track_3d_params is not None and (grip_scale_exp > 0 or slope_corr_val > 0):
         mu_arr = track_3d_params['mu']
         dmu_ds_arr = track_3d_params['dmu_ds']
         omega_y_arr = track_3d_params['omega_y']
@@ -442,20 +464,14 @@ def __solver_fb_closed(p_ggv: np.ndarray,
             ### HJ : nonlinear grip scaling (same as calc_ax_poss)
             grip_scale_i = math.pow(g_tilde_i / 9.81, grip_scale_exp) if g_tilde_i > 0 else 0.0
 
-            # Apply per-waypoint friction scaling from cached friction params (clamp by limit)
-            fc = track_3d_params.get('_friction_cache', None)
-            if fc is not None:
-                fric_limit = fc.get('global_friction_limit', 1.0)
-                fric = 1.0
-                for sec in fc['sectors']:
-                    if sec['start'] <= i <= sec['end']:
-                        fric = min(sec['friction'], fric_limit)
-                        break
-                grip_scale_i *= fric
+            # Friction is already applied via mu array (set in __solver_fb_closed)
+            # No additional friction scaling in grip_scale_i here
 
             # ay_max with grip_scale, ax_max WITHOUT grip_scale (for diamond ratio)
-            ay_max_i = mu_mean * np.interp(vx_i, p_ggv[0, :, 0], p_ggv[0, :, 2]) * grip_scale_i
-            ax_max_raw = mu_mean * np.interp(vx_i, p_ggv[0, :, 0], p_ggv[0, :, 1])  # original, no grip_scale
+            # Use per-waypoint mu[i] (includes friction) instead of mu_mean
+            mu_i_fric = mu[i] if i < len(mu) else mu_mean
+            ay_max_i = mu_i_fric * np.interp(vx_i, p_ggv[0, :, 0], p_ggv[0, :, 2]) * grip_scale_i
+            ax_max_raw = mu_i_fric * np.interp(vx_i, p_ggv[0, :, 0], p_ggv[0, :, 1])  # original, no grip_scale
 
             # (1) diamond constraint: mu gravity vs original tire ax capacity
             slope_corr = track_3d_params.get('slope_correction', 1.0)
@@ -479,20 +495,7 @@ def __solver_fb_closed(p_ggv: np.ndarray,
                     v_gtilde_max = math.sqrt(9.81 * math.cos(mu_i) / dmu_i)
                     vx_profile[i] = min(vx_profile[i], v_gtilde_max)
 
-    # Friction-only Vmax correction (applies even for 2D, when track_3d_params is None)
-    if _g_friction_cache is not None and track_3d_params is None:
-        fric_limit = _g_friction_cache.get('global_friction_limit', 1.0)
-        for i in range(len(vx_profile)):
-            fric = 1.0
-            for sec in _g_friction_cache['sectors']:
-                if sec['start'] <= i <= sec['end']:
-                    fric = min(sec['friction'], fric_limit)
-                    break
-            if fric < 1.0 and radii[i] < 1e4:
-                ay_max_fric = mu_mean * np.interp(vx_profile[i], p_ggv[0, :, 0], p_ggv[0, :, 2]) * fric
-                if ay_max_fric > 0:
-                    v_lat = math.sqrt(ay_max_fric * radii[i])
-                    vx_profile[i] = min(vx_profile[i], v_lat)
+    # Friction Vmax correction removed — friction is already in mu array for both 2D and 3D
 
     # Pre-slope braking: Vmax from margin before slope entry through slope end
     if track_3d_params is not None:
@@ -834,26 +837,18 @@ def calc_ax_poss(vx_start: float,
         # g_tilde = fmax(w_dot - V_omega + centrifugal + g*cos(mu)*cos(phi), 0)
         g_tilde = max(-V_omega + centrifugal + g * math.cos(mu_t) * math.cos(phi_t), 0.0)
         ### HJ : nonlinear grip scaling: grip_scale = (g_tilde / g) ^ grip_scale_exp
-        grip_scale = math.pow(g_tilde / g, grip_scale_exp) if g_tilde > 0 else 0.0
+        if grip_scale_exp == 0:
+            grip_scale = 1.0  # g_tilde disabled
+        elif g_tilde > 0:
+            grip_scale = math.pow(g_tilde / g, grip_scale_exp)
+        else:
+            grip_scale = 0.0
     else:
         # fallback: simple cos(slope) scaling with nonlinear exponent
         grip_scale = math.pow(math.cos(slope), grip_scale_exp)
 
-    # Apply per-waypoint friction scaling from cached friction params (clamp by global limit)
-    fc = _g_friction_cache
-    if fc is not None:
-        fric_limit = fc.get('global_friction_limit', 1.0)
-        fric = 1.0
-        for sec in fc['sectors']:
-            if s_m >= 0 and sec['s_start'] >= 0:
-                if sec['s_start'] <= s_m <= sec['s_end']:
-                    fric = min(sec['friction'], fric_limit)
-                    break
-            else:
-                if sec['start'] <= point_idx <= sec['end']:
-                    fric = min(sec['friction'], fric_limit)
-                    break
-        grip_scale *= fric
+    # Friction is already applied via mu array (set in __solver_fb_closed)
+    # No additional friction scaling in grip_scale here to avoid double-apply
 
     ### HJ : ax_tilde constraint inside Kamm circle (3d_gb_optimizer와 동일)
     ###
@@ -902,11 +897,13 @@ def calc_ax_poss(vx_start: float,
     # CONSIDER MACHINE LIMITATIONS -------------------------------------------------------------------------------------
     # ------------------------------------------------------------------------------------------------------------------
 
+    # Machine limits are also constrained by g_tilde (grip_scale) and tire-road friction (mu)
+    # mu already contains friction from sector tuner, grip_scale contains g_tilde only
     if mode == 'accel_forw':
-        ax_max_machines_tmp = np.interp(vx_start, ax_max_machines[:, 0], ax_max_machines[:, 1])
+        ax_max_machines_tmp = np.interp(vx_start, ax_max_machines[:, 0], ax_max_machines[:, 1]) * grip_scale * mu
         ax_avail_vehicle = min(ax_avail_tires, ax_max_machines_tmp)
     else:
-        bx_max_machines_tmp = np.interp(vx_start, b_ax_max_machines[:, 0], b_ax_max_machines[:, 1])
+        bx_max_machines_tmp = np.interp(vx_start, b_ax_max_machines[:, 0], b_ax_max_machines[:, 1]) * grip_scale * mu
         ax_avail_vehicle = min(ax_avail_tires, bx_max_machines_tmp)
 
     # ------------------------------------------------------------------------------------------------------------------
