@@ -36,7 +36,7 @@ class VelocityScaler:
 
         # dyn params sub
         self.glb_wpnts_name = "/global_waypoints"
-        rospy.Subscriber("/dyn_sector_speed/parameter_updates", Config, self.dyn_param_cb)
+        rospy.Subscriber("/dyn_sector_tuner/speed/parameter_updates", Config, self.dyn_param_cb)
         rospy.Subscriber(self.glb_wpnts_name, WpntArray, self.glb_wpnts_cb)
         rospy.Subscriber(self.glb_wpnts_name+"/shortest_path", WpntArray, self.glb_wpnts_sp_cb)
         rospy.Subscriber("update_map", Bool, self.update_map_cb)

@@ -1,6 +1,10 @@
-from state_machine_node import StateMachine
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List
 from f110_msgs.msg import WpntArray, Wpnt
-from typing import List
+
+if TYPE_CHECKING:
+    from state_machine_node import StateMachine
 
 """
 Here we define the behaviour in the different states.

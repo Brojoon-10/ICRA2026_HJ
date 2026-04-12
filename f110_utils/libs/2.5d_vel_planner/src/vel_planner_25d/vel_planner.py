@@ -27,7 +27,8 @@ def calc_vel_profile(ax_max_machines: np.ndarray,
                      filt_window: int = None,
                      slope: np.ndarray = None,
                      track_3d_params: dict = None,
-                     grip_scale_exp: float = 1.0) -> np.ndarray:  ### HJ : slope + track_3d_params + nonlinear grip
+                     grip_scale_exp: float = 1.0,
+                     s_global: np.ndarray = None) -> np.ndarray:
     """
     author:
     Alexander Heilmeier
@@ -230,7 +231,10 @@ def calc_vel_profile(ax_max_machines: np.ndarray,
         else:
             mu = mu.copy()
         fric_limit = _friction_cache.get('global_friction_limit', 1.0)
-        s_arr = np.concatenate([[0], np.cumsum(el_lengths)])
+        if s_global is not None:
+            s_arr = s_global
+        else:
+            s_arr = np.concatenate([[0], np.cumsum(el_lengths)])
         for j in range(len(mu)):
             s_j = s_arr[j] if j < len(s_arr) else s_arr[-1]
             for sec in _friction_cache['sectors']:
