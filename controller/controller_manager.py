@@ -251,7 +251,7 @@ class Controller_manager:
 
         ### HJ : friction sector → accel limiter ay_max sync
         from dynamic_reconfigure.msg import Config as DynConfig
-        rospy.Subscriber('/dyn_sector_friction/parameter_updates', DynConfig, self.friction_sector_cb)
+        rospy.Subscriber('/dyn_sector_tuner/friction/parameter_updates', DynConfig, self.friction_sector_cb)
         ### HJ : end
 
         # Subscribers

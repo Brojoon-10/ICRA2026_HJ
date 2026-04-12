@@ -68,18 +68,32 @@
     <param name="map" value="$(arg map)" />
   </node>
 
-  <!-- ### HJ : 3D speed sector server + velocity scaler -->
+  <!-- ══════════════════ SECTOR TUNERS (rqt: dyn_sector_tuner/) ══════════════════ -->
   <rosparam ns="map_params" command="load"
     file="$(find stack_master)/maps/$(arg map)/speed_scaling.yaml"/>
-  <node pkg="sector_tuner_3d" type="sector_server.py" name="dyn_sector_speed" output="screen" />
+  <rosparam ns="ot_map_params" command="load"
+    file="$(find stack_master)/maps/$(arg map)/ot_sectors.yaml" />
+  <rosparam ns="static_obs_map_params" command="load"
+    file="$(find stack_master)/maps/$(arg map)/static_obs_sectors.yaml" />
+
+  <group ns="dyn_sector_tuner">
+    <node pkg="sector_tuner_3d" type="sector_server.py" name="speed" output="screen" />
+    <node pkg="overtaking_sector_tuner_3d" type="ot_sector_server.py" name="overtake" output="screen" />
+    <node pkg="static_obstacle_sector_tuner_3d" type="static_obs_sector_server.py" name="static_obs" output="screen" />
+    <node pkg="friction_sector_tuner" type="friction_sector_server.py" name="friction" output="screen" />
+  </group>
+
+  <!-- Velocity scaler -->
   <node pkg="sector_tuner_3d" type="vel_scaler_node.py" name="velocity_scaler" output="screen">
     <param name="enable_smart_scaling" value="$(arg enable_smart_scaling)" />
-    <!-- ### IY : remap when local racing line mux is active -->
     <remap if="$(arg use_local_racing_line)"
            from="/global_waypoints_scaled" to="/global_waypoints_scaled_raw" />
   </node>
 
-  <!-- ### IY : Local racing line mux node (event-triggered) -->
+  <!-- OT interpolator -->
+  <node pkg="overtaking_sector_tuner_3d" type="ot_interpolator.py" name="ot_interpolator" output="screen"/>
+
+  <!-- Local racing line mux (event-triggered) -->
   <group if="$(arg use_local_racing_line)">
     <node pkg="global_line_3d" type="local_raceline_mux_node.py"
           name="local_raceline_mux" output="screen">
@@ -94,22 +108,6 @@
       <param name="smoothed_track_file" value="gazebo_wall_2_3d_smoothed.csv" />
     </node>
   </group>
-
-  <!-- ### HJ : 3D overtaking sector server -->
-  <rosparam ns="ot_map_params" command="load"
-    file="$(find stack_master)/maps/$(arg map)/ot_sectors.yaml" />
-  <node pkg="overtaking_sector_tuner_3d" type="ot_sector_server.py" name="dyn_sector_overtake" output="screen" />
-  <node pkg="overtaking_sector_tuner_3d" type="ot_interpolator.py" name="ot_interpolator" output="screen"/>
-
-  <!-- ### HJ : 3D static obstacle sector server -->
-  <rosparam ns="static_obs_map_params" command="load"
-    file="$(find stack_master)/maps/$(arg map)/static_obs_sectors.yaml" />
-  <node pkg="static_obstacle_sector_tuner_3d" type="static_obs_sector_server.py"
-        name="dyn_sector_static_obstacle" output="screen" />
-
-  <!-- Friction sector tuner -->
-  <node pkg="friction_sector_tuner" type="friction_sector_server.py"
-        name="dyn_sector_friction" output="screen" />
 
   <!-- State indicator -->
   <group unless="$(arg sim)">

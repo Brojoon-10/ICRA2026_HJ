@@ -102,7 +102,7 @@ class VelocityPlanner:
 
         # Friction sector subscriber
         from dynamic_reconfigure.msg import Config as DynConfig
-        rospy.Subscriber("/dyn_sector_friction/parameter_updates", DynConfig, self.friction_changed_cb)
+        rospy.Subscriber("/dyn_sector_tuner/friction/parameter_updates", DynConfig, self.friction_changed_cb)
 
         # Init complete — now allow rqt changes to trigger recalculation
         self._init_phase = False

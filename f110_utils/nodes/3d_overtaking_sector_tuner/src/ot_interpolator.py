@@ -46,8 +46,8 @@ class OvertakingInterpolator:
         # SUBSCRIBE
         self.glb_wpnts_name = "/global_waypoints_scaled"
         self.glb_wpnts_sp_name = "/global_waypoints/shortest_path"
-        rospy.Subscriber("/dyn_sector_overtake/parameter_updates", Config, self.dyn_param_cb)
-        rospy.Subscriber("/dyn_sector_speed/parameter_updates", Config, self.dyn_speed_param_cb)
+        rospy.Subscriber("/dyn_sector_tuner/overtake/parameter_updates", Config, self.dyn_param_cb)
+        rospy.Subscriber("/dyn_sector_tuner/speed/parameter_updates", Config, self.dyn_speed_param_cb)
         rospy.Subscriber(self.glb_wpnts_name, WpntArray, self.glb_wpnts_cb)
         rospy.Subscriber("/global_waypoints", WpntArray, self.glb_wpnts_og_cb)
         rospy.Subscriber(self.glb_wpnts_sp_name, WpntArray, self.glb_wpnts_sp_cb)
