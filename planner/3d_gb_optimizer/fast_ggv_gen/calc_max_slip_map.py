@@ -3,6 +3,25 @@ from casadi import *
 from tqdm import tqdm
 
 
+### HJ : Probe HSL ma27; fall back to MUMPS if libhsl.so is not loadable.
+def _select_linear_solver():
+    try:
+        _x = MX.sym('x')
+        _probe = nlpsol('hsl_probe', 'ipopt',
+                        {'x': _x, 'f': (_x - 1.0) ** 2},
+                        {'ipopt.linear_solver': 'ma27',
+                         'ipopt.print_level': 0, 'print_time': 0})
+        _probe(x0=0.0)
+        if _probe.stats().get('success', False):
+            return 'ma27'
+    except Exception:
+        pass
+    return 'mumps'
+
+_LINEAR_SOLVER = _select_linear_solver()
+### HJ : end
+
+
 def calc_max_slip_map(tire_params: dict, debug_plots: bool = False, n_points: int = 200, tol: float = 1e-6):
     N_list = np.linspace(0.5, tire_params["N_max"], n_points)
     N_list_res = []
@@ -56,7 +75,9 @@ def calc_max_slip_map(tire_params: dict, debug_plots: bool = False, n_points: in
     ubg_vec = vertcat(0, 0)
 
     # --- Build solvers ONCE (parametric in p_N) ---
-    opts = {"ipopt.print_level": 0, "print_time": 0, "ipopt.tol": tol, "ipopt.max_iter": 200 if tol > 1e-5 else 500}
+    opts = {"ipopt.print_level": 0, "print_time": 0, "ipopt.tol": tol,
+            "ipopt.max_iter": 200 if tol > 1e-5 else 500,
+            "ipopt.linear_solver": _LINEAR_SOLVER}  ### HJ : ma27 if HSL available, else mumps
     nlp_x = {"x": x, "f": -F_x, "g": vertcat(*g_con), "p": p_N}
     nlp_y = {"x": x, "f": F_y, "g": vertcat(*g_con), "p": p_N}
     solver_x = nlpsol("solver_x", "ipopt", nlp_x, opts)
