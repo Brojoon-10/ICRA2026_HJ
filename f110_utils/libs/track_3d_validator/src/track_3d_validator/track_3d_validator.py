@@ -102,12 +102,13 @@ class Track3DValidator:
             d_arr:      (N,) Frenet d-coordinates (optional, computed if None)
 
         Returns:
-            (valid: bool, first_invalid_idx: int)
+            (valid: bool, first_invalid_idx: int, fail_stage: int)
+            fail_stage: 0 = valid, 1 = d-bound, 2 = wall crossing
             first_invalid_idx = -1 if valid
         """
         N = len(samples_xy)
         if N < 2:
-            return True, -1
+            return True, -1, 0
 
         # --- Stage 1: d_right/d_left bound check (vectorized, ~0.1ms) ---
         if d_arr is None:
@@ -129,25 +130,10 @@ class Track3DValidator:
 
         if not np.any(outside):
             # Stage 1 all clear — skip Stage 2 for performance
-            return True, -1
+            return True, -1, 0
 
-        # Log which points failed Stage 1
+        # First Stage 1 failure (lowest index with outside == True)
         first_outside = int(np.argmax(outside))
-
-        # # DEBUG: uncomment for detailed validation logging
-        # fi = first_outside
-        # wi = int(wpnt_idxs[fi])
-        # dl = float(d_left[fi])
-        # dr = float(d_right[fi])
-        # di = float(d_arr[fi])
-        # lo = float(-dr + margin)
-        # hi = float(dl - margin)
-        # rospy.loginfo_throttle(2,
-        #     f"[Track3DValidator] Stage1 fail: traj_idx={fi}, wpnt_idx={wi}, "
-        #     f"s={float(s_arr[fi]):.3f}, d={di:.4f}, "
-        #     f"d_left(lookup)={dl:.4f}, d_right(lookup)={dr:.4f}, "
-        #     f"valid=[{lo:.4f}, {hi:.4f}], "
-        #     f"check_left={di > hi}, check_right={di < lo}")
 
         # --- Stage 2: s-based batch wall crossing check ---
         if self.has_boundary:
@@ -156,12 +142,9 @@ class Track3DValidator:
             )
             if np.any(crossing):
                 cross_idx = int(np.argmax(crossing))
-                # # DEBUG: uncomment for wall crossing logging
-                # rospy.loginfo_throttle(2,
-                #     f"[Track3DValidator] Stage2 wall crossing at idx={cross_idx}, s={s_arr[cross_idx]:.3f}")
-                return False, cross_idx
+                return False, cross_idx, 2
 
-        return False, first_outside
+        return False, first_outside, 1
 
     def is_point_valid(self, x, y, s=None, d=None):
         """

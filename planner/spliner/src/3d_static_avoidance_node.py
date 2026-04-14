@@ -421,6 +421,10 @@ class StaticAvoidance3D:
                     gb_wpnts[gb_idx_for_blend].y_m])
                 samples[idx] = samples[idx] * (1 - w) + target_pt * w
 
+        # Record spline portion length BEFORE appending GB (for validator scope)
+        spline_seg = np.linalg.norm(np.diff(samples, axis=0), axis=1)
+        spline_arc_len = float(np.sum(spline_seg))
+
         samples_raw = np.vstack([samples, xy_additional])
 
         # --- Uniform arc-length resampling (kappa accuracy + state machine consistency) ---
@@ -435,6 +439,8 @@ class StaticAvoidance3D:
             np.interp(arc_uni, arc, samples_raw[:, 0]),
             np.interp(arc_uni, arc, samples_raw[:, 1]),
         ])
+        # Index in resampled array where spline ends (GB additions begin)
+        n_spline_uni = int(np.searchsorted(arc_uni, spline_arc_len))
 
         # --- Frenet conversion (single source of truth for s, d) ---
         sd = self.converter.get_frenet(samples[:, 0], samples[:, 1])
@@ -450,14 +456,17 @@ class StaticAvoidance3D:
             el_lengths=(total_len / (n_uni - 1)) * np.ones(n_uni - 1),
             is_closed=False)
 
-        # --- Track3DValidator batch check ---
+        # --- Track3DValidator — validate only spline portion (GB additions trusted) ---
         danger_flag = False
         first_invalid = -1
-        if self.track_validator is not None:
-            valid, first_invalid = self.track_validator.validate_trajectory(
-                samples, s_arr, d_arr)
+        fail_stage = 0  # 0=valid, 1=d-bound, 2=wall crossing
+        if self.track_validator is not None and n_spline_uni >= 2:
+            valid, fi, st = self.track_validator.validate_trajectory(
+                samples[:n_spline_uni], s_arr[:n_spline_uni], d_arr[:n_spline_uni])
             if not valid:
                 danger_flag = True
+                first_invalid = fi
+                fail_stage = st
                 # # DEBUG: uncomment for detailed bounds violation logging
                 # fi = first_invalid
                 # gb_i = int((s_arr[fi] / wpnt_dist) % ref_max_idx)
@@ -498,6 +507,7 @@ class StaticAvoidance3D:
                 wpnt.mu_rad = ref.mu_rad
                 wpnts.wpnts.append(wpnt)
 
+            # Markers: green=valid, yellow=Stage1 (d-bound), red=Stage2 (wall crossing)
             mrk = Marker()
             mrk.header.frame_id = "map"
             mrk.header.stamp = rospy.Time.now()
@@ -505,9 +515,13 @@ class StaticAvoidance3D:
             mrk.scale.x = mrk.scale.y = 0.1
             mrk.scale.z = max(vi / self.gb_vmax, 0.05) if self.gb_vmax else 0.1
             mrk.color.a = 1.0
-            if is_invalid:
+            if is_invalid and fail_stage == 2:
                 mrk.color.r = 1.0
                 mrk.color.g = mrk.color.b = 0.0
+            elif is_invalid and fail_stage == 1:
+                mrk.color.r = 1.0
+                mrk.color.g = 1.0
+                mrk.color.b = 0.0
             else:
                 mrk.color.g = 0.8
                 mrk.color.r = 0.2
