@@ -13,11 +13,44 @@ from calc_max_slip_map import calc_max_slip_map
 import multiprocessing
 from joblib import Parallel, delayed
 
+
+### HJ : Probe HSL ma27; fall back to MUMPS if libhsl.so is not loadable.
+#       ma27 is 2~3x faster for our small NLPs but requires a user-built libhsl.
+def _select_linear_solver(verbose=True):
+    try:
+        _x = MX.sym('x')
+        _probe = nlpsol('hsl_probe', 'ipopt',
+                        {'x': _x, 'f': (_x - 1.0) ** 2},
+                        {'ipopt.linear_solver': 'ma27',
+                         'ipopt.print_level': 0, 'print_time': 0})
+        _probe(x0=0.0)
+        if _probe.stats().get('success', False):
+            if verbose:
+                print('[fast_gg] linear_solver: ma27 (HSL)')
+            return 'ma27'
+    except Exception:
+        pass
+    if verbose:
+        print('[fast_gg] linear_solver: mumps (HSL not available, fallback)')
+    return 'mumps'
+
+LINEAR_SOLVER = _select_linear_solver()
+### HJ : end
+
 # parse arguments
 parser = argparse.ArgumentParser(description='Fast GGV diagram generator (parametric NLP)')
 parser.add_argument('--vehicle_name', type=str, default='rc_car_10th', help='Vehicle name')
 parser.add_argument('--tuning', action='store_true', default=False,
                     help='Apply tuning_<vehicle>.yml override')
+## IY : decouple tuning file name from vehicle_name
+#       Default: tuning_<vehicle_name>.yml (backward compatible)
+#       Override: e.g. --tuning_name rc_car_10th
+#                 → use tuning_rc_car_10th.yml regardless of --vehicle_name
+#       Enables base × tuning combinations (multiple cars, shared tuning).
+parser.add_argument('--tuning_name', type=str, default=None,
+                    help='Tuning file suffix (default: same as --vehicle_name). '
+                         'Allows decoupled base/tuning combinations.')
+## IY : end
 parser.add_argument('--fast', action='store_true', default=True,
                     help='Use reduced resolution for fast tuning (default: True)')
 parser.add_argument('--full', action='store_true', default=False,
@@ -32,9 +65,25 @@ fast_mode = args.fast and not args.full
 # ============================================================
 g_earth = 9.81
 
+## IY : raise V_min from 1.5 to 2.0 to avoid Pacejka low-speed singularity
+#       Reason: at V<2, the slip angle regularization (eps_v=0.5) still intrudes
+#       ~17%, producing an artificially shrunken envelope. The post-hoc floor
+#       clamp worked around this but introduced a fit anomaly at V=1.5, g=10.5
+#       (fast4 output showed ax_max=1.03 vs raw rho=5.98 — diamond NLP stuck
+#       in a local minimum on the mixed-origin clamped envelope).
+#       Setting V_min=2.0 means:
+#         - NLP never computes the problematic V=1.5 slice
+#         - Floor clamp effectively no-ops (no drop to trigger it)
+#         - Diamond fit sees clean physics across the entire V range
+#       Lookup coverage: planner may occasionally request V<2 (observed min
+#       ≈1.64 on eng_0410_v5 track). The C++ FBGA binary clamps out-of-range
+#       V lookups to the nearest v_list entry, so V=1.0~1.99 queries return
+#       the V=2.0 envelope — equivalent to a hard floor at V=2, but much
+#       cleaner than the original clamp hack.
 if fast_mode:
     ### HJ : reduced resolution for interactive tuning
-    V_min = 1.5
+    # V_min = 1.5
+    V_min = 2.0
     V_max = 12.0
     V_N = 5            # 15 → 5
     g_factor_min = 1.0 / g_earth
@@ -44,7 +93,8 @@ if fast_mode:
     alpha_N_interp = 125  # output resolution (interpolated, not NLP)
     print(f'[fast_gg] FAST mode: {V_N}×{g_N}×{alpha_N_nlp} = {V_N*g_N*alpha_N_nlp} NLP calls')
 else:
-    V_min = 1.5
+    # V_min = 1.5
+    V_min = 2.0
     V_max = 12.0
     V_N = 15
     g_factor_min = 1.0 / g_earth
@@ -53,6 +103,7 @@ else:
     alpha_N_nlp = 125
     alpha_N_interp = 125
     print(f'[fast_gg] FULL mode: {V_N}×{g_N}×{alpha_N_nlp} = {V_N*g_N*alpha_N_nlp} NLP calls')
+## IY : end
 
 g_list = np.round(np.linspace(g_earth * g_factor_min, g_earth * g_factor_max, g_N), 6)
 alpha_list = np.linspace(-0.5 * np.pi, 0.5 * np.pi, alpha_N_nlp)
@@ -75,7 +126,12 @@ vehicle_params = params['vehicle_params']
 tire_params = params['tire_params']
 
 if args.tuning:
-    tuning_path = os.path.join(data_path, 'vehicle_params', 'tuning_' + vehicle_name + '.yml')
+    ## IY : tuning_name defaults to vehicle_name but can be overridden
+    #       to allow base/tuning decoupling (e.g. different base, shared tuning).
+    # tuning_path = os.path.join(data_path, 'vehicle_params', 'tuning_' + vehicle_name + '.yml')
+    _tuning_name = args.tuning_name if args.tuning_name else vehicle_name
+    tuning_path = os.path.join(data_path, 'vehicle_params', 'tuning_' + _tuning_name + '.yml')
+    ## IY : end
     if os.path.exists(tuning_path):
         with open(tuning_path, 'r') as stream:
             tuning = yaml.safe_load(stream)
@@ -83,10 +139,36 @@ if args.tuning:
             for key in ['lambda_mu_x', 'lambda_mu_y', 'p_Dx_2', 'p_Dy_2']:
                 if key in tuning:
                     tire_params[key] = tuning[key]
-            for key in ['P_max', 'v_max', 'epsilon']:
+            ## IY : extend tuning override keys to include NLP constraint params
+            #       (was: only P_max, v_max, epsilon)
+            # for key in ['P_max', 'v_max', 'epsilon']:
+            #     if key in tuning:
+            #         vehicle_params[key] = tuning[key]
+            for key in ['P_max', 'v_max', 'epsilon',
+                        'P_brake_max', 'ax_max_cap', 'ax_min_cap', 'ay_max_cap']:
                 if key in tuning:
                     vehicle_params[key] = tuning[key]
+            ## IY : end
             print(f'[fast_gg] Tuning override applied from {tuning_path}')
+
+            ## IY : save merged (base + tuning override) params to output for traceability
+            #       So each output/<vehicle>/ folder is self-contained and shows
+            #       exactly which parameter set produced the rho.npy files.
+            os.makedirs(out_path, exist_ok=True)
+            merged_path = os.path.join(out_path, 'params_' + vehicle_name + '.yml')
+            header = (
+                "# Auto-generated merged params (base + tuning override)\n"
+                f"# base:   {os.path.basename(vehicle_params_path)}\n"
+                f"# tuning: {os.path.basename(tuning_path)}\n"
+                f"# at:     {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "# DO NOT EDIT — regenerated on every fast_gen_gg_diagrams run\n\n"
+            )
+            merged = {'vehicle_params': vehicle_params, 'tire_params': tire_params}
+            with open(merged_path, 'w') as f:
+                f.write(header)
+                yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
+            print(f'[fast_gg] Merged params saved to {merged_path}')
+            ## IY : end
     else:
         print(f'[fast_gg] WARNING: --tuning specified but {tuning_path} not found')
 
@@ -379,9 +461,22 @@ lbg += [0, 0, 0, 0, 0, 0, 0]
 ubg += [0, 0, 0, 0, 0, 0, 0]
 
 # --- Engine power limit ---
+## IY : add brake power limit (was: lbg = -inf, no brake power constraint)
+#       Physical meaning: F_brake * V <= P_brake_max  (brake power upper bound)
+#       At high speed the ESC can't recover/dissipate arbitrary power, so
+#       max deceleration is limited. If P_brake_max is None/missing, lbg
+#       stays at -inf (original behavior, unbounded brake power).
+# g_con += [F_x * u]
+# lbg += [-float('inf')]
+# ubg += [vehicle_params["P_max"]]
+_P_brake_max = vehicle_params.get("P_brake_max", None)
+_brake_lb = -float('inf') if _P_brake_max is None else -float(_P_brake_max)
 g_con += [F_x * u]
-lbg += [-float('inf')]
+lbg += [_brake_lb]
 ubg += [vehicle_params["P_max"]]
+if _P_brake_max is not None:
+    print(f'[fast_gg] Brake power limit active: P_brake_max = {_P_brake_max} W')
+## IY : end
 
 # --- Velocity limit ---
 g_con += [u]
@@ -413,11 +508,38 @@ opts = {
     "ipopt.acceptable_iter": 10,
     "ipopt.hessian_approximation": 'limited-memory',
     "ipopt.warm_start_init_point": 'yes',
+    "ipopt.linear_solver": LINEAR_SOLVER,  ### HJ : ma27 if HSL available, else mumps
 }
 solver = nlpsol("solver", "ipopt", nlp, opts)
 
 lbg_vec = vertcat(*lbg)
 ubg_vec = vertcat(*ubg)
+
+## IY : build variable bounds for ax/ay caps (null = no cap, original behavior)
+#       These are speed-independent engineering safety limits on ax, ay applied
+#       directly as variable bounds (not constraints) — IPOPT handles these for
+#       free. Bounds go on the SCALED variables a_x_n, a_y_n, so divide caps
+#       by the corresponding scale factors a_x_s, a_y_s.
+#       Index 0 = a_x_n, index 1 = a_y_n (see x_n vertcat order above).
+_n_vars = x_n.shape[0]
+lbx_vec = -np.inf * np.ones(_n_vars)
+ubx_vec =  np.inf * np.ones(_n_vars)
+
+_ax_max_cap = vehicle_params.get("ax_max_cap", None)
+_ax_min_cap = vehicle_params.get("ax_min_cap", None)
+_ay_max_cap = vehicle_params.get("ay_max_cap", None)
+
+if _ax_max_cap is not None:
+    ubx_vec[0] = float(_ax_max_cap) / a_x_s
+    print(f'[fast_gg] ax_max_cap active: {_ax_max_cap} m/s^2')
+if _ax_min_cap is not None:
+    lbx_vec[0] = -float(_ax_min_cap) / a_x_s
+    print(f'[fast_gg] ax_min_cap active: {_ax_min_cap} m/s^2')
+if _ay_max_cap is not None:
+    ubx_vec[1] =  float(_ay_max_cap) / a_y_s
+    lbx_vec[1] = -float(_ay_max_cap) / a_y_s
+    print(f'[fast_gg] ay_max_cap active: ±{_ay_max_cap} m/s^2')
+## IY : end
 
 t_build = time.time() - t_build_start
 print(f'[fast_gg] Solver built in {t_build:.2f}s')
@@ -462,9 +584,16 @@ def calc_gg_points(V, g_force, alpha_list_local):
             x0_n = x0_prev
 
         # call solver with parameters
-        x_opt = solver(x0=x0_n, lbx=-np.inf, ubx=np.inf,
+        ## IY : pass ax/ay cap variable bounds (was: lbx=-inf, ubx=inf)
+        #       Defaults to ±inf vectors if no caps set, so behavior is
+        #       identical to the original when all caps are null.
+        # x_opt = solver(x0=x0_n, lbx=-np.inf, ubx=np.inf,
+        #                lbg=lbg_vec, ubg=ubg_vec,
+        #                p=vertcat(V, g_force, alpha))
+        x_opt = solver(x0=x0_n, lbx=lbx_vec, ubx=ubx_vec,
                        lbg=lbg_vec, ubg=ubg_vec,
                        p=vertcat(V, g_force, alpha))
+        ## IY : end
 
         if solver.stats()["success"]:
             x0_prev = x_opt["x"]
@@ -531,6 +660,63 @@ if __name__ == "__main__":
 
     rho_vehicle_frame = [tmp[0] for tmp in processed_list]
     rho_velocity_frame = [tmp[1] for tmp in processed_list]
+
+    ## IY : low-speed rho floor clamp
+    # Pacejka underestimates lateral grip at low speed due to slip angle
+    # artifact (large geometric slip ≠ actual sliding at low speed).
+    # For each g, scan high→low speed on the lateral axis (alpha≈0) to
+    # detect where rho drops sharply (>10%), then clamp all lower speeds
+    # to the value just before the drop. Only raises values (max op).
+    DROP_THRESHOLD = 0.10  # 10% drop triggers clamp
+    alpha_lat_idx = int(np.argmin(np.abs(alpha_list_interp)))  # alpha≈0
+
+    for rho_data in [rho_vehicle_frame, rho_velocity_frame]:
+        for g_idx in range(g_N):
+            # extract lateral rho at each velocity
+            rho_lat = np.array([rho_data[v_idx][g_idx][alpha_lat_idx]
+                                for v_idx in range(V_N)])
+            # scan high→low speed: find first sharp drop
+            v_ref_idx = 0  # fallback: lowest speed (no clamp)
+            for v_idx in range(V_N - 1, 0, -1):
+                if rho_lat[v_idx] > 1e-6:
+                    drop = (rho_lat[v_idx] - rho_lat[v_idx - 1]) / rho_lat[v_idx]
+                    if drop > DROP_THRESHOLD:
+                        ## HJ : use v_idx + 1 as floor instead of v_idx
+                        #       When a >10% drop is detected between v_idx and v_idx-1,
+                        #       v_idx itself is the UPPER side of the drop — but
+                        #       empirically it's still in the SHOULDER (transitioning
+                        #       into plateau), not fully on the plateau. The next-up
+                        #       sample (v_idx+1) lands on the truly healthy region.
+                        #
+                        #       Verified on rc_car_10th_iy fast-mode data (2026-04-13):
+                        #         before: floor=rho[V=4.125]=5.943 (3.7% undershoot)
+                        #         after : floor=rho[V=6.75 ]=6.144 (0.4% undershoot)
+                        #
+                        #       min() clips to V_N-1 for the edge case where the drop
+                        #       occurs at the very top sample (extremely rare since
+                        #       the scan starts from the top of the plateau).
+                        # v_ref_idx = v_idx
+                        v_ref_idx = min(v_idx + 1, V_N - 1)
+                        ## HJ : end
+                        break
+            # apply floor clamp for all speeds below v_ref
+            if v_ref_idx > 0:
+                floor = rho_data[v_ref_idx][g_idx]  # rho at v_ref for all alpha
+                for v_idx in range(v_ref_idx):
+                    rho_data[v_idx][g_idx] = np.maximum(rho_data[v_idx][g_idx], floor)
+                ## HJ : updated log — v_ref-1 no longer meaningful after v_idx+1 shift
+                # print(f'[fast_gg] Floor clamp: g={g_list[g_idx]:.2f}, '
+                #       f'V_ref={V_list[v_ref_idx]:.2f} m/s, '
+                #       f'clamped V < {V_list[v_ref_idx]:.2f} '
+                #       f'(lat rho {rho_lat[v_ref_idx-1]:.2f} → {rho_lat[v_ref_idx]:.2f})')
+                print(f'[fast_gg] Floor clamp: g={g_list[g_idx]:.2f}, '
+                      f'V_ref={V_list[v_ref_idx]:.2f} m/s, '
+                      f'clamped V < {V_list[v_ref_idx]:.2f} '
+                      f'(lat rho at V_ref = {rho_lat[v_ref_idx]:.2f})')
+                ## HJ : end
+
+    # (original: rho saved directly without clamp)
+    ## IY : end
 
     for frame in ["vehicle_frame", "velocity_frame"]:
         os.makedirs(os.path.join(out_path, frame), exist_ok=True)

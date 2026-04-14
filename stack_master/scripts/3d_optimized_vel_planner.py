@@ -57,6 +57,27 @@ from track3D import Track3D
 from ggManager import GGManager
 
 
+### HJ : Probe HSL ma27; fall back to MUMPS if libhsl.so is not loadable.
+def _select_linear_solver():
+    try:
+        _x = ca.MX.sym('x')
+        _probe = ca.nlpsol('hsl_probe', 'ipopt',
+                           {'x': _x, 'f': (_x - 1.0) ** 2},
+                           {'ipopt.linear_solver': 'ma27',
+                            'ipopt.print_level': 0, 'print_time': 0})
+        _probe(x0=0.0)
+        if _probe.stats().get('success', False):
+            print('[velopt] linear_solver: ma27 (HSL)')
+            return 'ma27'
+    except Exception:
+        pass
+    print('[velopt] linear_solver: mumps (HSL not available, fallback)')
+    return 'mumps'
+
+_LINEAR_SOLVER = _select_linear_solver()
+### HJ : end
+
+
 def build_and_solve(track, gg, vehicle_params,
                     n_fixed, chi_fixed, v_init, ax_init,
                     w_T=1.0, w_jx=1e-2, V_min=0.0, RK4_steps=1, sol_opt=None):
@@ -228,6 +249,7 @@ def build_and_solve(track, gg, vehicle_params,
             'ipopt.acceptable_tol': 1e-3,
             'ipopt.acceptable_iter': 10,
             'ipopt.constr_viol_tol': 1e-4,
+            'ipopt.linear_solver': _LINEAR_SOLVER,  ### HJ : ma27 if HSL available, else mumps
         }
     sol_opt = dict(sol_opt)
     sol_opt.setdefault('print_time', 0)
