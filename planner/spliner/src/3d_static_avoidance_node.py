@@ -255,10 +255,13 @@ class StaticAvoidance3D:
             self, obs_s, obs_d, obs_radius, gb_wpnts) -> Tuple[str, str]:
         """
         GB-aware direction decision.
-        BUGFIX: 원본은 gb_wp.d_left 만 보고 threshold 비교 — 장애물 위치 무시.
-        장애물이 left 에 붙어있고 raceline~left wall 이 커도 실제 통과 gap 은
-        0 가까울 수 있음. 결과: 좁은 쪽으로 갔다가 Track3DValidator 필터 막힘.
-        양쪽 실제 gap (장애물 edge ↔ wall) 을 계산해서 공간 큰 쪽 선택.
+        BUGFIX: the original only compared gb_wp.d_left against a threshold
+        and ignored the obstacle position. If an obstacle hugs the left wall
+        while the raceline-to-left-wall distance is large, the real gap for
+        passing can be near zero, so the planner would pick the narrow side
+        and the Track3DValidator would reject the resulting spline.
+        New logic computes the actual gap on each side (obstacle edge <->
+        wall) and picks the side with more room.
         """
         if gb_wpnts is None or len(gb_wpnts) == 0:
             return ('right', 'left') if obs_d > 0 else ('left', 'right')
@@ -267,7 +270,7 @@ class StaticAvoidance3D:
         obs_s_idx = int(obs_s / wpnt_dist) % len(gb_wpnts)
         gb_wp = gb_wpnts[obs_s_idx]
 
-        # 장애물 left/right edge in d (sign convention: +d = left)
+        # Obstacle left/right edges in d (sign convention: +d = left)
         obs_d_left = obs_d + obs_radius
         obs_d_right = obs_d - obs_radius
 
@@ -286,7 +289,7 @@ class StaticAvoidance3D:
         elif right_ok and not left_ok:
             return ('left', 'right')
         else:
-            # 둘 다 OK 거나 둘 다 애매: 더 넓은 쪽 선택
+            # Both sides acceptable or both tight: pick the wider gap
             if left_gap >= right_gap:
                 return ('right', 'left')
             else:
@@ -465,13 +468,16 @@ class StaticAvoidance3D:
         n_spline_uni = int(np.searchsorted(arc_uni, spline_arc_len))
 
         # --- 3D-safe s, d (no 2D nearest projection) ---
-        # BUGFIX: 원본 get_frenet(x,y) 는 2D 최근접 투영이라 3D 트랙 XY 오버랩
-        # (다리/교차로 두 층이 XY 겹침) 에서 한 샘플 (s, d) 쌍이 다른 층으로
-        # flip → spline_z / gb_wpnt_i / ref.vx_mps 동시에 튐. recovery 에서
-        # 실측 & 수정 검증 완료 (e7d5157). BPoly 가 (cur_x, cur_y) 에서
-        # 시작하므로:
-        #   s: cur_s + arc-length 누적 (cur_s 는 3D-aware C++ frenet_conversion)
-        #   d: 확정된 s 의 raceline 접선→법선 방향 signed 투영
+        # BUGFIX: the original get_frenet(x, y) is a 2D nearest projection,
+        # so on 3D tracks with XY overlap (bridges / elevated crossovers
+        # where two layers share the same XY) a single sample's (s, d) pair
+        # can flip to the wrong layer, pulling spline_z / gb_wpnt_i /
+        # ref.vx_mps with it simultaneously. Observed and verified on the
+        # recovery planner fix (commit e7d5157). The BPoly spline always
+        # starts at (cur_x, cur_y), so:
+        #   s: cur_s + cumulative arc-length (cur_s comes from the
+        #      3D-aware C++ frenet_conversion)
+        #   d: signed projection onto the raceline tangent-normal at that s
         s_arr = (float(self.cur_s) + arc_uni) % float(self.gb_max_s)
 
         ref_x = np.asarray(self.converter.spline_x(s_arr)).flatten()
