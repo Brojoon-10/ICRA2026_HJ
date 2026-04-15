@@ -368,10 +368,26 @@ class RecoverySpliner3D:
         # Index in resampled array where spline ends (GB additions begin)
         n_spline_uni = int(np.searchsorted(arc_uni, spline_arc_len))
 
-        # === Frenet conversion (single source of truth for s, d) ===
-        sd = self.converter.get_frenet(samples_xy[:, 0], samples_xy[:, 1])
-        s_arr = sd[0]
-        d_arr = sd[1]
+        # === 3D-safe s, d computation (no 2D nearest projection) ===
+        # BUGFIX: 원본 get_frenet(x,y) 는 2D 최근접 투영이라 3D 트랙 XY 오버랩
+        # (다리/교차 등 두 층이 같은 XY 차지) 에서 한 샘플 (s, d) 쌍이 통째로
+        # 다른 층으로 flip → spline_z / gb_wpnt_i / ref.vx_mps 동시에 튐.
+        # 실측 확인: s 17→17→50→17 (Δ~33m 점프), z 0.14↔0.60, vx 4→6 한 실린더.
+        # spline 이 (cur_x, cur_y) 에서 출발하므로:
+        #   s: cur_s + arc-length 누적 (3D-aware cur_s 출처: C++ frenet_conversion)
+        #   d: 확정된 s 지점의 raceline 접선에서 법선 방향 signed 투영
+        # 둘 다 get_frenet 의 2D 최근접 모호성 완전 회피.
+        s_arr = (float(self.cur_s) + arc_uni) % float(self.gb_max_s)
+
+        ref_x = np.asarray(self.converter.spline_x(s_arr)).flatten()
+        ref_y = np.asarray(self.converter.spline_y(s_arr)).flatten()
+        dx_ds = np.asarray(self.converter.spline_x(s_arr, 1)).flatten()
+        dy_ds = np.asarray(self.converter.spline_y(s_arr, 1)).flatten()
+        t_norm = np.sqrt(dx_ds * dx_ds + dy_ds * dy_ds) + 1e-9
+        # unit normal toward +d (left, 90° CCW from tangent) — matches get_cartesian convention
+        nx = -dy_ds / t_norm
+        ny = dx_ds / t_norm
+        d_arr = (samples_xy[:, 0] - ref_x) * nx + (samples_xy[:, 1] - ref_y) * ny
 
         # z from reference path surface (uses s only, consistent with s_arr)
         z_arr = np.array(self.converter.spline_z(s_arr)).flatten()
