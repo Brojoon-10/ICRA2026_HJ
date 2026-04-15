@@ -117,35 +117,36 @@ def _build_cylinder_markers(xs, ys, zs, vs, r, g, b):
     return markers
 
 
-### HJ : trackbounds now 1:1 with raceline wpnts, using wpnt psi + d_left/d_right
-def _build_trackbounds_markers(waypoints):
-    """Wpnt-aligned 좌/우 트랙 경계 sphere markers (1:1 with wpnts, psi-normal direction).
-    좌=보라(0.5,0,0.5), 우=노랑(0.5,1,0). z는 wpnt의 z_m 그대로 사용."""
+def _build_trackbounds_markers(track):
+    """좌/우 트랙 경계 sphere markers. 좌=보라(0.5,0,0.5), 우=노랑(0.5,1,0)."""
     markers = []
     marker_id = 0
 
-    for w in waypoints:
-        x, y, z = w['x_m'], w['y_m'], w['z_m']
-        psi = w['psi_rad']
-        d_left = w['d_left']
-        d_right = w['d_right']
+    for k in range(len(track.s)):
+        s = track.s[k]
+        theta = track.theta[k]
+        x_c, y_c, z_c = track.x[k], track.y[k], track.z[k]
 
-        # 왼쪽 경계 (psi + pi/2 방향)
-        x_l = x + d_left * np.cos(psi + np.pi / 2)
-        y_l = y + d_left * np.sin(psi + np.pi / 2)
+        # 왼쪽 경계
+        w_l = track.w_tr_left[k]
+        x_l = x_c - w_l * np.sin(theta)
+        y_l = y_c + w_l * np.cos(theta)
+
         m = _make_marker_template()
         m['id'] = marker_id
-        m['pose']['position'] = {'x': float(x_l), 'y': float(y_l), 'z': float(z)}
+        m['pose']['position'] = {'x': float(x_l), 'y': float(y_l), 'z': float(z_c)}
         m['color'] = {'r': 0.5, 'g': 0.0, 'b': 0.5, 'a': 1.0}
         markers.append(m)
         marker_id += 1
 
-        # 오른쪽 경계 (psi - pi/2 방향)
-        x_r = x + d_right * np.cos(psi - np.pi / 2)
-        y_r = y + d_right * np.sin(psi - np.pi / 2)
+        # 오른쪽 경계
+        w_r = track.w_tr_right[k]  # 음수
+        x_r = x_c - w_r * np.sin(theta)
+        y_r = y_c + w_r * np.cos(theta)
+
         m = _make_marker_template()
         m['id'] = marker_id
-        m['pose']['position'] = {'x': float(x_r), 'y': float(y_r), 'z': float(z)}
+        m['pose']['position'] = {'x': float(x_r), 'y': float(y_r), 'z': float(z_c)}
         m['color'] = {'r': 0.5, 'g': 1.0, 'b': 0.0, 'a': 1.0}
         markers.append(m)
         marker_id += 1
@@ -288,7 +289,7 @@ def export_waypoints():
     )
     ### HJ : end
 
-    trackbounds_markers = _build_trackbounds_markers(waypoints)
+    trackbounds_markers = _build_trackbounds_markers(track)
 
     # ── JSON 출력 (참고 포맷 호환) ──
     output = {
