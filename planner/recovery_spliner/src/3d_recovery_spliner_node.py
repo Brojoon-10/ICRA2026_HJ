@@ -369,14 +369,18 @@ class RecoverySpliner3D:
         n_spline_uni = int(np.searchsorted(arc_uni, spline_arc_len))
 
         # === 3D-safe s, d computation (no 2D nearest projection) ===
-        # BUGFIX: 원본 get_frenet(x,y) 는 2D 최근접 투영이라 3D 트랙 XY 오버랩
-        # (다리/교차 등 두 층이 같은 XY 차지) 에서 한 샘플 (s, d) 쌍이 통째로
-        # 다른 층으로 flip → spline_z / gb_wpnt_i / ref.vx_mps 동시에 튐.
-        # 실측 확인: s 17→17→50→17 (Δ~33m 점프), z 0.14↔0.60, vx 4→6 한 실린더.
-        # spline 이 (cur_x, cur_y) 에서 출발하므로:
-        #   s: cur_s + arc-length 누적 (3D-aware cur_s 출처: C++ frenet_conversion)
-        #   d: 확정된 s 지점의 raceline 접선에서 법선 방향 signed 투영
-        # 둘 다 get_frenet 의 2D 최근접 모호성 완전 회피.
+        # BUGFIX: the original get_frenet(x, y) is a 2D nearest projection,
+        # so on 3D tracks with XY overlap (bridges / elevated crossovers
+        # where two layers share the same XY) a single sample's (s, d) pair
+        # can flip to the wrong layer, pulling spline_z / gb_wpnt_i /
+        # ref.vx_mps with it simultaneously.
+        # Observed in logs: s 17 -> 17 -> 50 -> 17 (Δ~33m jump on one sample),
+        # z 0.14 <-> 0.60, vx 4 -> 6 on a single cylinder.
+        # The BPoly spline always starts at (cur_x, cur_y), so:
+        #   s: cur_s + cumulative arc-length (cur_s comes from the 3D-aware
+        #      C++ frenet_conversion)
+        #   d: signed projection onto the raceline tangent-normal at that s
+        # Both avoid the 2D nearest projection ambiguity entirely.
         s_arr = (float(self.cur_s) + arc_uni) % float(self.gb_max_s)
 
         ref_x = np.asarray(self.converter.spline_x(s_arr)).flatten()

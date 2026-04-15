@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
 3D SQP Avoidance — sqp_avoidance_node.py 3D version
-    - smart_static 모드 제거 (3D에선 미사용)
-    - wrap-around 유틸 적용 (circular_s_dist, signed_s_dist) — 시작/끝점 뜀 방지
-    - Track3DValidator로 스플라인 portion 검증 (실패 시 warm-start fallback)
-    - z_m = spline_z(s) 로 3D output
-    - Local curvature velocity: v = ref.vx * sqrt(|1 - d*kappa|)
-    - SLSQP 안정성 개선: ftol=1e-3, maxiter=50, warm start 유지
-    - 원본 구조/목적함수/제약/SLSQP 그대로 유지 (버그만 수정)
+    - smart_static mode removed (unused in 3D).
+    - Wrap-around utils applied (circular_s_dist, signed_s_dist) to avoid
+      start/end jumps at the s wrap seam.
+    - Track3DValidator checks the spline portion (warm-start fallback on
+      failure).
+    - z_m = spline_z(s) for 3D output.
+    - Local curvature velocity: v = ref.vx * sqrt(|1 - d*kappa|).
+    - SLSQP tuned for stability: ftol=1e-3, maxiter=50, warm start kept.
+    - Original structure / objective / constraints / SLSQP retained; only
+      bugs are fixed.
 """
 import time
 import rospy
@@ -161,8 +164,9 @@ class SQPAvoidance3DNode:
         v_max = np.max(np.array([wpnt.vx_mps for wpnt in data.wpnts]))
         if self.scaled_vmax != v_max:
             self.scaled_vmax = v_max
-            # BUGFIX: use len(), not .id. 원본은 data.wpnts[-1].id = N-1 을 모듈로로 써서
-            # 마지막 인덱스(N-1)가 0 으로 매핑되는 off-by-one 존재.
+            # BUGFIX: use len(), not .id. The original used
+            # data.wpnts[-1].id = N-1 as a modulus, which aliased the last
+            # waypoint (N-1) onto index 0 — an off-by-one wrap error.
             self.scaled_max_idx = len(data.wpnts)
             self.scaled_max_s = data.wpnts[-1].s_m
             self.scaled_delta_s = data.wpnts[1].s_m - data.wpnts[0].s_m
@@ -170,7 +174,7 @@ class SQPAvoidance3DNode:
     def updated_wpnts_cb(self, data: WpntArray):
         self.wpnts_updated = data.wpnts[:-1]
         self.max_s_updated = self.wpnts_updated[-1].s_m
-        # BUGFIX: 동일 off-by-one. 배열 길이 사용.
+        # BUGFIX: same off-by-one. Use the array length.
         self.max_idx_updated = len(self.wpnts_updated)
 
     def behavior_cb(self, data: BehaviorStrategy):
@@ -235,12 +239,15 @@ class SQPAvoidance3DNode:
             considered_obs = []
             for ob in obs.obstacles:
                 s_forward = signed_s_dist(self.cur_s, ob.s_start, self.scaled_max_s)
-                # 전방 & lookahead 이내, d 중심이 경로에 가까울 때만 고려.
-                # opponent trajectory가 아직 안 왔으면 동적 장애물은 제외 (circular_s_dist(None) 방지)
+                # Only consider obstacles ahead of us within lookahead and
+                # whose d_center is close to the raceline.
+                # If /opponent_trajectory has not been received yet, skip
+                # dynamic obstacles (avoid circular_s_dist(None)).
                 if not (abs(ob.d_center) < self.obs_traj_tresh and 0 <= s_forward < self.lookahead):
                     continue
                 if not ob.is_static and self.opponent_wpnts_sm is None:
-                    # dynamic obstacle이지만 opponent_trajectory 미수신 → 이번 사이클은 static처럼 취급 또는 skip
+                    # Dynamic obstacle but /opponent_trajectory not yet
+                    # received — skip this cycle (or treat as static).
                     rospy.logwarn_throttle(
                         2.0, "[3D SQP] dynamic obstacle received but /opponent_trajectory not yet available — skipping"
                     )
@@ -397,11 +404,13 @@ class SQPAvoidance3DNode:
             resp = self.converter.get_cartesian(evasion_s, evasion_d).transpose()
             smoothed_xy_points = self.ccma.filter(resp)
 
-            # BUGFIX: 기존엔 smoothed XY 에 대해 get_frenet 재투영 — 2D 최근접이라
-            # 3D 트랙 XY 오버랩에서 샘플 s 가 다른 층으로 flip 가능.
-            # s_array 는 이미 확정 (linspace) 이고 CCMA 는 XY 만 살짝 스무딩할 뿐
-            # s 축 샘플 위치를 바꾸지 않음 → s 는 그대로 재사용, d 만 geometric
-            # normal projection 으로 재계산 (recovery/static 수정과 동일 방식).
+            # BUGFIX: previously we re-projected the smoothed XY via
+            # get_frenet, a 2D nearest projection that on 3D tracks with
+            # XY overlap can flip a sample's s to a different layer.
+            # s_array is already fixed (linspace) and CCMA only lightly
+            # smooths XY without shifting samples along s, so we keep s
+            # as-is and recompute d as a geometric normal projection —
+            # same approach as the recovery / static fix.
             evasion_x = smoothed_xy_points[:, 0]
             evasion_y = smoothed_xy_points[:, 1]
             # evasion_s is already set above: np.mod(s_array, scaled_max_s)
@@ -491,8 +500,10 @@ class SQPAvoidance3DNode:
         delta_s = self.down_sampled_delta_s
         e_psi = self.converter.get_e_psi(self.cur_x, self.cur_y, self.cur_yaw)
         desired_dd = np.tan(e_psi) * delta_s
-        # BUGFIX: 원본은 abs(desired_dd) 로 부호 날려서 e_psi<0 (우측 헤딩) 인데도
-        # d[1]-d[0] 를 양수로 강제 → 실제 헤딩과 반대 방향으로 경로 시작. 부호 유지.
+        # BUGFIX: the original wrapped desired_dd in abs(), erasing its
+        # sign. So with e_psi < 0 (vehicle heading right of the tangent)
+        # it still forced d[1]-d[0] > 0, starting the path in the wrong
+        # direction. Keep the sign.
         return np.array([0.02 - abs((d[1] - d[0]) - desired_dd)])
 
     def obstacle_constraint(self, d):
@@ -511,14 +522,16 @@ class SQPAvoidance3DNode:
         return violations
 
     def turning_radius_constraint(self, d):
-        # BUGFIX: 원본은 d''(s) 만 kappa 로 보고 raceline 의 kappa_ref 를 누락.
-        # 실제 경로 곡률 ≈ kappa_ref + d''(s). 코너 구간에서 kappa_ref 가 이미
-        # 마찰 예산을 크게 쓰는데 제약이 d''(s) 만 제한하면 총 곡률이 한계 초과.
-        # global_traj_kappas 는 원본에서 계산만 해놓고 사용처가 없었음 — 여기 연결.
+        # BUGFIX: the original treated only d''(s) as kappa and dropped
+        # the raceline's kappa_ref. The actual path curvature is
+        # approximately kappa_ref + d''(s); in corners kappa_ref already
+        # consumes most of the friction budget, so bounding only d''(s)
+        # lets the total curvature exceed the limit. global_traj_kappas
+        # was computed but never read in the original — wire it in here.
         y_prime = np.diff(d)
         y_prime = np.where(y_prime == 0, 1e-6, y_prime)
         y_prime_prime = np.diff(y_prime)
-        # y_prime_prime shape (N-2,), global_traj_kappas 도 (N-2,) 로 정렬
+        # y_prime_prime has shape (N-2,); global_traj_kappas is (N-2,) too.
         kappa_offset = y_prime_prime / (self.down_sampled_delta_s ** 2)
         kappa_total = self.global_traj_kappas + kappa_offset
         mu = 0.318
@@ -530,8 +543,10 @@ class SQPAvoidance3DNode:
         return np.array([self.down_sampled_delta_s - abs(d[1] - d[0])])
 
     def side_consistency_constraint(self, d):
-        # BUGFIX: 원본은 모든 d 에 side 제약을 걸어서, 차가 raceline 반대편에 있으면
-        # d[0]=current_d 와 충돌(solver infeasible). 장애물 범위 indices 에만 적용.
+        # BUGFIX: the original applied the side constraint to all d,
+        # which conflicts with d[0] = current_d when the car is on the
+        # opposite side (making the solver infeasible). Apply it only
+        # over the obstacle range indices.
         if len(self.obs_downsampled_indices) == 0:
             return np.array([1.0])
         d_obs = d[self.obs_downsampled_indices]
