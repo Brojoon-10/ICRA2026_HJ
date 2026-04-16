@@ -144,14 +144,17 @@ class SamplingPlannerNode:
         rospy.Subscriber('/car_state/odom', Odometry, self._cb_odom, queue_size=1)
 
         # -- Publishers ------------------------------------------------------------------------------------------
-        self.pub_wpnts       = rospy.Publisher('~best_trajectory',   WpntArray,   queue_size=1)
-        self.pub_path        = rospy.Publisher('~best_path',         Path,        queue_size=1)
-        # ### HJ : marker style mirrors 3d_state_machine_node local_waypoints:
-        #         SPHERE per point (speed-colored) + CYLINDER height = V * 0.1317
-        self.pub_loc_markers = rospy.Publisher('~markers',           MarkerArray, queue_size=10)
-        self.pub_vel_markers = rospy.Publisher('~vel_markers',       MarkerArray, queue_size=10)
-        self.pub_status      = rospy.Publisher('~status',            String,      queue_size=1, latch=True)
-        self.pub_timing      = rospy.Publisher('~timing_ms',         Float32,     queue_size=1)
+        self.pub_wpnts         = rospy.Publisher('~best_trajectory', WpntArray,   queue_size=1)
+        self.pub_best_sample   = rospy.Publisher('~best_sample',     Path,        queue_size=1)
+        # ### HJ : best sample = SPHERE per point (speed-colored) + CYLINDER (speed-height)
+        self.pub_best_markers  = rospy.Publisher('~best_sample/markers',     MarkerArray, queue_size=10)
+        self.pub_vel_markers   = rospy.Publisher('~best_sample/vel_markers', MarkerArray, queue_size=10)
+        # ### HJ : every valid sampled candidate as thin gray LINE_STRIPs so the
+        #         "fan of samples" is visible in RViz. Invalid (friction / bounds)
+        #         candidates are suppressed.
+        self.pub_candidates    = rospy.Publisher('~candidates',              MarkerArray, queue_size=10)
+        self.pub_status        = rospy.Publisher('~status',                  String,      queue_size=1, latch=True)
+        self.pub_timing        = rospy.Publisher('~timing_ms',               Float32,     queue_size=1)
 
         self._publish_status('INIT_OK')
         rospy.loginfo('[sampling] Node ready — observation mode.')
@@ -493,6 +496,9 @@ class SamplingPlannerNode:
                     except Exception as _e:
                         rospy.logwarn_throttle(2.0, '[sampling][traj] log failed: %s', _e)
                     self._publish_trajectory(traj)
+                    # ### HJ : publish all valid candidate samples (gray lines)
+                    #         so the sampling fan is actually visible in RViz.
+                    self._publish_candidates(traj.get('optimal_idx', -1))
                     self._publish_status('OK')
                 else:
                     self._publish_status('NO_FEASIBLE')
@@ -643,7 +649,7 @@ class SamplingPlannerNode:
             ps.pose.position.z = float(zs[i])
             ps.pose.orientation.w = 1.0
             path.poses.append(ps)
-        self.pub_path.publish(path)
+        self.pub_best_sample.publish(path)
 
         # Expose for downstream marker building
         traj_x = xs; traj_y = ys; traj_z = zs
@@ -684,7 +690,7 @@ class SamplingPlannerNode:
             mk.pose.position.z = float(traj_z[i])
             mk.pose.orientation.w = 1.0
             loc_markers.markers.append(mk)
-        self.pub_loc_markers.publish(loc_markers)
+        self.pub_best_markers.publish(loc_markers)
 
         # CYLINDER vel markers — height = V * 0.1317 (same scale as state machine)
         VEL_SCALE = 0.1317
@@ -710,6 +716,96 @@ class SamplingPlannerNode:
             mk.pose.orientation.w = 1.0
             vel_markers.markers.append(mk)
         self.pub_vel_markers.publish(vel_markers)
+
+    # =============================================================================================================
+    # Candidate-samples publishing (gray fan)
+    # =============================================================================================================
+    def _publish_candidates(self, optimal_idx: int):
+        """Publish all sampled candidates as LINE_STRIPs.
+
+        - Valid non-best : gray, thin (0.03 m), alpha 0.35
+        - Invalid        : dark gray, very thin (0.015 m), alpha 0.15
+        - Best (optimal) : RED, thick (0.07 m), alpha 1.0 — drawn last so it
+                           is always on top.
+        """
+        cands = getattr(self.planner, 'candidates', None)
+        if cands is None:
+            return
+        s_all     = np.asarray(cands['s'])
+        n_all     = np.asarray(cands['n'])
+        valid_all = np.asarray(cands['valid'], dtype=bool)
+        N = s_all.shape[0]
+
+        header = Header()
+        header.stamp    = rospy.Time.now()
+        header.frame_id = self.frame_id
+
+        ma = MarkerArray()
+        clr = Marker()
+        clr.header = header
+        clr.action = Marker.DELETEALL
+        ma.markers.append(clr)
+
+        L = float(self.track.s[-1])
+        drawn = 0
+        best_marker = None
+
+        for i in range(N):
+            is_best  = (i == optimal_idx)
+            is_valid = bool(valid_all[i])
+
+            s_row = s_all[i]
+            n_row = n_all[i]
+            ds = np.diff(s_row)
+            wrap_adj = np.cumsum(np.where(ds < -L / 2.0, L, 0.0))
+            s_unwr = s_row.copy().astype(np.float64)
+            s_unwr[1:] += wrap_adj
+            try:
+                xyz = self.track.sn2cartesian(
+                    s=np.clip(s_unwr % L, 1e-6, L - 1e-6), n=n_row)
+                xs_ = np.asarray(xyz[:, 0], dtype=np.float64)
+                ys_ = np.asarray(xyz[:, 1], dtype=np.float64)
+                zs_ = np.asarray(xyz[:, 2], dtype=np.float64)
+            except Exception:
+                continue
+
+            mk = Marker()
+            mk.header = header
+            mk.ns     = 'candidates'
+            mk.id     = drawn + 1
+            mk.type   = Marker.LINE_STRIP
+            mk.action = Marker.ADD
+            mk.pose.orientation.w = 1.0
+
+            if is_best:
+                mk.scale.x = 0.07   # thick
+                mk.color.r = 1.0; mk.color.g = 0.1; mk.color.b = 0.1
+                mk.color.a = 1.0
+            elif is_valid:
+                mk.scale.x = 0.03   # thin
+                mk.color.r = 0.55; mk.color.g = 0.55; mk.color.b = 0.55
+                mk.color.a = 0.35
+            else:
+                mk.scale.x = 0.015  # very thin
+                mk.color.r = 0.3; mk.color.g = 0.3; mk.color.b = 0.3
+                mk.color.a = 0.15
+
+            for k in range(len(xs_)):
+                p = Point()
+                p.x = float(xs_[k]); p.y = float(ys_[k]); p.z = float(zs_[k])
+                mk.points.append(p)
+
+            if is_best:
+                best_marker = mk   # draw last (on top)
+            else:
+                ma.markers.append(mk)
+            drawn += 1
+
+        # best on top — appended last so RViz renders it above the others
+        if best_marker is not None:
+            ma.markers.append(best_marker)
+
+        self.pub_candidates.publish(ma)
 
 
 def main():

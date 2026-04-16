@@ -455,24 +455,213 @@ For each planner, before declaring Phase 1 done:
 ## 10. Quick-Start Commands (Once Built)
 
 ```bash
-# Sampling planner observe
-roslaunch 3d_sampling_based_planner sampling_planner_observe.launch \
-  map_name:=gazebo_wall_2_iy
+# Sampling planner observe (directory is 3d_sampling_based_planner/;
+# ROS package name is sampling_based_planner_3d — ROS 1 doesn't allow pkg
+# names that start with a digit, so directory and pkg name intentionally differ)
+roslaunch sampling_based_planner_3d sampling_planner_observe.launch \
+  map_name:=gazebo_wall_2_iy vehicle_name:=rc_car_10th_latest
 
-# MPCC 2D observe
+# MPCC 2D observe (not yet implemented)
 roslaunch mpcc_planner mpcc_planner_observe.launch \
   map_name:=gazebo_wall_2_iy use_3d:=false
 
-# MPCC 3D observe
+# MPCC 3D observe (not yet implemented)
 roslaunch mpcc_planner mpcc_planner_observe.launch \
   map_name:=gazebo_wall_2_iy use_3d:=true
-
-# Compare both alongside global raceline in RViz
-rviz -d $(rospack find 3d_sampling_based_planner)/rviz/sampling_observe.rviz
 ```
 
 ---
 
-**Owner**: HJ
-**Created**: 2026-04-16
-**Status**: Plan — pending review before Phase 0 execution
+## 11. Phase 0/1 구현 일지 — sampling_based_planner_3d
+
+### 11.1 실제 셋업 순서
+
+1. TUM 레포를 `planner/3d_sampling_based_planner/`에 통째로 복사 (`src/`, `data/`, `local_sampling_based/` 등 그대로 보존)
+2. ROS 스킨 추가: `package.xml`, `CMakeLists.txt`, `config/default.yaml`, `launch/`, `node/sampling_planner_node.py`, `install/install_deps.sh` (pip3)
+3. `ggManager.py`를 `3d_gb_optimizer`와 sys.path로 공유 (분리 시점에 byte-identical 확인). `track3D.py`, `point_mass_model.py`는 gb_optimizer에 HJ 수정본이 있어 로컬 유지.
+4. ROS 패키지명 `3d_sampling_based_planner → sampling_based_planner_3d` (ROS 1은 숫자로 시작하는 이름 불가). 폴더명은 유지.
+5. 런타임 버그 순차 수정 (아래 표).
+
+### 11.2 버그 추적 로그 (시간 순)
+
+| # | 증상 | 진단 | 해결 |
+|---|---|---|---|
+| 1 | `KeyError: 's_m'` 시작 시 | raceline CSV 컬럼이 `s_opt/v_opt/...`이지 `s_m/vx_mps`가 아님 | `_load_raceline_dict`에서 후보 컬럼명 리스트 탐색 |
+| 2 | `AttributeError: Track3D has no track_length` | Upstream은 호길이 배열을 `self.s`로 저장, 스칼라 없음 | `self.track.s[-1]` 사용 |
+| 3 | `KeyError: 't'` (calc_trajectory 내부) | raceline dict에 `t/V/chi/ax/ay` 키 누락 | `t = cumsum(ds/v)` 유도, CSV 나머지 필드 복사 |
+| 4 | `KeyError: 't'` (2차) | `prediction`은 opponent id별 dict-of-dicts인데, 평면 dict를 넘김 | `prediction = {}` (상대차 없음) |
+| 5 | 궤적 s가 랩 중간에서 24m 폭주 (1초, V≤5.8) | 2-lap raceline concat이 `np.interp(..., period=L)`의 xp 중복 유발 | 단일 lap으로 되돌림 |
+| 6 | Stack frenet과 Track3D centerline 불일치 | `/car_state/odom_frenet`은 raceline 기준, Track3D는 centerline 기준 | `/car_state/odom` (cartesian) 구독 + `_cart_to_cl_frenet_exact`로 재투영 |
+| 7 | 랩 끝에서 sample 꼬리 "역행" | Quintic 다항식이 끝 속도/가속도 BC만 있고 위치 BC 없어 overshoot | §11.3 참고 |
+| 8 | 랩 끝 점들이 한 곳에 "몰림/뭉개짐" | 내가 넣은 `cummax` band-aid가 backward 점들을 같은 s에 stack | `cummax`/`stack-snap` 제거, `|ds|>0.20m` 시에만 truncate |
+| 9 | 랩 wrap 직후 첫 tick에서 궤적이 트랙 한참 너머로 튐 | **근본 원인 = `np.interp` periodic 정밀도 버그** → §11.4 |
+| 10 | Candidate 샘플이 best만 보이고 나머지 안 보임 | `_publish_candidates`에서 invalid skip + best skip → valid가 best 하나뿐이면 0개 | invalid도 옅게, best도 빨강으로, 모두 표시 |
+
+### 11.3 다항식 꼬리 overshoot (#7, #8)
+
+**현상.** 궤적 마지막 1~5개 sample의 s가 직전 대비 3~4cm 감소. RViz에서는 안 보이는 수준이지만, 첫 band-aid인 `np.maximum.accumulate`가 이 점들을 같은 s에 고정 → 같은 cartesian 위치에 중첩 → "점이 뭉친다".
+
+**원인.** Upstream의 s(t)는 quintic jerk-optimal 다항식. 경계조건이 시작 (s, ṡ, s̈) + 끝 (ṡ, s̈) = 5개이고 **끝 위치 제약이 없음**. 다항식이 끝 속도/가속도 맞추다가 미세하게 역진 가능.
+
+**선택한 해결:** 의미 있는 backward (> 0.20 m)에서만 truncate.
+- 미세 떨림(3~4cm)은 무시 (RViz에서 안 보임)
+- cummax는 점 stacking 유발, `xs[k+1:]=xs[k]`도 동일 → 둘 다 제거
+- upstream 다항식 차수 변경은 jerk-optimality 깨뜨림 → PoC에서는 과함
+
+### 11.4 랩 경계 "궤적 전역 폭주" 버그 (#9) — 핵심 이슈
+
+**증상.** 차가 s=L→s≈0 넘은 직후 첫 tick에서 `s_raw[0]=0.17, s_raw[1]=63.6`. 0.033초에 63m 진행 — V=2인데 — 물리적 불가능.
+
+**배제한 가설:**
+- Frenet 투영 드리프트 — 매 tick `ds ≈ cart_jump` 검증 완료
+- 2-lap raceline 확장 — 시도했으나 `period=L` interp에 xp 중복 유발, 악화
+- `_cart_to_cl_frenet_exact`가 잘못된 세그먼트 선택 — top-3 nearest 로그로 확인, 항상 정확
+
+**진짜 원인:** `np.interp(s_query, raceline['s'], raceline['t'], period=L)` 호출에서:
+
+1. numpy 내부: `xp_wrap = xp % period` 적용
+2. raceline s[-1] = 89.875073 == L **정확히 같음** → `89.875073 % 89.875073 = 0`
+3. 정렬(sort) 시 이 wrap된 마지막 점(s≈0, t=18.184)이 배열 앞쪽으로 이동
+4. s≈0.17 조회 시 numpy가 (s=0.000, t=18.184)와 (s=0.2, t=0.067) 사이를 보간
+5. 결과: **t ≈ 2.5초** — lap 끝 시간(18초)과 lap 시작 시간(0초) 사이의 무의미한 보간값
+6. 이 잘못된 t로 `postprocess_raceline`이 엉뚱한 인덱스에서 slice
+7. `s_post` 첫 step이 12m 점프 → 다항식 경계조건 폭주 → 모든 candidate가 10~30m 날아감
+
+**디버깅 과정:**
+1. cartesian gap > 3m 감지 로그 추가 → JUMP 포착
+2. `HJ_DEBUG` 환경변수로 랩 경계 근처 per-tick 상세 덤프 (state, postprocessed raceline, per-candidate 다항식 계수)
+3. 3분 주행으로 실제 wrap 통과 포착
+4. `s_post[-1] = 17.38 @ t_post[-1] = 1.51초` 확인 — V=3인 구간에서 11 m/s 진행이면 slice가 잘못됐다는 증거
+5. Python 독립 실행으로 `np.interp(0.173, s, t, period=L) = 2.49` vs `period=None: 0.058` 재현
+6. numpy 내부 동작 직접 추적 (`xp % period → sort → fp reorder → 경계 pad → 보간`) — wrap된 마지막 sample의 fp=T_lap이 앞쪽에 끼어든 것 확정
+
+**해결 (5줄, `_load_raceline_dict`):** raceline s[-1]을 `L - 1e-6`로 pin.
+- 데이터를 고쳐서 upstream 알고리즘이 설계대로 동작하게 함
+- 증상 위에 band-aid 쌓기 X (cummax, JUMP-mitigation 오히려 악화시킴)
+- closed-loop CSV에서 마지막 점은 첫 점과 동일 → 1µm 조정은 무해
+
+### 11.5 `postprocess_raceline` wrap-attach
+
+pin fix 이후에도 차가 랩 끝 ~0.5초 이내면 tail slice가 `horizon × 1.5`보다 짧음 → `np.interp`가 마지막 s에 clamp → sample 꼬리가 s=L에 정체.
+
+**해결:** `src/sampling_based_planner.py::postprocess_raceline` 내부에서 time shift 직후, tail이 짧으면 raceline HEAD를 `s+L`, `t+tail_end+dt_first`로 concat. 바로 뒤의 `horizon × 1.5` clip이 잉여 제거 → 과잉 attach 무해.
+
+### 11.6 시각화 파이프라인 (최종 형태)
+
+```
+traj['s'] (upstream, line 582에서 mod L 적용)
+    │
+    ├─ ds < -L/2 감지  → 이후 sample에 +L 누적 (unwrap)
+    │
+    ├─ ds < -0.20 m 감지 → 해당 인덱스에서 truncate
+    │
+    ├─ sn2cartesian(s_unwr % L, n) → wrap 일관적 cartesian 재계산
+    │
+    └─ 발행:
+       ├─ ~best_trajectory : WpntArray (s_m 단조 증가)
+       ├─ ~best_sample     : nav_msgs/Path (3D z 포함)
+       ├─ ~best_sample/markers     : SPHERE per point (속도별 색)
+       ├─ ~best_sample/vel_markers : CYLINDER (높이 = V × 0.1317)
+       └─ ~candidates      : MarkerArray LINE_STRIP
+            ├─ valid non-best : 회색, 얇게, 반투명
+            ├─ invalid        : 짙은 회색, 매우 얇게, 거의 투명
+            └─ best           : 빨강, 굵게, 불투명 (맨 마지막에 그려서 위에)
+```
+
+### 11.7 후보 시각화 이슈 (#10)
+
+**현상.** `~candidates` 토픽에서 best만 보이고 나머지 후보가 안 나올 때가 있음.
+
+**원인.** 초기 코드가 `if not valid: skip` + `if i == optimal_idx: skip` 처리 — 마찰원/경계 검증에서 대부분 탈락하고 valid가 best 하나뿐이면 그려지는 후보가 0개.
+
+**해결.** 모든 55개(= v_samples × n_samples) 후보를 예외 없이 그림:
+- best: 빨강 (1.0, 0.1, 0.1), 두께 0.07m, alpha 1.0
+- valid non-best: 회색, 두께 0.03m, alpha 0.35
+- invalid: 짙은 회색, 두께 0.015m, alpha 0.15
+
+upstream에 `self.candidates` dict 노출 추가 (`s_array`, `n_array`, `valid_array`, `optimal_idx`).
+
+### 11.8 현재 상태
+
+- 랩 경계 시각적으로 매끄러움; 점프·몰림 없음
+- 풀 horizon (npts=30) 유지
+- `[wrap]` 로그가 랩 통과 시 정확히 1회 발생, unwrap 범위 정상
+- `[trunc]`는 드물게 발생 (다항식이 실제로 > 20cm overshoot 시에만)
+- 솔브 시간: 10Hz에서 8~22ms per tick
+- 55개 후보 LINE_STRIP 중 valid 몇 개 + best 빨강 1개 항상 표시
+
+잔여 외부 이슈:
+- `/car_state/odom`이 가끔 순간이동 (GLIM 재초기화) — planner 영역 밖
+
+---
+
+## 12. 주요 설계 판단 근거 요약
+
+| 판단 | 고려한 대안 | 선택 이유 |
+|---|---|---|
+| TUM upstream 통째로 wrapping | 자체 sampler 재구현 | upstream이 검증됨; 포팅 비용이 thin ROS wrapper보다 훨씬 큼 |
+| 패키지명 `sampling_based_planner_3d`, 폴더명 `3d_sampling_based_planner` | 통일 (폴더 rename) | ROS 1이 숫자 시작 이름 금지; rename하면 기존 로그/IDE 참조 깨짐 |
+| Track3D centerline에 직접 투영 (FrenetConverter 미사용) | 스택 frenet 서버 공유 | Track3D 자체 폴리라인이 solver 내부에서 사용됨; FrenetConverter는 다른 spline → cm급 drift → chi/bounds 불일치 |
+| `raceline['s'][-1] = L - 1e-6` pin (trim 대신) | 마지막 점 삭제 | 삭제하면 `[s[-1], L)` 구간 gap이 mirror 실패 모드 유발; pin은 period를 정확히 채움 |
+| `postprocess_raceline` 내부에 wrap-attach | node에서 감싸기 | attach는 slice와 clip *사이*에 일어나야 함 — node에서 하면 postprocess 전체 재구현 필요 |
+| backward > 20cm에서만 truncate | cummax / stack-snap | cummax = 점 stacking; stack-snap = cartesian 몰림. truncate만 sample 유일성 보존 |
+| 단일 lap raceline (2-lap 아님) | 2-lap concat | 2-lap은 `np.interp(period=L)` 깨뜨림 (xp 중복); periodic-interp + attach 조합이 안전 |
+| `HJ_DEBUG` 로그 코드 유지 (env 제어) | 수정 후 삭제 | 이 영역이 깨지기 쉬움; 계측 남겨두면 향후 버그 빠르게 발견 가능 |
+| 후보 전체 시각화 (invalid 포함) | valid non-best만 표시 | valid가 best 하나뿐이면 화면에 0개 → 디버깅 불가; 전부 그려야 "어디까지 시도했나" 파악 가능 |
+
+---
+
+## 13. TODO
+
+### 13.1 Cost function 설계 + State Machine 연동
+
+**목표.** Sampling planner의 cost function을 state-aware로 만들어 `state_machine`의
+각 discrete state가 상황에 맞는 cost 프로파일을 선택하게 함. Sampling은 이 구조에
+이상적 (cost가 순수 scoring 함수 — 미분 필요 없음, MPC와 달리).
+
+**설계 개요:**
+- cost term을 weight로 노출: `w_time`, `w_track`, `w_lat`, `w_vel`, `w_obs`, `w_smooth`
+- state별 target 곡선: `n_target(s)`, `V_target(s)`
+- state별 sample 분포 가변: `n_range`, `K` (추월 시 넓게, raceline tracking 시 좁게)
+
+**State × Weight 테이블 (초안):**
+
+| State | w_time | w_track | w_lat | w_vel | w_obs | w_smooth | n_target | V_target |
+|---|---|---|---|---|---|---|---|---|
+| `GB_TRACK` | 0 | 10 | 0 | 5 | 0 | 1 | 0 (raceline) | v_ref(s) |
+| `GB_OPTIMIZER` | 1.0 | 0.1 | 0 | 0 | 0 | 1 | — | — |
+| `OVERTAKE` | 0.5 | 0 | 5 | 1 | 50 | 2 | n_avoid(s) | v_ref·0.9 |
+| `SMART_STATIC` | 0 | 0 | 10 | 5 | 100 | 1 | n_avoid_static | v_ref(s) |
+| `TRAILING` | 0 | 5 | 0 | 20 | 30 | 3 | 0 | v_lead − Δ |
+| `RECOVERY` | 0 | 0 | 0 | 10 | 0 | 5 | 0 | V_safe (~2) |
+| `START` | 0.2 | 0 | 0 | 5 | 0 | 1 | 0 | ramp(t) |
+
+**작업 목록:**
+- [ ] `config/default.yaml`에 weight/target을 ROS param으로 노출 (`GB_TRACK` 행부터)
+- [ ] 노드에서 `calc_trajectory(...)`를 state별 cost 번들로 호출하도록 리팩터
+- [ ] `/state_machine/state` 구독 (없으면 `GB_TRACK` fallback)
+- [ ] 상태별 `n_target(s)` / `V_target(s)` 주입 설계 (OVERTAKE, SMART_STATIC, TRAILING, RECOVERY, START)
+- [ ] State별 sample 분포 (`n_range`, `K`) — 2~3가지 분포로 시작
+- [ ] 검증: sim에서 각 state 통과하며 선택된 궤적이 의도에 맞는지 확인 (시각 + 로그)
+- [ ] 파이프라인 주입을 `use_sampling_as_planner:=true` 하나로 gate; 기본값은 observation-only
+
+**합리성 점검.** Sampling-based cost 교체는 가장 가벼운 통합 경로:
+노드가 이미 state를 구독하고 자체 토픽에 발행 중이며 cost function은 순수 Python 점수 함수.
+IPOPT/acados 재컴파일 불필요. State 전환 시 lateral 점프 없음 (sample 분포가 연속 변경).
+채팅에서 도달한 설계 의도 ("planner 여러 개" 대신 "cost function을 state화") 그대로 구현.
+
+### 13.2 기타 계획 항목
+
+- [ ] MPCC planner 패키지 (`mpcc_planner/`) — Phase 0 골격
+- [ ] Dynamic bicycle MPC + 3D `g_tilde` + slope-aware 마찰원 (Phase 2b) — 2.5D 근사가 명확히 부족할 때만 승격
+- [ ] 공유 `track3d_utils` 라이브러리 (`f110_utils/libs/`) — `track3D.py` / `point_mass_model.py` API drift 해소 후
+- [ ] Dynamic obstacle 처리 (`prediction` dict-of-dicts를 `/dynamic_obstacles`에서 채우기)
+- [ ] 3~4cm 다항식 꼬리 떨림 재검토 — `generate_longitudinal_curves`에 끝 위치 soft BC 추가로 해결 가능 (현재는 truncation으로 마스킹)
+- [ ] State별 `horizon` / `num_samples` 튜닝 (저속 짧게, 고속 길게) — cost-state 통합 후
+
+---
+
+**담당**: HJ
+**생성**: 2026-04-16
+**갱신**: 2026-04-17 — Phase 0/1 랩 경계 버그 해결 + 후보 시각화 완료 후 §11~13 추가.
+**상태**: sampling_based_planner_3d Phase 0/1 안정 (observation mode, 랩 경계 wrapping 해결, 멀티 샘플 시각화 완료). 다음 주요 작업 = §13.1 (cost function state화 + state machine 연동).
