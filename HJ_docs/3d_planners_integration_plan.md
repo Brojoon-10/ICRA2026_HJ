@@ -766,7 +766,84 @@ horizon: 1.5
 - Adaptive rate: 장애물 감지 시 rate_hz 자동 상승 (20→30 Hz)
 - Multi-horizon: 가까운 건 짧은 horizon (반응성), 먼 건 긴 horizon (예측성)
 
-### 13.5 기타 계획 항목
+### 13.5 파라미터 튜닝 실전 가이드
+
+목적별로 어디를 건드려야 하는지 요약.
+
+#### 후보 생성 (탐색 범위·해상도)
+
+| 목적 | 변경 | 기대 효과 | CPU 비용 |
+|---|---|---|---|
+| lateral 해상도 ↑ (좁은 갭 통과) | `n_samples` 11→21 | 후보 간 횡간격 절반 | ~2× |
+| 속도 프로파일 정밀화 | `v_samples` 5→10 | 미세 속도 차이 반영 | ~2× |
+| 먼 미래 예측 | `horizon` 1.0→1.5 + `num_samples` 30→45 | 15 m/s 기준 22m 앞까지 | 동일 |
+| 초고속 반응 (해상도 희생) | `v_samples` 3, `n_samples` 7, `rate_hz` 50 | 21개 후보, 3~8ms | ÷3 |
+
+#### 물리 검증 (통과율 조절)
+
+| 목적 | 변경 | 효과 |
+|---|---|---|
+| valid 후보 수 ↑ (탈락 줄이기) | `safety_distance` ↓, `gg_abs_margin` ↑, `kappa_thr` ↑ | 경계·마찰·곡률 제약 완화 |
+| 안전 우선 (보수적 주행) | `safety_distance` ↑, `gg_abs_margin` ↓ (음수 가능) | 제약 강화 |
+| 3D slope 효과 무시 (디버깅) | `friction_check_2d: true` | 평면 가정, g=9.81 일정 |
+
+**soft_check 메커니즘:** upstream의 `check_friction_limits`, `check_curvature`,
+`check_path_collision`은 모두 `soft_check=True`. 모든 후보가 탈락하면 **가장 덜 위반한
+1개를 살림** → 완전 NO_FEASIBLE은 극히 드뭄.
+
+#### Cost 평가 (어떤 후보를 "좋다"고 판단할지)
+
+| 목적 | 변경 | 효과 |
+|---|---|---|
+| raceline 추종 강화 | `raceline_weight` ↑ (0.1→1.0) | 횡 편차에 민감 |
+| 속도보다 경로 우선 | `velocity_weight` ↓ (100→10) | 속도 편차 관용 |
+| 장애물 회피 강화 | `prediction_weight` ↑ | prediction 연동 필수 |
+
+**현재 cost 수식:**
+```
+cost = velocity_weight × ∫((V - V_rl) / V_rl)² dt     ← 상대 속도 오차
+     + raceline_weight × ∫(n - n_rl)² dt               ← 횡방향 편차
+     + prediction_weight × ∫exp(-s_f·Δs² - n_f·Δn²) dt ← 장애물 가우시안 커널
+```
+
+**숨은 파라미터 (config 미노출, 코드 내부):**
+- `prediction_s_factor` (0.015) — 장애물 종방향 회피 커널 폭
+- `prediction_n_factor` (0.5) — 장애물 횡방향 회피 커널 폭
+- `s_dot_max` 배수 (1.2) — 종방향 최대 속도 후보 = max(v_start, v_rl) × 1.2
+- `relative_generation` 분기 조건 (±30%) — raceline 속도 대비 현재 속도 차이 기준
+
+#### 실행 성능 (Hz·CPU)
+
+| 설정 | 후보 수 | 예상 솔브 | rate_hz 가능 |
+|---|---|---|---|
+| v5×n11 (현재) | 55 | 8~22ms | 30Hz |
+| v8×n15 | 120 | 20~40ms | 20Hz |
+| v10×n21 | 210 | 40~70ms | 10Hz |
+| v3×n7 + rate 50Hz | 21 | 3~8ms | 50Hz |
+
+**권장 시작점:** `v8×n15 + rate_hz=20` — 해상도와 반응성 균형.
+
+### 13.6 시각화 규칙
+
+`~candidates` 토픽 (MarkerArray, LINE_STRIP)에 55개 전체 후보가 그려짐.
+어떤 후보가 검증을 통과하고 어떤 후보가 탈락했는지 색으로 즉시 구분 가능.
+
+| 종류 | 색 | 굵기 | alpha | 의미 |
+|---|---|---|---|---|
+| **Best (선택됨)** | 빨강 (1.0, 0.1, 0.1) | 0.07m | 1.0 | cost 최소, 이 궤적이 publish됨 |
+| **Valid (통과, 비선택)** | 검은색 (0.1, 0.1, 0.1) | 0.04m | 0.7 | 물리 검증 통과했지만 cost에서 밀림 |
+| **Invalid (탈락)** | 옅은 회색 (0.6, 0.6, 0.6) | 0.015m | 0.25 | 트랙 경계·마찰원·곡률 위반으로 탈락 |
+
+- **벽 넘어가는 라인 = invalid**: 트랙 경계 검증(`check_path_collision`)에서 탈락한 후보.
+  안전하게 갈 수 없는 경로임을 시각적으로 보여주기 위해 의도적으로 표시.
+- **Best는 맨 마지막에 그려짐**: RViz 렌더 순서상 항상 다른 후보 위에 표시.
+- **Valid가 0개인 경우**: soft_check으로 최소 1개가 살아남기 때문에 best(빨강)는 항상 있음.
+  나머지 54개가 전부 invalid(옅은 회색)일 수 있음 — 마찰원/경계가 매우 보수적일 때 발생.
+
+RViz 설정: Add → MarkerArray → Topic `/sampling_planner_node/candidates`.
+이 하나만 추가하면 **전체 샘플 팬 + best 하이라이트** 한 번에 보임.
+
+### 13.7 기타 계획 항목
 
 - [ ] MPCC planner 패키지 (`mpcc_planner/`) — Phase 0 골격
 - [ ] Dynamic bicycle MPC + 3D `g_tilde` + slope-aware 마찰원 (Phase 2b)
