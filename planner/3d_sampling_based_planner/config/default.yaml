@@ -16,7 +16,7 @@ gg_abs_margin:   0.0
 gg_margin_rel:   0.0
 friction_check_2d: false
 s_dot_min:       1.0
-kappa_thr:       0.1
+kappa_thr:       1.5    # track max curvature = 0.9 rad/m; 1.5 gives margin for lateral offset curvature
 
 relative_generation: true
 
