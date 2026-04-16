@@ -650,18 +650,136 @@ upstream에 `self.candidates` dict 노출 추가 (`s_array`, `n_array`, `valid_a
 IPOPT/acados 재컴파일 불필요. State 전환 시 lateral 점프 없음 (sample 분포가 연속 변경).
 채팅에서 도달한 설계 의도 ("planner 여러 개" 대신 "cost function을 state화") 그대로 구현.
 
-### 13.2 기타 계획 항목
+### 13.2 Sampling planner 내부 구조 및 파라미터 가이드
+
+#### 13.2.1 알고리즘 요약 — Solver 아님, 후보 선택 방식
+
+이 planner는 **MPC/NLP solver를 사용하지 않는다.** 후보 궤적의 다항식 계수는
+5×5 / 6×6 선형 연립방정식의 **직접 풀이** (`np.linalg.solve`). 반복 최적화가 아니라서
+수렴 실패, warm-start 깨짐, NaN 발산 같은 solver 고유 위험이 없음.
+
+```
+[Step 1] 종방향 후보 v_samples개 생성 (4차 다항식, 끝 속도 목표별)
+[Step 2] 횡방향 후보 n_samples개 × 종방향 v_samples개 = 총 후보 수
+[Step 3] 물리 검증: 트랙 경계, 곡률, 마찰원(gg-diagram) → valid/invalid 분류
+[Step 4] valid 후보에 cost 평가 → argmin = best sample
+```
+
+**"Infeasible"의 의미가 다름:**
+- MPC: solver가 수학적 해를 못 찾음 (위험: 제어 입력 NaN 가능)
+- Sampling: **55개 후보 전부 검증 탈락** → 고를 게 없음 (안전: 그냥 이번 tick skip)
+
+최악 케이스가 "궤적 없음" → 기존 raceline으로 fallback 가능. 이 특성은 경쟁 주행에서
+MPC 대비 안전성 이점.
+
+**Spatial MPC 대비 저속 안정성 이점:**
+Spatial MPC는 독립 변수가 arc-length(s)이므로 ds/dt → 0 (정지/저속)에서 수학적 특이점
+발생 — 분모가 0으로 수렴하며 수치 발산 위험. 별도의 최소 속도 가드(`v ≥ ε`)나
+temporal MPC 전환이 필요. 반면 sampling planner는 시간(t) 기반 다항식이라 **V=0에서도
+정상 동작** — 정지 출발, 급감속, 스핀 후 저속 복귀 같은 상황에서 별도 처리 없이 안정적.
+RC카 스케일에서 출발/정지/코너 저속 구간이 빈번하므로 이 장점이 실용적으로 큼.
+
+#### 13.2.2 핵심 파라미터 (config/default.yaml)
+
+| 파라미터 | 현재값 | 의미 | 영향 |
+|---|---|---|---|
+| `rate_hz` | 10 | 계획 주기 (Hz) | ↑ 올리면 반응 빨라짐. CPU 허용 시 20~30 가능 |
+| `horizon` | 1.0 | 예측 시간 (초) | ↑ 멀리 보지만 다항식 overshoot 위험 ↑. RC카 1~2초 적정 |
+| `num_samples` | 30 | 시간 discretization (궤적 당 점 수) | ↑ 궤적 해상도 ↑. 30~50이면 충분 |
+| `v_samples` | 5 | 종방향 속도 목표 수 | ↑ 다양한 속도 프로파일 탐색. 10이면 더 정밀 |
+| `n_samples` | 11 | 횡방향 위치 목표 수 | ↑ lateral 해상도 ↑. 15~21로 올리면 좁은 갭 통과 가능 |
+| `safety_distance` | 0.20 | 트랙 경계 여유 (m) | ↓ 공격적, ↑ 보수적 |
+| `gg_abs_margin` | 0.0 | 마찰원 절대 마진 (m/s²) | ↑ 보수적 (마찰원을 줄임) |
+| `s_dot_min` | 1.0 | 최소 종방향 속도 (m/s) | 정지 상태 방지용 |
+
+**총 후보 수 = v_samples × n_samples = 현재 55개.** 주요 튜닝 포인트:
+
+| 목표 | 변경 | 효과 | CPU 비용 |
+|---|---|---|---|
+| 더 빠른 반응 | `rate_hz` 20~30 | 0.05~0.03초 간격 재계획 | ~2×~3× |
+| 더 정밀한 경로 선택 | `v_samples=10, n_samples=21` → 210개 | 좁은 갭 통과, 미세한 speed 차이 반영 | ~4× |
+| 더 먼 예측 | `horizon=2.0` | 15 m/s에서 30m 앞까지 | 동일 (후보 수 불변) |
+| 후보 해상도만 올리기 | `num_samples=50` | 궤적 내 점 밀도 ↑ (시각화/보간 정밀도) | ~1.7× |
+
+**실측 솔브 시간 (현재 설정, NUC):** 8~22ms per tick.
+v_samples=10 + n_samples=21이면 ~50~80ms 예상. 10Hz 유지 가능. 30Hz는 버거울 수 있음.
+
+#### 13.2.3 CPU 허용 시 올릴 수 있는 것
+
+```yaml
+# 공격적 설정 예시 (검증 필요)
+rate_hz: 20
+v_samples: 8
+n_samples: 15      # 120개 후보
+num_samples: 40
+horizon: 1.5
+```
+
+120개 × 40점 = 4800 평가점. 현재 55×30=1650 대비 ~3배. NUC에서 30~60ms 예상.
+20Hz (50ms budget) 내에 들어갈 가능성 있음. **실측 후 판단.**
+
+### 13.3 Raceline 기반 Frenet 전환 가능성
+
+현재 planner는 **centerline 기반 Track3D** 위에서 동작. 스택 나머지는 raceline
+기반 frenet. 인터페이스에서 cartesian 변환으로 연결 중 (§11.2 #6).
+
+**Raceline 기반 전환 시 이점:**
+- 장애물 데이터가 raceline frenet으로 오면 변환 불필요
+- `n=0 = raceline` 이라 tracking cost가 단순히 `n²`
+- 스택 전체 frenet 통일 → 모듈 간 데이터 직접 교환 가능
+
+**Raceline 기반 전환 시 필요 작업:**
+- Raceline 곡선으로 Track3D 재빌드 (centerline CSV 대신 raceline CSV 입력)
+  - 이건 Track3D 생성자에 다른 CSV 넣으면 되는 수준
+- gg-diagram 재생성 (raceline 위의 slope/banking 기준)
+  - `fast_ggv_gen/run.sh` 한 번 실행
+- 트랙 경계 재계산: centerline 기준 `w_left/w_right` → raceline 기준으로 shift
+  - `w_left_rl(s) = w_left_cl(s_cl) - n_rl(s_cl)` 같은 변환
+- `sampling_based_planner.py` 내부의 `period=L` 호출을 raceline 호길이로 교체
+- Wrap 버그 재검증 (raceline 호길이 ≠ centerline 호길이)
+- **raceline이 바뀔 때마다 이 전체를 다시 돌려야 함** (offline 파이프라인 추가)
+
+**현재 판단:** centerline 유지가 안전하고 실용적. 단, raceline 전환을 배제하지 않음.
+장애물 통합이 본격화되면 frenet 통일의 이점이 커질 수 있으므로, 그 시점에 재평가.
+핵심 판단 기준 = **장애물 데이터가 어떤 좌표계로 들어오는가** (cartesian이면 centerline
+유지, raceline-frenet이면 전환 고려).
+
+### 13.4 State Machine 연동 발전 방향
+
+**Phase 3 (cost function state화):**
+1. `config/default.yaml`에 state별 weight 테이블 노출
+2. `/state_machine/state` 구독, 상태 변경 시 weight swap
+3. 같은 55개 후보 중 **다른 기준으로 "best"를 고름** → state 전환 시 궤적 점프 없음
+
+**Phase 4 (prediction 연동):**
+1. `gp_traj_predictor` 출력 → `prediction` dict-of-dicts으로 변환
+2. 장애물 위치가 cartesian이면 centerline 투영, raceline-frenet이면 변환
+3. `prediction_cost_weight` 활성화 → OVERTAKE/TRAILING state에서 진짜 상대차 회피
+
+**Phase 5 (pipeline 주입):**
+1. observation → `use_sampling_as_planner:=true`로 `/global_waypoints_scaled`에 주입
+2. State machine이 기존 spline planner 대신 sampling 출력 소비
+3. 기존 planner와 A/B 비교 (같은 주행에서 둘 다 publish, 하나만 controller에 연결)
+
+**Phase 6 (고급 튜닝):**
+- State별 `horizon` / `n_range` / `v_samples` 동적 조정
+- Adaptive rate: 장애물 감지 시 rate_hz 자동 상승 (20→30 Hz)
+- Multi-horizon: 가까운 건 짧은 horizon (반응성), 먼 건 긴 horizon (예측성)
+
+### 13.5 기타 계획 항목
 
 - [ ] MPCC planner 패키지 (`mpcc_planner/`) — Phase 0 골격
-- [ ] Dynamic bicycle MPC + 3D `g_tilde` + slope-aware 마찰원 (Phase 2b) — 2.5D 근사가 명확히 부족할 때만 승격
-- [ ] 공유 `track3d_utils` 라이브러리 (`f110_utils/libs/`) — `track3D.py` / `point_mass_model.py` API drift 해소 후
-- [ ] Dynamic obstacle 처리 (`prediction` dict-of-dicts를 `/dynamic_obstacles`에서 채우기)
-- [ ] 3~4cm 다항식 꼬리 떨림 재검토 — `generate_longitudinal_curves`에 끝 위치 soft BC 추가로 해결 가능 (현재는 truncation으로 마스킹)
-- [ ] State별 `horizon` / `num_samples` 튜닝 (저속 짧게, 고속 길게) — cost-state 통합 후
+- [ ] Dynamic bicycle MPC + 3D `g_tilde` + slope-aware 마찰원 (Phase 2b)
+- [ ] 공유 `track3d_utils` 라이브러리 (`f110_utils/libs/`)
+- [ ] Dynamic obstacle 처리 (`prediction` dict-of-dicts 연동)
+- [ ] 3~4cm 다항식 꼬리 떨림 재검토 (끝 위치 soft BC 추가 가능)
+- [ ] Raceline 기반 Track3D 전환 PoC — 장애물 통합 본격화 시점에 실행 여부 결정
 
 ---
 
 **담당**: HJ
 **생성**: 2026-04-16
-**갱신**: 2026-04-17 — Phase 0/1 랩 경계 버그 해결 + 후보 시각화 완료 후 §11~13 추가.
-**상태**: sampling_based_planner_3d Phase 0/1 안정 (observation mode, 랩 경계 wrapping 해결, 멀티 샘플 시각화 완료). 다음 주요 작업 = §13.1 (cost function state화 + state machine 연동).
+**갱신**: 2026-04-17 — §11~13 추가 (구현 일지, 시각화, 파라미터 가이드, 발전 방향).
+**상태**: sampling_based_planner_3d Phase 0/1 안정 (observation mode, 랩 경계 해결,
+멀티 샘플 시각화 완료). 다음 = §13.1 (cost function state화 + state machine 연동),
+§13.4 (prediction 연동).
