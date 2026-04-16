@@ -782,9 +782,9 @@ class SamplingPlannerNode:
                 mk.color.r = 1.0; mk.color.g = 0.1; mk.color.b = 0.1
                 mk.color.a = 1.0
             elif is_valid:
-                mk.scale.x = 0.04          # medium — clearly distinct from invalid
+                mk.scale.x = 0.03          # thin but visible
                 mk.color.r = 0.1; mk.color.g = 0.1; mk.color.b = 0.1   # near-black
-                mk.color.a = 0.7
+                mk.color.a = 0.45
             else:
                 mk.scale.x = 0.015         # thin
                 mk.color.r = 0.6; mk.color.g = 0.6; mk.color.b = 0.6   # light gray
