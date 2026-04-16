@@ -778,17 +778,17 @@ class SamplingPlannerNode:
             mk.pose.orientation.w = 1.0
 
             if is_best:
-                mk.scale.x = 0.07   # thick
+                mk.scale.x = 0.07          # thick
                 mk.color.r = 1.0; mk.color.g = 0.1; mk.color.b = 0.1
                 mk.color.a = 1.0
             elif is_valid:
-                mk.scale.x = 0.03   # thin
-                mk.color.r = 0.55; mk.color.g = 0.55; mk.color.b = 0.55
-                mk.color.a = 0.35
+                mk.scale.x = 0.04          # medium — clearly distinct from invalid
+                mk.color.r = 0.1; mk.color.g = 0.1; mk.color.b = 0.1   # near-black
+                mk.color.a = 0.7
             else:
-                mk.scale.x = 0.015  # very thin
-                mk.color.r = 0.3; mk.color.g = 0.3; mk.color.b = 0.3
-                mk.color.a = 0.15
+                mk.scale.x = 0.015         # thin
+                mk.color.r = 0.6; mk.color.g = 0.6; mk.color.b = 0.6   # light gray
+                mk.color.a = 0.25
 
             for k in range(len(xs_)):
                 p = Point()
