@@ -173,7 +173,8 @@ def _fit_poly(deltas_actual, servos_target, degree):
     return coeffs_lo, rms, deltas_actual, servos_target
 
 
-def _save_mapping_plot(coeffs, d_measured, s_measured, offset, gain, png_path):
+def _save_mapping_plot(coeffs, d_measured, s_measured, offset, gain, png_path,
+                       servo_clip_min=0.0, servo_clip_max=1.0):
     """Plot nonlinear poly vs linear map vs measured data points and save as PNG."""
     try:
         import matplotlib
@@ -185,10 +186,10 @@ def _save_mapping_plot(coeffs, d_measured, s_measured, offset, gain, png_path):
 
     d_dense = np.linspace(-0.7, 0.7, 300)
 
-    # poly curve
+    # poly curve (before and after clip for visual comparison)
     coeffs_hi = np.array(coeffs[::-1])  # highest-degree first for np.polyval
-    s_poly = np.polyval(coeffs_hi, d_dense)
-    s_poly = np.clip(s_poly, 0, 1)
+    s_poly_raw = np.polyval(coeffs_hi, d_dense)
+    s_poly = np.clip(s_poly_raw, servo_clip_min, servo_clip_max)
 
     # linear map
     s_linear = gain * d_dense + offset
@@ -197,13 +198,23 @@ def _save_mapping_plot(coeffs, d_measured, s_measured, offset, gain, png_path):
 
     # --- left: servo = f(delta) ---
     ax = axes[0]
+    # servo clip region (shaded)
+    ax.axhspan(servo_clip_max, 1.1, color="tab:red", alpha=0.08, label="Servo clip region")
+    ax.axhspan(-0.1, servo_clip_min, color="tab:red", alpha=0.08)
+    ax.axhline(servo_clip_max, color="tab:red", linestyle=":", linewidth=1, alpha=0.6)
+    ax.axhline(servo_clip_min, color="tab:red", linestyle=":", linewidth=1, alpha=0.6)
+
     ax.plot(np.rad2deg(d_dense), s_linear, "--", color="gray", linewidth=1.5, label="Linear (gain=%.3f, off=%.3f)" % (gain, offset))
     ax.plot(np.rad2deg(d_dense), s_poly, "-", color="tab:blue", linewidth=2, label="Poly fit (a0..a%d)" % (len(coeffs) - 1))
+    # show the unclipped poly as faint dashed where it exceeds clip
+    clip_mask = (s_poly_raw < servo_clip_min) | (s_poly_raw > servo_clip_max)
+    if np.any(clip_mask):
+        ax.plot(np.rad2deg(d_dense[clip_mask]), s_poly_raw[clip_mask], ":", color="tab:blue", linewidth=1, alpha=0.4)
     ax.scatter(np.rad2deg(np.array(d_measured)), np.array(s_measured), c="tab:red", s=40, zorder=5, label="Measured (%d pts)" % len(d_measured))
     ax.set_xlabel("Steering angle [deg]")
     ax.set_ylabel("Servo command [0-1]")
     ax.set_title("Steering angle -> Servo mapping")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=8, loc="upper left")
     ax.grid(True, alpha=0.3)
     ax.set_xlim([-40, 40])
     ax.set_ylim([-0.05, 1.05])
@@ -376,8 +387,11 @@ def fit_from_bags(bag_dir, vesc_yaml, wheelbase, poly_degree):
           "  enable_nonlinear_servo_gain: true\nin the same file when ready." % vesc_yaml)
 
     # ### HJ : save visualization of the nonlinear mapping
+    servo_min = float(vdata.get("vesc_driver", {}).get("servo_min", 0.0))
+    servo_max = float(vdata.get("vesc_driver", {}).get("servo_max", 1.0))
     png_path = os.path.join(os.path.dirname(vesc_yaml), "nonlinear_servo_mapping.png")
-    _save_mapping_plot(coeffs, d_sorted, s_sorted, offset, gain, png_path)
+    _save_mapping_plot(coeffs, d_sorted, s_sorted, offset, gain, png_path,
+                       servo_clip_min=servo_min, servo_clip_max=servo_max)
 
     return 0
 
