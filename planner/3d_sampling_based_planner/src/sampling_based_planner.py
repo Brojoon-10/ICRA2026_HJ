@@ -227,6 +227,18 @@ class LocalSamplingPlanner():
             gg_abs_margin=gg_abs_margin
         )
 
+        # ### HJ : expose all candidate arrays (and the valid mask) so the ROS node
+        # can visualise every sample — upstream only kept the chosen best internally.
+        # Shapes: s_array / n_array / V_array = (v_samples*n_samples, num_samples)
+        #         valid_array = (v_samples*n_samples,) bool
+        self.candidates = {
+            's':        s_array,
+            'n':        n_array,
+            'V':        V_array,
+            'valid':    valid_array,
+            't':        t_array,
+        }
+
         # choose best trajectory
         optimal_idx = self.get_optimal_trajectory_idx(
             valid_array=valid_array,
@@ -247,6 +259,7 @@ class LocalSamplingPlanner():
         # set planned trajectory
         self.trajectory.clear()
         self.trajectory['traj_cnt'] = self.traj_cnt
+        self.trajectory['optimal_idx'] = int(optimal_idx)   # ### HJ : expose for viz
         self.trajectory["t"] = t_array[optimal_idx]
         self.trajectory["s"] = s_array[optimal_idx]
         self.trajectory["s_dot"] = s_dot_array[optimal_idx]
