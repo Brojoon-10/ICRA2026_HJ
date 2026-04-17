@@ -21,6 +21,7 @@ BIN_SIZE="0.05"
 SMOOTH_STEP="0.05"
 OPT_STEP="0.2"
 OUTPUT="global_waypoints"
+START_FROM="1"
 RAW_CSV="auto"
 GEN3D_CSV="auto"
 SMOOTHED_CSV="auto"
@@ -37,6 +38,7 @@ while [[ $# -gt 0 ]]; do
         --smooth-step)     SMOOTH_STEP="$2"; shift 2 ;;
         --opt-step)        OPT_STEP="$2"; shift 2 ;;
         --output)          OUTPUT="$2"; shift 2 ;;
+        --start-from)      START_FROM="$2"; shift 2 ;;
         --raw-csv)         RAW_CSV="$2"; shift 2 ;;
         --gen3d-csv)       GEN3D_CSV="$2"; shift 2 ;;
         --smoothed-csv)    SMOOTHED_CSV="$2"; shift 2 ;;
@@ -95,6 +97,8 @@ echo "  raceline: ${RACELINE_CSV}"
 echo "======================================================"
 
 # ─── Step 1: Bag + wall.pcd → boundary CSV ─────────────────────────────────────
+### HJ : start_from 인자로 특정 단계부터 시작 가능
+if (( START_FROM <= 1 )); then
 echo ""
 echo "[1/7] Generating boundary CSV from bag + wall.pcd ..."
 $PYTHON track_processing/csv_generators/gen_track_boundary_csv.py \
@@ -106,8 +110,12 @@ $PYTHON track_processing/csv_generators/gen_track_boundary_csv.py \
     --smooth-window 1 \
     --output "$RAW_CSV" \
     --no-plot
+else
+    echo "[1/7] Skipped (start_from=${START_FROM})"
+fi
 
 # ─── Step 2: Close loop (set last row = first row) ─────────────────────────────
+if (( START_FROM <= 2 )); then
 echo ""
 echo "[2/7] Closing loop ..."
 $PYTHON - <<PYEOF
@@ -124,8 +132,12 @@ with open(path, 'w', newline='') as f:
     writer.writerows(rows)
 print(f'  Loop closed: {path}  ({len(rows)} points)')
 PYEOF
+else
+    echo "[2/7] Skipped (start_from=${START_FROM})"
+fi
 
 # ─── Step 3: Generate 3D track data (v2: boundary-perpendicular tangent) ───────
+if (( START_FROM <= 3 )); then
 echo ""
 echo "[3/7] Generating 3D track data (v2) ..."
 $PYTHON - <<PYEOF
@@ -140,8 +152,12 @@ generate_3d_from_3d_track_bounds_v2(
     visualize=False,
 )
 PYEOF
+else
+    echo "[3/7] Skipped (start_from=${START_FROM})"
+fi
 
 # ─── Step 4: Track smoothing ────────────────────────────────────────────────────
+if (( START_FROM <= 4 )); then
 echo ""
 echo "[4/7] Smoothing track ..."
 $PYTHON - <<PYEOF
@@ -167,8 +183,12 @@ track_handler.smooth_track(
     visualize=False,
 )
 PYEOF
+else
+    echo "[4/7] Skipped (start_from=${START_FROM})"
+fi
 
 # ─── Step 5: Global racing line optimization ────────────────────────────────────
+if (( START_FROM <= 5 )); then
 echo ""
 echo "[5/7] Optimizing global racing line ..."
 $PYTHON - <<PYEOF
@@ -201,6 +221,9 @@ if map_dir:
 
 exec(compile(src, 'gen_global_racing_line.py', 'exec'), {'__name__': '__main__', '__file__': 'global_racing_line/gen_global_racing_line.py'})
 PYEOF
+else
+    echo "[5/7] Skipped (start_from=${START_FROM})"
+fi
 
 # ─── Step 6: Export global waypoints JSON ─────────────────────────────────────
 if [[ -n "$MAP_DIR" ]]; then
@@ -209,6 +232,7 @@ else
     WAYPOINTS_JSON="data/global_racing_lines/${OUTPUT}.json"
 fi
 
+if (( START_FROM <= 6 )); then
 echo ""
 echo "[6/7] Exporting global waypoints ..."
 $PYTHON - <<PYEOF
@@ -241,6 +265,9 @@ if map_dir:
 
 exec(compile(src, 'export_global_waypoints.py', 'exec'), {'__name__': '__main__', '__file__': 'global_racing_line/export_global_waypoints.py'})
 PYEOF
+else
+    echo "[6/7] Skipped (start_from=${START_FROM})"
+fi
 
 echo ""
 echo "======================================================"
@@ -253,6 +280,7 @@ echo "  Waypoints  : ${WAYPOINTS_JSON}"
 echo "======================================================"
 
 # ─── Step 7: Visualize ──────────────────────────────────────────────────────────
+if (( START_FROM <= 7 )); then
 echo ""
 echo "[7/7] Visualizing ..."
 $PYTHON visualization/plot_raceline.py \
@@ -260,3 +288,6 @@ $PYTHON visualization/plot_raceline.py \
     --raceline "$RACELINE_CSV" \
     --raw      "$RAW_CSV" \
     --gen      "$GEN3D_CSV"
+else
+    echo "[7/7] Skipped (start_from=${START_FROM})"
+fi

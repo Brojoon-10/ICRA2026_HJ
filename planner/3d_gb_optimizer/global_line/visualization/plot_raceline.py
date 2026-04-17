@@ -13,6 +13,15 @@ Usage:
         --raw data/raw_track_data/localization_bridge_2_bounds_3d.csv \
         --gen data/3d_track_data/localization_bridge_2_3d.csv
 """
+### HJ : numpy 1.17.4 + pandas 2.0.3 버전 불일치 우회
+import sys as _sys
+_sys.path[:] = [p for p in _sys.path if '/.local/' not in p]
+import numpy as _np
+_np.__version__ = '1.22.4'
+if not hasattr(_np.random, 'BitGenerator'):
+    from numpy.random.bit_generator import BitGenerator as _BG
+    _np.random.BitGenerator = _BG
+
 import argparse
 import os
 import sys
@@ -152,114 +161,114 @@ def main():
     # ════════════════════════════════════════════════════════════════════════
     #  FIGURE 2: Profiles (speed, offset, accel, jerk)
     # ════════════════════════════════════════════════════════════════════════
-    fig2, axes = plt.subplots(5, 1, figsize=(14, 10), sharex=True, num='Profiles')
+    # fig2, axes = plt.subplots(5, 1, figsize=(14, 10), sharex=True, num='Profiles')
 
-    # Speed
-    ax_v = axes[0]
-    ax_v.fill_between(s_opt, 0, v_opt, alpha=0.15, color='C0')
-    ax_v.plot(s_opt, v_opt, color='C0', lw=1.5)
-    ax_v.set_ylabel('V [m/s]')
-    ax_v.set_ylim(bottom=0)
+    # # Speed
+    # ax_v = axes[0]
+    # ax_v.fill_between(s_opt, 0, v_opt, alpha=0.15, color='C0')
+    # ax_v.plot(s_opt, v_opt, color='C0', lw=1.5)
+    # ax_v.set_ylabel('V [m/s]')
+    # ax_v.set_ylim(bottom=0)
 
-    # Lateral offset
-    ax_n = axes[1]
-    ax_n.fill_between(s_opt, 0, n_opt, where=(n_opt >= 0), alpha=0.15, color='C2')
-    ax_n.fill_between(s_opt, 0, n_opt, where=(n_opt < 0),  alpha=0.15, color='C3')
-    ax_n.plot(s_opt, n_opt, color='C2', lw=1.2)
-    ax_n.axhline(0, color='k', lw=0.4)
-    # Track width bounds
-    ax_n.fill_between(s_opt, trk_wl,  alpha=0.06, color='blue',  label='left limit')
-    ax_n.fill_between(s_opt, trk_wr, alpha=0.06, color='red',   label='right limit')
-    ax_n.set_ylabel('n [m]')
-    ax_n.legend(fontsize=7, ncol=2, loc='upper right')
+    # # Lateral offset
+    # ax_n = axes[1]
+    # ax_n.fill_between(s_opt, 0, n_opt, where=(n_opt >= 0), alpha=0.15, color='C2')
+    # ax_n.fill_between(s_opt, 0, n_opt, where=(n_opt < 0),  alpha=0.15, color='C3')
+    # ax_n.plot(s_opt, n_opt, color='C2', lw=1.2)
+    # ax_n.axhline(0, color='k', lw=0.4)
+    # # Track width bounds
+    # ax_n.fill_between(s_opt, trk_wl,  alpha=0.06, color='blue',  label='left limit')
+    # ax_n.fill_between(s_opt, trk_wr, alpha=0.06, color='red',   label='right limit')
+    # ax_n.set_ylabel('n [m]')
+    # ax_n.legend(fontsize=7, ncol=2, loc='upper right')
 
-    # Heading angle chi
-    ax_chi = axes[2]
-    ax_chi.plot(s_opt, np.degrees(chi_opt), color='C4', lw=1.2)
-    ax_chi.axhline(0, color='k', lw=0.4)
-    ax_chi.set_ylabel(r'$\chi$ [deg]')
+    # # Heading angle chi
+    # ax_chi = axes[2]
+    # ax_chi.plot(s_opt, np.degrees(chi_opt), color='C4', lw=1.2)
+    # ax_chi.axhline(0, color='k', lw=0.4)
+    # ax_chi.set_ylabel(r'$\chi$ [deg]')
 
-    # Accelerations
-    ax_a = axes[3]
-    ax_a.plot(s_opt, ax_opt, color='C0', lw=1.2, label=r'$a_x$ (long)')
-    ax_a.plot(s_opt, ay_opt, color='C3', lw=1.2, label=r'$a_y$ (lat)')
-    ax_a.axhline(0, color='k', lw=0.4)
-    ax_a.set_ylabel(r'a [m/s²]')
-    ax_a.legend(fontsize=7, ncol=2, loc='upper right')
+    # # Accelerations
+    # ax_a = axes[3]
+    # ax_a.plot(s_opt, ax_opt, color='C0', lw=1.2, label=r'$a_x$ (long)')
+    # ax_a.plot(s_opt, ay_opt, color='C3', lw=1.2, label=r'$a_y$ (lat)')
+    # ax_a.axhline(0, color='k', lw=0.4)
+    # ax_a.set_ylabel(r'a [m/s²]')
+    # ax_a.legend(fontsize=7, ncol=2, loc='upper right')
 
-    # Jerk
-    ax_j = axes[4]
-    ax_j.plot(s_opt, jx_opt, color='C0', lw=1.0, alpha=0.8, label=r'$j_x$')
-    ax_j.plot(s_opt, jy_opt, color='C3', lw=1.0, alpha=0.8, label=r'$j_y$')
-    ax_j.axhline(0, color='k', lw=0.4)
-    ax_j.set_ylabel(r'j [m/s³]')
-    ax_j.set_xlabel('s [m]')
-    ax_j.legend(fontsize=7, ncol=2, loc='upper right')
+    # # Jerk
+    # ax_j = axes[4]
+    # ax_j.plot(s_opt, jx_opt, color='C0', lw=1.0, alpha=0.8, label=r'$j_x$')
+    # ax_j.plot(s_opt, jy_opt, color='C3', lw=1.0, alpha=0.8, label=r'$j_y$')
+    # ax_j.axhline(0, color='k', lw=0.4)
+    # ax_j.set_ylabel(r'j [m/s³]')
+    # ax_j.set_xlabel('s [m]')
+    # ax_j.legend(fontsize=7, ncol=2, loc='upper right')
 
-    for ax in axes:
-        ax.grid(True, alpha=0.2)
-        ax.tick_params(labelsize=8)
+    # for ax in axes:
+    #     ax.grid(True, alpha=0.2)
+    #     ax.tick_params(labelsize=8)
 
-    fig2.suptitle(f'Racing Line Profiles  —  Laptime {laptime:.3f}s', fontsize=13, fontweight='bold')
-    fig2.tight_layout()
+    # fig2.suptitle(f'Racing Line Profiles  —  Laptime {laptime:.3f}s', fontsize=13, fontweight='bold')
+    # fig2.tight_layout()
 
     # ════════════════════════════════════════════════════════════════════════
     #  FIGURE 3: Pipeline comparison (raw → gen3d → smoothed) if data given
     # ════════════════════════════════════════════════════════════════════════
-    if raw_data or gen_data:
-        n_panels = 1 + bool(gen_data) + 1  # raw(optional) + gen(optional) + smoothed
-        panels = []
-        if raw_data:
-            panels.append(('Raw boundary', raw_data))
-        if gen_data:
-            panels.append(('Gen3D (before smoothing)', gen_data))
-        panels.append(('Smoothed (final)', None))
+    # if raw_data or gen_data:
+    #     n_panels = 1 + bool(gen_data) + 1  # raw(optional) + gen(optional) + smoothed
+    #     panels = []
+    #     if raw_data:
+    #         panels.append(('Raw boundary', raw_data))
+    #     if gen_data:
+    #         panels.append(('Gen3D (before smoothing)', gen_data))
+    #     panels.append(('Smoothed (final)', None))
 
-        fig3, ax3s = plt.subplots(1, len(panels), figsize=(7 * len(panels), 8), num='Pipeline Comparison')
-        if len(panels) == 1:
-            ax3s = [ax3s]
+    #     fig3, ax3s = plt.subplots(1, len(panels), figsize=(7 * len(panels), 8), num='Pipeline Comparison')
+    #     if len(panels) == 1:
+    #         ax3s = [ax3s]
 
-        for idx, (title, data) in enumerate(panels):
-            ax = ax3s[idx]
+    #     for idx, (title, data) in enumerate(panels):
+    #         ax = ax3s[idx]
 
-            if title == 'Raw boundary' and data:
-                ax.plot(_close(data['lx']), _close(data['ly']), 'b-', lw=1.5, label='Left')
-                ax.plot(_close(data['rx']), _close(data['ry']), 'r-', lw=1.5, label='Right')
-                cx = (data['lx'] + data['rx']) / 2
-                cy = (data['ly'] + data['ry']) / 2
-                ax.plot(_close(cx), _close(cy), 'k--', lw=0.6, alpha=0.4)
-                # Cross-bars
-                for i in range(0, len(data['lx']), max(1, len(data['lx']) // 30)):
-                    ax.plot([data['lx'][i], data['rx'][i]], [data['ly'][i], data['ry'][i]],
-                            '-', color='green', lw=0.4, alpha=0.5)
+    #         if title == 'Raw boundary' and data:
+    #             ax.plot(_close(data['lx']), _close(data['ly']), 'b-', lw=1.5, label='Left')
+    #             ax.plot(_close(data['rx']), _close(data['ry']), 'r-', lw=1.5, label='Right')
+    #             cx = (data['lx'] + data['rx']) / 2
+    #             cy = (data['ly'] + data['ry']) / 2
+    #             ax.plot(_close(cx), _close(cy), 'k--', lw=0.6, alpha=0.4)
+    #             # Cross-bars
+    #             for i in range(0, len(data['lx']), max(1, len(data['lx']) // 30)):
+    #                 ax.plot([data['lx'][i], data['rx'][i]], [data['ly'][i], data['ry'][i]],
+    #                         '-', color='green', lw=0.4, alpha=0.5)
 
-            elif title.startswith('Gen3D') and data:
-                ax.plot(_close(data['left'][0]),  _close(data['left'][1]),  'b-', lw=1.5, label='Left')
-                ax.plot(_close(data['right'][0]), _close(data['right'][1]), 'r-', lw=1.5, label='Right')
-                ax.plot(_close(data['x']), _close(data['y']), 'k--', lw=0.6, alpha=0.4)
-                for i in range(0, len(data['x']), max(1, len(data['x']) // 30)):
-                    ax.plot([data['left'][0][i], data['right'][0][i]],
-                            [data['left'][1][i], data['right'][1][i]],
-                            '-', color='green', lw=0.4, alpha=0.5)
+    #         elif title.startswith('Gen3D') and data:
+    #             ax.plot(_close(data['left'][0]),  _close(data['left'][1]),  'b-', lw=1.5, label='Left')
+    #             ax.plot(_close(data['right'][0]), _close(data['right'][1]), 'r-', lw=1.5, label='Right')
+    #             ax.plot(_close(data['x']), _close(data['y']), 'k--', lw=0.6, alpha=0.4)
+    #             for i in range(0, len(data['x']), max(1, len(data['x']) // 30)):
+    #                 ax.plot([data['left'][0][i], data['right'][0][i]],
+    #                         [data['left'][1][i], data['right'][1][i]],
+    #                         '-', color='green', lw=0.4, alpha=0.5)
 
-            else:  # Smoothed + racing line
-                left_xy  = np.column_stack([_close(left_b[0]),  _close(left_b[1])])
-                right_xy = np.column_stack([_close(right_b[0]), _close(right_b[1])])
-                poly = np.vstack([left_xy, right_xy[::-1]])
-                ax.add_patch(Polygon(poly, closed=True, fc='#e8e8e8', ec='none', zorder=0))
-                ax.plot(_close(left_b[0]),  _close(left_b[1]),  color='#333', lw=1.5, label='Left')
-                ax.plot(_close(right_b[0]), _close(right_b[1]), color='#333', lw=1.5, label='Right')
-                lc2 = _speed_lc(rl_x, rl_y, v_opt, lw=2.5, cmap='RdYlGn')
-                ax.add_collection(lc2)
-                plt.colorbar(lc2, ax=ax, shrink=0.6, label='V [m/s]')
+    #         else:  # Smoothed + racing line
+    #             left_xy  = np.column_stack([_close(left_b[0]),  _close(left_b[1])])
+    #             right_xy = np.column_stack([_close(right_b[0]), _close(right_b[1])])
+    #             poly = np.vstack([left_xy, right_xy[::-1]])
+    #             ax.add_patch(Polygon(poly, closed=True, fc='#e8e8e8', ec='none', zorder=0))
+    #             ax.plot(_close(left_b[0]),  _close(left_b[1]),  color='#333', lw=1.5, label='Left')
+    #             ax.plot(_close(right_b[0]), _close(right_b[1]), color='#333', lw=1.5, label='Right')
+    #             lc2 = _speed_lc(rl_x, rl_y, v_opt, lw=2.5, cmap='RdYlGn')
+    #             ax.add_collection(lc2)
+    #             plt.colorbar(lc2, ax=ax, shrink=0.6, label='V [m/s]')
 
-            ax.set_aspect('equal')
-            ax.set_title(title, fontsize=12, fontweight='bold')
-            ax.legend(fontsize=8, loc='upper left')
-            ax.grid(True, alpha=0.15)
+    #         ax.set_aspect('equal')
+    #         ax.set_title(title, fontsize=12, fontweight='bold')
+    #         ax.legend(fontsize=8, loc='upper left')
+    #         ax.grid(True, alpha=0.15)
 
-        fig3.suptitle('Pipeline: Raw → Gen3D → Smoothed + Raceline', fontsize=14, fontweight='bold')
-        fig3.tight_layout()
+    #     fig3.suptitle('Pipeline: Raw → Gen3D → Smoothed + Raceline', fontsize=14, fontweight='bold')
+    #     fig3.tight_layout()
 
     # ════════════════════════════════════════════════════════════════════════
     #  FIGURE 4: 3D Track + Racing Line (speed-colored)
@@ -326,41 +335,41 @@ def main():
     # ════════════════════════════════════════════════════════════════════════
     #  FIGURE 5: 3D Profiles (z, speed, accel along track)
     # ════════════════════════════════════════════════════════════════════════
-    fig5, axes5 = plt.subplots(4, 1, figsize=(14, 9), sharex=True, num='3D Profiles')
+    # fig5, axes5 = plt.subplots(4, 1, figsize=(14, 9), sharex=True, num='3D Profiles')
 
-    # Elevation
-    ax_z = axes5[0]
-    ax_z.plot(s_opt, trk_z, color='C1', lw=1.2, label='centerline z')
-    ax_z.plot(s_opt, rl_z, color='C0', lw=1.5, label='raceline z')
-    ax_z.set_ylabel('z [m]')
-    ax_z.legend(fontsize=7, loc='upper right')
+    # # Elevation
+    # ax_z = axes5[0]
+    # ax_z.plot(s_opt, trk_z, color='C1', lw=1.2, label='centerline z')
+    # ax_z.plot(s_opt, rl_z, color='C0', lw=1.5, label='raceline z')
+    # ax_z.set_ylabel('z [m]')
+    # ax_z.legend(fontsize=7, loc='upper right')
 
-    # Banking angle (phi)
-    ax_phi = axes5[1]
-    ax_phi.plot(s_opt, np.degrees(trk_phi), color='C4', lw=1.2)
-    ax_phi.set_ylabel(r'Banking $\phi$ [deg]')
-    ax_phi.axhline(0, color='k', lw=0.4)
+    # # Banking angle (phi)
+    # ax_phi = axes5[1]
+    # ax_phi.plot(s_opt, np.degrees(trk_phi), color='C4', lw=1.2)
+    # ax_phi.set_ylabel(r'Banking $\phi$ [deg]')
+    # ax_phi.axhline(0, color='k', lw=0.4)
 
-    # Pitch (mu)
-    ax_mu = axes5[2]
-    ax_mu.plot(s_opt, np.degrees(trk_mu), color='C5', lw=1.2)
-    ax_mu.set_ylabel(r'Pitch $\mu$ [deg]')
-    ax_mu.axhline(0, color='k', lw=0.4)
+    # # Pitch (mu)
+    # ax_mu = axes5[2]
+    # ax_mu.plot(s_opt, np.degrees(trk_mu), color='C5', lw=1.2)
+    # ax_mu.set_ylabel(r'Pitch $\mu$ [deg]')
+    # ax_mu.axhline(0, color='k', lw=0.4)
 
-    # Speed (repeated for context with 3D data)
-    ax_v3 = axes5[3]
-    ax_v3.fill_between(s_opt, 0, v_opt, alpha=0.15, color='C0')
-    ax_v3.plot(s_opt, v_opt, color='C0', lw=1.5)
-    ax_v3.set_ylabel('V [m/s]')
-    ax_v3.set_xlabel('s [m]')
-    ax_v3.set_ylim(bottom=0)
+    # # Speed (repeated for context with 3D data)
+    # ax_v3 = axes5[3]
+    # ax_v3.fill_between(s_opt, 0, v_opt, alpha=0.15, color='C0')
+    # ax_v3.plot(s_opt, v_opt, color='C0', lw=1.5)
+    # ax_v3.set_ylabel('V [m/s]')
+    # ax_v3.set_xlabel('s [m]')
+    # ax_v3.set_ylim(bottom=0)
 
-    for ax in axes5:
-        ax.grid(True, alpha=0.2)
-        ax.tick_params(labelsize=8)
+    # for ax in axes5:
+    #     ax.grid(True, alpha=0.2)
+    #     ax.tick_params(labelsize=8)
 
-    fig5.suptitle(f'3D Track Profiles  —  Laptime {laptime:.3f}s', fontsize=13, fontweight='bold')
-    fig5.tight_layout()
+    # fig5.suptitle(f'3D Track Profiles  —  Laptime {laptime:.3f}s', fontsize=13, fontweight='bold')
+    # fig5.tight_layout()
 
     plt.show()
 
