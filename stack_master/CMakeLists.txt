@@ -94,9 +94,15 @@ find_package(catkin REQUIRED COMPONENTS
 #   cfg/DynReconf2.cfg
 # )
 ### HJ : VelPlanner3D dynamic reconfigure
+## IY : also generate GGTuner.cfg → GGTunerConfig.py (used by gg_tuner_node)
 generate_dynamic_reconfigure_options(
   cfg/VelPlanner3D.cfg
+  cfg/GGTuner.cfg
+  ## IY : GGTuner3D — gg_tuner_3d_node uses this (VelOpt replaces FBGA stage)
+  cfg/GGTuner3D.cfg
+  ## IY : end
 )
+## IY : end
 
 ###################################
 ## catkin specific configuration ##
