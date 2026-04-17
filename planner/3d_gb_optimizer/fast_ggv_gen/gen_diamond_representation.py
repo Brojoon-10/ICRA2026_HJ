@@ -1,5 +1,8 @@
 import os
 import argparse
+## IY : yaml for tuning override (was not imported)
+import yaml
+## IY : end
 from casadi import *
 import multiprocessing
 from joblib import Parallel, delayed
@@ -7,6 +10,14 @@ from joblib import Parallel, delayed
 ### HJ : add argparse for vehicle_name (was hardcoded to 'rc_car_10th')
 parser = argparse.ArgumentParser(description='Generate diamond representation for GG diagrams')
 parser.add_argument('--vehicle_name', type=str, default='rc_car_10th', help='Vehicle name (default: rc_car_10th)')
+## IY : add tuning CLI args (same as fast_gen_gg_diagrams.py) to enable
+#       diamond post-process (gg_exp_scale, ax_max/min_scale, ay_scale).
+#       --tuning_name decouples the tuning file name from --vehicle_name.
+parser.add_argument('--tuning', action='store_true', default=False,
+                    help='Apply tuning_<name>.yml post-process overrides')
+parser.add_argument('--tuning_name', type=str, default=None,
+                    help='Tuning file suffix (default: same as --vehicle_name)')
+## IY : end
 args, _ = parser.parse_known_args()
 vehicle_name = args.vehicle_name
 # paths
@@ -15,6 +26,63 @@ dir_path = os.path.dirname(os.path.abspath(__file__))
 gg_diagram_path = os.path.join(dir_path, 'output')
 
 num_cores = multiprocessing.cpu_count()
+
+## IY : load diamond post-process params
+#       Reads post-process keys from the UNIFIED params yml
+#       (params_<vehicle_name>.yml), which contains all NLP + post-process
+#       + raceline keys in one file. NLP/raceline keys are ignored here.
+#       If --tuning flag is given, also tries tuning_<name>.yml as fallback
+#       (backward compatibility with manual CLI usage).
+#       All params default to None (= apply nothing = NLP fit as-is).
+# (previous: read from tuning_<name>.yml only via --tuning flag)
+tuning_post = {
+    'gg_exp_scale':  None,
+    'ax_max_scale':  None,
+    'ax_min_scale':  None,
+    'ay_scale':      None,
+}
+
+_data_path = os.path.join(dir_path, '..', 'global_line', 'data')
+
+## IY : primary: read from params_<vehicle_name>.yml (unified yml from gg_tuner)
+_params_path = os.path.join(_data_path, 'vehicle_params',
+                            'params_' + vehicle_name + '.yml')
+_loaded_from = None
+if os.path.exists(_params_path):
+    with open(_params_path, 'r') as _stream:
+        _params_raw = yaml.safe_load(_stream) or {}
+    for _key in tuning_post:
+        if _key in _params_raw and _params_raw[_key] is not None:
+            tuning_post[_key] = float(_params_raw[_key])
+    _loaded_from = _params_path
+## IY : end
+
+## IY : fallback: if --tuning flag given, also check tuning_<name>.yml
+#       (for backward compat with manual CLI: run_on_container.sh with TUNING=1)
+if args.tuning and _loaded_from is None:
+    _tuning_name = args.tuning_name if args.tuning_name else vehicle_name
+    _tuning_path = os.path.join(_data_path, 'vehicle_params',
+                                'tuning_' + _tuning_name + '.yml')
+    if os.path.exists(_tuning_path):
+        with open(_tuning_path, 'r') as _stream:
+            _tuning_raw = yaml.safe_load(_stream) or {}
+        for _key in tuning_post:
+            if _key in _tuning_raw and _tuning_raw[_key] is not None:
+                tuning_post[_key] = float(_tuning_raw[_key])
+        _loaded_from = _tuning_path
+    else:
+        print(f'[gen_diamond] WARNING: --tuning specified but {_tuning_path} '
+              f'not found')
+## IY : end
+
+_active = {k: v for k, v in tuning_post.items() if v is not None}
+if _active:
+    print(f'[gen_diamond] Post-process params from {_loaded_from}:')
+    for _k, _v in _active.items():
+        print(f'               {_k} = {_v}')
+else:
+    print(f'[gen_diamond] No post-process params set → NLP fit preserved as-is')
+## IY : end
 
 
 def gen_diamond_representation(alpha_list, rho_list):
@@ -146,6 +214,50 @@ for frame in ['vehicle', 'velocity']:
     ax_min_list = [tmp[1] for tmp in processed_list]
     ax_max_list = [tmp[2] for tmp in processed_list]
     ay_max_list = [tmp[3] for tmp in processed_list]
+
+    ## IY : apply diamond post-process scales (null = NLP fit as-is)
+    #       - gg_exp_scale: multiplies fitted exponent, clipped to [1.0, 2.0].
+    #         Preserves V/g variation while shifting toward diamond (<1) or
+    #         ellipse (>1). Does NOT throw away NLP variation.
+    #       - ax_max_scale / ax_min_scale: directional accel/brake scaling
+    #         (can be used independently to bias brake-heavy vs accel-heavy).
+    #       - ay_scale: corner capability scaling.
+    #       Applied AFTER diamond fit, to both vehicle and velocity frames.
+    gg_arr = np.asarray(gg_exponent_list, dtype=np.float64)
+    ax_min_arr = np.asarray(ax_min_list,  dtype=np.float64)
+    ax_max_arr = np.asarray(ax_max_list,  dtype=np.float64)
+    ay_max_arr = np.asarray(ay_max_list,  dtype=np.float64)
+
+    _applied_log = []
+    if tuning_post['gg_exp_scale'] is not None:
+        _s = tuning_post['gg_exp_scale']
+        gg_before_min, gg_before_max = float(gg_arr.min()), float(gg_arr.max())
+        gg_arr = np.clip(gg_arr * _s, 1.0, 2.0)
+        _applied_log.append(
+            f"gg_exp_scale={_s}: [{gg_before_min:.3f},{gg_before_max:.3f}] → "
+            f"[{gg_arr.min():.3f},{gg_arr.max():.3f}]")
+    if tuning_post['ax_max_scale'] is not None:
+        _s = tuning_post['ax_max_scale']
+        ax_max_arr = ax_max_arr * _s
+        _applied_log.append(f"ax_max_scale={_s}")
+    if tuning_post['ax_min_scale'] is not None:
+        _s = tuning_post['ax_min_scale']
+        ax_min_arr = ax_min_arr * _s   # ax_min is already negative
+        _applied_log.append(f"ax_min_scale={_s}")
+    if tuning_post['ay_scale'] is not None:
+        _s = tuning_post['ay_scale']
+        ay_max_arr = ay_max_arr * _s
+        _applied_log.append(f"ay_scale={_s}")
+
+    if _applied_log:
+        print(f'[gen_diamond] [{frame}_frame] post-process applied: '
+              + ', '.join(_applied_log))
+
+    gg_exponent_list = gg_arr.tolist()
+    ax_min_list      = ax_min_arr.tolist()
+    ax_max_list      = ax_max_arr.tolist()
+    ay_max_list      = ay_max_arr.tolist()
+    ## IY : end
 
     out_path = os.path.join(gg_diagram_path, vehicle_name)
     np.save(os.path.join(out_path, frame + '_frame', "gg_exponent.npy"), gg_exponent_list)

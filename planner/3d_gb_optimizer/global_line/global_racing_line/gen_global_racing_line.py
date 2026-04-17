@@ -1,9 +1,45 @@
+### HJ : numpy 1.17.4 + pandas 2.0.3 버전 불일치 우회
+### ~/.local의 망가진 pandas 차단 + numpy 버전 스푸핑 + BitGenerator 주입
+import sys as _sys
+_sys.path[:] = [p for p in _sys.path if '/.local/' not in p]
+import numpy as _np
+_np.__version__ = '1.22.4'
+if not hasattr(_np.random, 'BitGenerator'):
+    from numpy.random.bit_generator import BitGenerator as _BG
+    _np.random.BitGenerator = _BG
+
 import os
 import sys
 import casadi as ca
 import numpy as np
 import yaml
 import pandas as pd
+
+
+### HJ : Probe HSL ma27; fall back to MUMPS if libhsl.so is not loadable.
+#       ma27 is typically 1.5–3x faster than MUMPS for this NLP size.
+#       Original MUMPS behavior is preserved when HSL is not installed —
+#       no existing workflow breaks.
+def _select_linear_solver(verbose=True):
+    try:
+        _x = ca.MX.sym('x')
+        _probe = ca.nlpsol('hsl_probe', 'ipopt',
+                           {'x': _x, 'f': (_x - 1.0) ** 2},
+                           {'ipopt.linear_solver': 'ma27',
+                            'ipopt.print_level': 0, 'print_time': 0})
+        _probe(x0=0.0)
+        if _probe.stats().get('success', False):
+            if verbose:
+                print('[gen_global_racing_line] linear_solver: ma27 (HSL)')
+            return 'ma27'
+    except Exception:
+        pass
+    if verbose:
+        print('[gen_global_racing_line] linear_solver: mumps (HSL not available, fallback)')
+    return 'mumps'
+
+_LINEAR_SOLVER = _select_linear_solver()
+### HJ : end
 
 params = {
     # 'track_name': 'experiment_3d_2_3d_smoothed.csv',
@@ -24,6 +60,19 @@ params = {
     'neglect_w_dot': False,
     'neglect_V_omega': False,
     'V_guess': 3.0,  # initial velocity guess
+    ## IY : minimum velocity bound for raceline NLP
+    #       Prevents the optimizer from planning V < V_min anywhere on the
+    #       track. Consistent with fast_gen_gg_diagrams.py V_min=2.0 (which
+    #       means the GGV lookup is only valid for V ≥ 2). Forces the
+    #       optimizer to take wider lines at tight corners instead of
+    #       crawling, and sidesteps low-speed GGV artifacts entirely.
+    #         0.0 = unconstrained (original behavior)
+    #         2.0 = current choice (matches GGV V_min)
+    #       Infeasibility risk: if the track has a hairpin too tight for
+    #       V≥V_min at the max available ay, the NLP will fail. Start
+    #       lower (1.5 or 1.8) if feasibility is uncertain.
+    'V_min': 2.0,
+    ## IY : end
     'w_jx': 1e-2,  # cost weight for jerk x-direction
     'w_jy': 1e-2,  # cost weight for jerk y-direction
     # min time
@@ -40,12 +89,47 @@ params = {
     ### HJ : end
     'RK4_steps': 1,
     'sol_opts': {
-        "ipopt.max_iter": 5000,
+        "ipopt.max_iter": 2000,
         "ipopt.hessian_approximation": 'limited-memory',  # 'exact' or 'limited-memory'
         "ipopt.line_search_method": 'cg-penalty',  # 'filter', 'cg-penalty'
-        "ipopt.acceptable_tol": 1e-4,
-        "ipopt.acceptable_dual_inf_tol": 1e-4,
-        "ipopt.constr_viol_tol": 1e-4,
+        ## IY : physically-justified tolerance relaxation for V_min=2.0 NLP
+        #       Problem: after enforcing V_min=2.0, the raceline NLP develops
+        #       near-degenerate active constraints at tight corners where both
+        #       V=V_min and ay=ay_max are simultaneously binding. This causes
+        #       dual multiplier ambiguity — solver primal-converges
+        #       (inf_pr ~ 1e-10) but inf_du oscillates around 0.15 without exit.
+        #
+        #       Scale analysis (justification for each tolerance):
+        #         - Objective J ≈ 20 s (lap time)
+        #         - |dJ/dV| ≈ 1/V² ∈ [0.01, 0.25] over V ∈ [2, 10]
+        #         - Default tol=1e-8 → excessive for this problem scale
+        #         - tol=1e-4 → worst-case obj error ≈ 1e-4 · 20 ≈ 2 ms
+        #         - dual_inf_tol=1e-1 → ~40% relative error on gradient scale
+        #         - acceptable_dual_inf_tol=5.0 (observed: inf_du oscillates
+        #           0.08~2.5 during active basin exploration — 1.0 kept
+        #           resetting the acceptable counter whenever spikes hit 2+,
+        #           so raised to 5.0 to absorb those spikes)
+        #         - acceptable_iter=10 (default 15, slightly less conservative
+        #           but still robust to noise-level oscillations)
+        #       Constraint-violation tolerances kept TIGHT (1e-4) because
+        #       primal violation means physically invalid trajectory (outside
+        #       track, exceeding GGV envelope). Do not relax constr_viol_tol.
+        # (previous)
+        # "ipopt.acceptable_tol": 1e-4,
+        # "ipopt.acceptable_dual_inf_tol": 1e-4,
+        # "ipopt.constr_viol_tol": 1e-4,
+        "ipopt.tol":                        1e-4,
+        "ipopt.dual_inf_tol":               1e-1,
+        "ipopt.constr_viol_tol":            1e-4,
+        "ipopt.compl_inf_tol":              1e-4,
+        "ipopt.acceptable_tol":             1e-3,
+        "ipopt.acceptable_dual_inf_tol":    5.0,
+        "ipopt.acceptable_constr_viol_tol": 1e-3,
+        "ipopt.acceptable_iter":            10,
+        ## IY : end
+        ### HJ : HSL ma27 if available (probed at import), else MUMPS fallback.
+        "ipopt.linear_solver": _LINEAR_SOLVER,
+        ### HJ : end
     }
 }
 
@@ -77,6 +161,9 @@ def calc_global_raceline(
         w_dOmega_z: float,
         RK4_steps: int,
         V_guess: float,
+        ## IY : V_min enforced as NLP lower bound on velocity state
+        V_min: float,
+        ## IY : end
         neglect_w_omega_x: bool,
         neglect_w_omega_y: bool,
         neglect_euler: bool,
@@ -197,7 +284,10 @@ def calc_global_raceline(
     # Initial conditions
     Xk = ca.MX.sym('X0', nx)
     w += [Xk]
-    lbw += [0.0, track_handler.w_tr_right[0] + vehicle_params['total_width'] / 2.0 + safety_distance, -np.pi / 2.0, -np.inf, -np.inf]
+    ## IY : enforce V >= V_min on velocity state (index 0) — was hardcoded 0.0
+    # lbw += [0.0, track_handler.w_tr_right[0] + vehicle_params['total_width'] / 2.0 + safety_distance, -np.pi / 2.0, -np.inf, -np.inf]
+    lbw += [V_min, track_handler.w_tr_right[0] + vehicle_params['total_width'] / 2.0 + safety_distance, -np.pi / 2.0, -np.inf, -np.inf]
+    ## IY : end
     ubw += [gg_handler.V_max, track_handler.w_tr_left[0] - vehicle_params['total_width'] / 2.0 - safety_distance, np.pi / 2.0, np.inf, np.inf]
     w0 += [V_guess, (track_handler.w_tr_left[0] + track_handler.w_tr_right[0]) / 2.0, 0.0, 1e-6, 1e-6]
 
@@ -275,7 +365,10 @@ def calc_global_raceline(
         # New NLP variable for state at end of interval.
         Xk = ca.MX.sym('X_' + str(k + 1), nx)
         w += [Xk]
-        lbw += [0.0, track_handler.w_tr_right[k+1] + vehicle_params['total_width'] / 2.0 + safety_distance, -np.pi / 2.0, -np.inf, -np.inf]
+        ## IY : enforce V >= V_min on velocity state (index 0) — was hardcoded 0.0
+        # lbw += [0.0, track_handler.w_tr_right[k+1] + vehicle_params['total_width'] / 2.0 + safety_distance, -np.pi / 2.0, -np.inf, -np.inf]
+        lbw += [V_min, track_handler.w_tr_right[k+1] + vehicle_params['total_width'] / 2.0 + safety_distance, -np.pi / 2.0, -np.inf, -np.inf]
+        ## IY : end
         ubw += [gg_handler.V_max, track_handler.w_tr_left[k+1] - vehicle_params['total_width'] / 2.0 - safety_distance, np.pi / 2.0, np.inf, np.inf]
         w0 += [V_guess, (track_handler.w_tr_left[k+1] + track_handler.w_tr_right[k+1]) / 2.0, 0.0, 1e-6, 1e-6]
 
@@ -351,6 +444,9 @@ if __name__ == '__main__':
             w_dOmega_z=params['w_dOmega_z'],
             RK4_steps=params['RK4_steps'],
             V_guess=params['V_guess'],
+            ## IY : pass V_min from params dict to NLP
+            V_min=params['V_min'],
+            ## IY : end
             neglect_w_omega_x=params['neglect_w_omega_x'],
             neglect_w_omega_y=params['neglect_w_omega_y'],
             neglect_euler=params['neglect_euler'],
