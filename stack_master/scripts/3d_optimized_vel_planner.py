@@ -37,6 +37,7 @@ if not hasattr(_np.random, 'BitGenerator'):
 import os
 import sys
 import argparse
+import threading
 import time
 import numpy as np
 import pandas as pd
@@ -45,6 +46,9 @@ import casadi as ca
 
 import rospy
 from f110_msgs.msg import WpntArray, Wpnt
+## IY : Trigger service for /velopt/reload (hot-reload from gg_tuner_3d)
+from std_srvs.srv import Trigger, TriggerResponse
+## IY : end
 
 # --- locate 3d_gb_optimizer modules ---
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -78,9 +82,117 @@ _LINEAR_SOLVER = _select_linear_solver()
 ### HJ : end
 
 
+## IY(0416) : per-sector friction → multi-GGV support
+#   friction_scaling.yaml의 friction 값을 p_Dx_1 = p_Dy_1으로 직접 사용.
+#   각 unique friction에 대해 별도 GGManager를 로드하고,
+#   NLP 루프에서 waypoint별로 해당 sector의 GGV를 참조.
+def _read_friction_sectors():
+    """Read friction sector params from rosparam (set by friction_sector_server).
+    Returns list of dicts [{start, end, friction}, ...] or empty list if unavailable.
+    """
+    try:
+        n_sec = rospy.get_param('/friction_map_params/n_sectors', 0)
+        if n_sec <= 0:
+            return []
+        sectors = []
+        for i in range(n_sec):
+            sectors.append({
+                'start': int(rospy.get_param(f'/friction_map_params/Sector{i}/start', 0)),
+                'end':   int(rospy.get_param(f'/friction_map_params/Sector{i}/end', 0)),
+                'friction': float(rospy.get_param(f'/friction_map_params/Sector{i}/friction', -1.0)),
+            })
+        return sectors
+    except Exception:
+        return []
+
+
+def _build_friction_gg_map(sectors, n_waypoints, gg_base_dir, gg_margin,
+                           base_p_Dx_1):
+    """Build per-waypoint GGManager mapping from friction sectors.
+
+    Args:
+        sectors:      list of {start, end, friction} dicts
+        n_waypoints:  number of waypoints on the resampled grid
+        gg_base_dir:  base GGV velocity_frame directory path
+        gg_margin:    GGV margin
+        base_p_Dx_1:  p_Dx_1 from the base vehicle params (for detecting base-matching sectors)
+
+    Returns:
+        gg_list:  list of GGManager instances (one per unique friction)
+        gg_idx:   np.array of shape (n_waypoints,) mapping each waypoint → index in gg_list
+                  None if no friction sectors or all sectors use base friction.
+    """
+    if not sectors:
+        return None, None
+
+    # Filter out sectors with invalid friction (< 0 means not set)
+    valid = [s for s in sectors if s['friction'] > 0]
+    if not valid:
+        return None, None
+
+    # Collect unique friction values
+    unique_frictions = sorted(set(s['friction'] for s in valid))
+
+    # If all sectors have the same friction as base → no multi-GGV needed
+    if len(unique_frictions) == 1 and abs(unique_frictions[0] - base_p_Dx_1) < 1e-4:
+        return None, None
+
+    # Build GGManager per unique friction
+    gg_base_parent = os.path.dirname(os.path.dirname(gg_base_dir))  # gg_diagrams/
+    gg_base_name = os.path.basename(os.path.dirname(gg_base_dir))   # e.g. rc_car_10th_latest
+    gg_dict = {}
+    for fric in unique_frictions:
+        fric_int = int(round(fric * 100))
+        fric_dir = os.path.join(gg_base_parent,
+                                f'{gg_base_name}_f{fric_int:03d}',
+                                'velocity_frame')
+        if abs(fric - base_p_Dx_1) < 1e-4:
+            # Base friction — use the base GGV directory
+            fric_dir = gg_base_dir
+        if not os.path.exists(fric_dir):
+            rospy.logwarn(f'[velopt] friction GGV not found: {fric_dir} '
+                          f'(friction={fric:.3f}) → skipping multi-GGV')
+            return None, None
+        gg_dict[fric] = GGManager(gg_path=fric_dir, gg_margin=gg_margin)
+        rospy.loginfo(f'[velopt] loaded GGV for friction={fric:.3f}: {fric_dir}')
+
+    # Build ordered gg_list and friction→index map
+    fric_to_idx = {f: i for i, f in enumerate(unique_frictions)}
+    gg_list = [gg_dict[f] for f in unique_frictions]
+
+    # Build per-waypoint index (waypoint index → sector → friction → gg_list index)
+    default_fric = min(unique_frictions, key=lambda f: abs(f - base_p_Dx_1))
+    gg_idx = np.full(n_waypoints, fric_to_idx[default_fric], dtype=int)
+
+    for sec in valid:
+        fric = sec['friction']
+        idx = fric_to_idx[fric]
+        wpnt_start = sec['start']
+        wpnt_end = sec['end']
+        total_original = max(s['end'] for s in valid) + 1
+        grid_start = int(round(wpnt_start / total_original * n_waypoints))
+        grid_end = int(round((wpnt_end + 1) / total_original * n_waypoints))
+        grid_start = max(0, min(grid_start, n_waypoints - 1))
+        grid_end = max(0, min(grid_end, n_waypoints))
+        gg_idx[grid_start:grid_end] = idx
+
+    rospy.loginfo(f'[velopt] friction multi-GGV: {len(gg_list)} GGVs, '
+                  f'unique frictions={unique_frictions}')
+    return gg_list, gg_idx
+## IY(0416) : end
+
+
+# --- (기존 build_and_solve 시그니처, 보존용 주석) ---
+# def build_and_solve(track, gg, vehicle_params,
+#                     n_fixed, chi_fixed, v_init, ax_init,
+#                     w_T=1.0, w_jx=1e-2, V_min=0.0, RK4_steps=1, sol_opt=None):
+# --- (원본 끝) ---
+## IY(0416) : add gg_list, gg_idx params for multi-GGV friction support
 def build_and_solve(track, gg, vehicle_params,
                     n_fixed, chi_fixed, v_init, ax_init,
-                    w_T=1.0, w_jx=1e-2, V_min=0.0, RK4_steps=1, sol_opt=None):
+                    w_T=1.0, w_jx=1e-2, V_min=0.0, RK4_steps=1, sol_opt=None,
+                    gg_list=None, gg_idx=None):
+## IY(0416) : end
     """Reduced-state NLP. All arrays must be on track.s (resampled grid)."""
     h = vehicle_params['h']
     N = track.s.size
@@ -190,9 +302,21 @@ def build_and_solve(track, gg, vehicle_params,
             neglect_w_dot=False, neglect_V_omega=False,
         )
 
+        # --- (기존 single-GGV lookup, 보존용 주석) ---
+        # gg_exp, ax_min, ax_max, ay_max = ca.vertsplit(
+        #     gg.acc_interpolator(ca.vertcat(Xk[0], gt_k))
+        # )
+        # --- (원본 끝) ---
+        ## IY(0416) : per-waypoint GGV lookup (multi-GGV friction support)
+        #   gg_list/gg_idx가 있으면 해당 sector의 GGV 사용, 없으면 기존 단일 GGV.
+        if gg_list is not None and gg_idx is not None:
+            gg_k = gg_list[int(gg_idx[k])]
+        else:
+            gg_k = gg
         gg_exp, ax_min, ax_max, ay_max = ca.vertsplit(
-            gg.acc_interpolator(ca.vertcat(Xk[0], gt_k))
+            gg_k.acc_interpolator(ca.vertcat(Xk[0], gt_k))
         )
+        ## IY(0416) : end
         g += [ay_max - ca.fabs(ayt_k)]
         lbg += [0.0]; ubg += [np.inf]
 
@@ -300,23 +424,98 @@ def build_and_solve(track, gg, vehicle_params,
 
 
 class VelOptNode:
+    ## IY : __init__ refactored to enable hot-reload via /velopt/reload service.
+    #       Constructor args are stored as instance state so reload_cb can
+    #       refresh them from rosparams without rebuilding the node object.
+    #       Path resolution + file load + NLP solve are extracted to
+    #       _load_and_solve() for reuse.
+    # --- (original __init__ preserved below) ---
+    # def __init__(self, map_name, raceline_variant, vehicle_yml_file, gg_dir_name,
+    #              step_size_opt=0.2, V_min=0.0, gg_margin=0.0):
+    #     rospy.init_node('vel_opt_3d')
+    #     self.map_name = map_name
+    #     self.step_size_opt = step_size_opt
+    #     self.V_min = V_min
+    #     self.gg_margin = gg_margin
+    #
+    #     # Resolve paths — folder structure fixed, filenames derived from args
+    #     self.map_dir = os.path.abspath(os.path.join(_THIS_DIR, '..', 'maps', self.map_name))
+    #     # track is always <map>_3d_smoothed.csv
+    #     self.track_csv = os.path.join(self.map_dir, f'{self.map_name}_3d_smoothed.csv')
+    #     # raceline: <map>_3d_<variant>_timeoptimal.csv
+    #     self.raceline_csv = os.path.join(
+    #         self.map_dir, f'{self.map_name}_3d_{raceline_variant}_timeoptimal.csv')
+    #     self.vehicle_yml = os.path.join(_DATA_DIR, 'vehicle_params', vehicle_yml_file)
+    #     self.gg_path = os.path.join(_DATA_DIR, 'gg_diagrams', gg_dir_name, 'velocity_frame')
+    #
+    #     for p, label in [(self.track_csv, 'track csv'), ...]:
+    #         if not os.path.exists(p): raise FileNotFoundError(f'{label} not found: {p}')
+    # --- (original end) ---
     def __init__(self, map_name, raceline_variant, vehicle_yml_file, gg_dir_name,
                  step_size_opt=0.2, V_min=0.0, gg_margin=0.0):
         rospy.init_node('vel_opt_3d')
+        ## IY : instance state for reload (constructor args saved verbatim)
         self.map_name = map_name
+        self.raceline_variant = raceline_variant
+        self.vehicle_yml_file = vehicle_yml_file
+        self.gg_dir_name = gg_dir_name
         self.step_size_opt = step_size_opt
         self.V_min = V_min
         self.gg_margin = gg_margin
+        ## IY : end
 
-        # Resolve paths — folder structure fixed, filenames derived from args
+        ## IY : load+solve delegated so reload_cb can reuse it
+        self._load_and_solve()
+        ## IY : end
+
+        ## IY : publisher + reload infrastructure (init once, reused by reload_cb).
+        #       process_lock serializes _load_and_solve / _publish_solution
+        #       against reload_cb so a reload mid-publish cannot corrupt state.
+        self.process_lock = threading.Lock()
+        self.last_wpnts_msg = None
+        self.pub = rospy.Publisher('/global_waypoints', WpntArray, queue_size=1, latch=True)
+        self._processed = False
+        self.sub = rospy.Subscriber('/global_waypoints', WpntArray, self._cb, queue_size=1)
+        self.reload_srv = rospy.Service('/velopt/reload', Trigger, self.reload_cb)
+        rospy.loginfo('[velopt] /velopt/reload service ready')
+        rospy.loginfo('[velopt] waiting for /global_waypoints template message ...')
+        ## IY : end
+
+    ## IY : _load_and_solve — path resolve + file load + NLP solve.
+    #       Called by __init__ and by reload_cb. Reads ~map, ~racecar (or
+    #       individual overrides), ~V_min, ~gg_margin, ~step_size_opt
+    #       rosparams if present; otherwise uses stored instance state.
+    def _load_and_solve(self):
+        ## IY : rosparam override (used by gg_tuner_3d cold-start and reload)
+        self.map_name         = rospy.get_param('~map',            self.map_name)
+        racecar               = rospy.get_param('~racecar',        None)
+        # racecar acts as shortcut when individual overrides are absent
+        default_variant = racecar if racecar else self.raceline_variant
+        default_yml     = f'params_{racecar}.yml' if racecar else self.vehicle_yml_file
+        default_gg      = racecar if racecar else self.gg_dir_name
+        self.raceline_variant = rospy.get_param('~raceline',     default_variant)
+        self.vehicle_yml_file = rospy.get_param('~vehicle_yml',  default_yml)
+        self.gg_dir_name      = rospy.get_param('~gg_dir',       default_gg)
+        self.step_size_opt    = float(rospy.get_param('~step_size_opt', self.step_size_opt))
+        self.V_min            = float(rospy.get_param('~V_min',         self.V_min))
+        self.gg_margin        = float(rospy.get_param('~gg_margin',     self.gg_margin))
+        ## IY : NLP cost weights — default to build_and_solve() defaults on first call
+        if not hasattr(self, 'w_T'):
+            self.w_T = 1.0
+        if not hasattr(self, 'w_jx'):
+            self.w_jx = 1e-2
+        self.w_T  = float(rospy.get_param('~w_T',  self.w_T))
+        self.w_jx = float(rospy.get_param('~w_jx', self.w_jx))
+        ## IY : end
+        ## IY : end
+
+        # Resolve paths — folder structure fixed, filenames derived from state
         self.map_dir = os.path.abspath(os.path.join(_THIS_DIR, '..', 'maps', self.map_name))
-        # track is always <map>_3d_smoothed.csv
         self.track_csv = os.path.join(self.map_dir, f'{self.map_name}_3d_smoothed.csv')
-        # raceline: <map>_3d_<variant>_timeoptimal.csv
         self.raceline_csv = os.path.join(
-            self.map_dir, f'{self.map_name}_3d_{raceline_variant}_timeoptimal.csv')
-        self.vehicle_yml = os.path.join(_DATA_DIR, 'vehicle_params', vehicle_yml_file)
-        self.gg_path = os.path.join(_DATA_DIR, 'gg_diagrams', gg_dir_name, 'velocity_frame')
+            self.map_dir, f'{self.map_name}_3d_{self.raceline_variant}_timeoptimal.csv')
+        self.vehicle_yml = os.path.join(_DATA_DIR, 'vehicle_params', self.vehicle_yml_file)
+        self.gg_path = os.path.join(_DATA_DIR, 'gg_diagrams', self.gg_dir_name, 'velocity_frame')
 
         for p, label in [(self.track_csv, 'track csv'),
                          (self.raceline_csv, 'raceline csv'),
@@ -325,7 +524,7 @@ class VelOptNode:
             if not os.path.exists(p):
                 raise FileNotFoundError(f'{label} not found: {p}')
 
-        rospy.loginfo(f'[velopt] map={map_name}')
+        rospy.loginfo(f'[velopt] map={self.map_name}')
         rospy.loginfo(f'[velopt] track    : {self.track_csv}')
         rospy.loginfo(f'[velopt] raceline : {self.raceline_csv}')
         rospy.loginfo(f'[velopt] vehicle  : {self.vehicle_yml}')
@@ -334,13 +533,8 @@ class VelOptNode:
         with open(self.vehicle_yml) as f:
             self.vehicle_params = yaml.safe_load(f)['vehicle_params']
 
-        # Load track + gg ONCE at startup
+        # Track3D + grid step that exactly divides L_track for clean periodic closure
         self.track = Track3D(path=self.track_csv)
-        ### HJ : compute step_size that exactly divides the full track length
-        #       so the NLP grid covers [0, L_track) with uniform spacing and
-        #       the periodic boundary V[0] == V[N-1] corresponds to a real
-        #       loop closure at s=L_track ↔ s=0 (unlike the original
-        #       gen_global_racing_line.py which leaves a small unoptimized gap).
         L_track = float(self.track.s[-1] + self.track.ds)
         N_target = max(10, int(round(L_track / self.step_size_opt)))
         actual_step = L_track / N_target
@@ -348,10 +542,27 @@ class VelOptNode:
                       f'desired_step={self.step_size_opt:.4f}, '
                       f'actual_step={actual_step:.6f} (N={N_target})')
         self.track.resample(actual_step)
-        ### HJ : end
         self.gg = GGManager(gg_path=self.gg_path, gg_margin=self.gg_margin)
 
-        # Load fixed path from timeoptimal csv (n_opt, chi_opt)
+        ## IY(0416) : per-sector friction → multi-GGV
+        #   friction_sector_server가 rosparam에 설정한 sector별 friction 값을 읽어서
+        #   해당 friction = p_Dx_1 = p_Dy_1 인 GGV를 로드.
+        #   GGV 디렉토리: {base}_f{NNN}/velocity_frame/ (gg_tuner가 미리 생성)
+        with open(self.vehicle_yml) as _f:
+            _full_params = yaml.safe_load(_f)
+        _base_p_Dx_1 = _full_params.get('tire_params', {}).get('p_Dx_1', 0.56)
+        friction_sectors = _read_friction_sectors()
+        self.gg_list, self.gg_idx = _build_friction_gg_map(
+            friction_sectors, self.track.s.size, self.gg_path,
+            self.gg_margin, _base_p_Dx_1)
+        if self.gg_list is not None:
+            rospy.loginfo(f'[velopt] multi-GGV active: {len(self.gg_list)} GGVs, '
+                          f'base p_Dx_1={_base_p_Dx_1:.3f}')
+        else:
+            rospy.loginfo('[velopt] multi-GGV inactive (single GGV)')
+        ## IY(0416) : end
+
+        # Load fixed path (n_opt, chi_opt) + warm-start v/ax from timeoptimal csv
         rl = pd.read_csv(self.raceline_csv)
         s_rl = rl['s_opt'].to_numpy()
         n_rl = rl['n_opt'].to_numpy()
@@ -359,7 +570,6 @@ class VelOptNode:
         v_rl = rl['v_opt'].to_numpy() if 'v_opt' in rl.columns else None
         ax_rl = rl['ax_opt'].to_numpy() if 'ax_opt' in rl.columns else None
 
-        # Resample onto NLP grid (track.s)
         s_period = s_rl[-1] + (s_rl[-1] - s_rl[-2])
         s_q = self.track.s % s_period
         self.n_fixed = np.interp(s_q, s_rl, n_rl)
@@ -371,61 +581,82 @@ class VelOptNode:
         rospy.loginfo(f'[velopt] fixed n  : [{self.n_fixed.min():.3f}, {self.n_fixed.max():.3f}] m')
         rospy.loginfo(f'[velopt] fixed chi: [{self.chi_fixed.min():.3f}, {self.chi_fixed.max():.3f}] rad')
 
-        # Solve NLP ONCE at startup (no topic input needed for dynamics)
         self._solve_once()
-
-        # Latched publisher on /global_waypoints
-        self.pub = rospy.Publisher('/global_waypoints', WpntArray, queue_size=1, latch=True)
-
-        # Subscribe to /global_waypoints only to grab the message template (path fields).
-        # We overwrite vx_mps, ax_mps2 and republish to the same topic.
-        self._processed = False
-        self.sub = rospy.Subscriber('/global_waypoints', WpntArray, self._cb, queue_size=1)
-        rospy.loginfo('[velopt] waiting for /global_waypoints template message ...')
+    ## IY : end
 
     def _solve_once(self):
         """Run the reduced-state NLP once using csv-based fixed path."""
-        rospy.loginfo('[velopt] solving NLP ...')
+        rospy.loginfo(
+            f'[velopt] solving NLP ... (w_T={self.w_T}, w_jx={self.w_jx}, '
+            f'V_min={self.V_min}, gg_margin={self.gg_margin})')
+        # --- (기존 build_and_solve 호출, 보존용 주석) ---
+        # self.V_opt, self.ax_opt, laptime, success = build_and_solve(
+        #     track=self.track, gg=self.gg, vehicle_params=self.vehicle_params,
+        #     n_fixed=self.n_fixed, chi_fixed=self.chi_fixed,
+        #     v_init=self.v_init, ax_init=self.ax_init, V_min=self.V_min,
+        #     w_T=self.w_T, w_jx=self.w_jx,
+        # )
+        # --- (원본 끝) ---
+        ## IY(0416) : pass gg_list/gg_idx for multi-GGV friction support
         self.V_opt, self.ax_opt, laptime, success = build_and_solve(
             track=self.track, gg=self.gg, vehicle_params=self.vehicle_params,
             n_fixed=self.n_fixed, chi_fixed=self.chi_fixed,
             v_init=self.v_init, ax_init=self.ax_init, V_min=self.V_min,
+            w_T=self.w_T, w_jx=self.w_jx,
+            gg_list=self.gg_list, gg_idx=self.gg_idx,
         )
+        ## IY(0416) : end
         rospy.loginfo(f'[velopt] laptime={laptime:.4f}s  '
                       f'V range [{self.V_opt.min():.2f}, {self.V_opt.max():.2f}] m/s  '
                       f'success={success}')
 
+    ## IY : _cb — simplified. Caches latest template msg and delegates publish
+    #       to _publish_solution. After first receive we unregister to stop
+    #       re-ingesting our own output; reload_cb re-subscribes to pick up
+    #       newer templates (e.g. after raceline regen).
+    # --- (original _cb preserved below) ---
+    # def _cb(self, msg):
+    #     if self._processed: return
+    #     self._processed = True
+    #     self.sub.unregister()
+    #     <...publish inlined here...>
+    # --- (original end) ---
     def _cb(self, msg):
-        if self._processed:
-            return
-        self._processed = True
-        self.sub.unregister()
+        with self.process_lock:
+            if self._processed:
+                return
+            self._processed = True
+            try:
+                self.sub.unregister()
+            except Exception:
+                pass
+            self.last_wpnts_msg = msg
+            self._publish_solution(msg)
+    ## IY : end
 
+    ## IY : _publish_solution — build + publish output WpntArray from a
+    #       template msg and current self.V_opt / self.ax_opt.
+    #       Extracted from original _cb so reload_cb can reuse the same
+    #       periodic-wrap interp + template copy path.
+    def _publish_solution(self, msg):
         # Determine the message's own track length (for periodic wrap of our V_opt)
         s_msg = np.array([w.s_m for w in msg.wpnts], dtype=np.float64)
         L_msg = s_msg[-1] + (s_msg[-1] - s_msg[-2])  # total track length from wpnts spacing
 
-        ### HJ : build PERIODIC interpolation arrays for V_opt and ax_opt.
-        #       Our NLP enforced V[0] == V[N-1] at s = 0 and s = (N-1)*ds.
-        #       Map s_msg → s_query in [0, (N-1)*ds] by scaling: s_q = s_msg * (N-1)*ds / L_msg
-        #       Then interp against track.s (linear, no clamping artifacts at wrap).
-        N_nlp = self.track.s.size
-        s_nlp_max = self.track.s[-1]  # (N-1)*ds
-
-        # append wrap point: s = s_nlp_max + ds, V = V_opt[0]  (periodic closure)
+        # build PERIODIC interpolation arrays for V_opt and ax_opt.
+        # NLP enforces V[0] == V[N-1] at s = 0 and s = (N-1)*ds.
+        s_nlp_max = self.track.s[-1]
         ds_nlp = self.track.ds
         s_wrap = np.concatenate((self.track.s, [s_nlp_max + ds_nlp]))
         V_wrap = np.concatenate((self.V_opt, [self.V_opt[0]]))
         ax_wrap = np.concatenate((self.ax_opt, [self.ax_opt[0]]))
 
-        # scale s_msg into NLP s range (so that s_msg=0 → 0, s_msg=L_msg → s_nlp_max + ds_nlp)
         scale = (s_nlp_max + ds_nlp) / L_msg
         s_query = s_msg * scale
 
         V_out = np.interp(s_query, s_wrap, V_wrap)
         ax_out = np.interp(s_query, s_wrap, ax_wrap)
 
-        # Build output msg
         out = WpntArray()
         out.header = msg.header
         out.header.stamp = rospy.Time.now()
@@ -450,6 +681,58 @@ class VelOptNode:
         rospy.loginfo(f'[velopt] published /global_waypoints '
                       f'(msg L={L_msg:.2f}m, NLP L={s_nlp_max + ds_nlp:.2f}m, '
                       f'V[0]={V_out[0]:.2f}, V[-1]={V_out[-1]:.2f})')
+    ## IY : end
+
+    ## IY : /velopt/reload service callback.
+    #       Reloads rosparams, re-solves NLP, then re-subscribes to
+    #       /global_waypoints to grab a fresh template (handles the case
+    #       where Stage 3 raceline regen published a new geometry).
+    #       Falls back to cached last_wpnts_msg if no fresh message arrives.
+    def reload_cb(self, req):
+        rospy.loginfo('[velopt] /velopt/reload received')
+        try:
+            with self.process_lock:
+                # Re-read rosparams, reload files, re-solve NLP
+                self._load_and_solve()
+
+                # Re-subscribe: discard stale cache, wait for fresh latched msg
+                self._processed = False
+                try:
+                    self.sub.unregister()
+                except Exception:
+                    pass
+                self.sub = rospy.Subscriber(
+                    '/global_waypoints', WpntArray, self._cb, queue_size=1)
+                fresh_msg = None
+                try:
+                    fresh_msg = rospy.wait_for_message(
+                        '/global_waypoints', WpntArray, timeout=2.0)
+                except rospy.ROSException:
+                    pass
+                if fresh_msg is not None:
+                    self.last_wpnts_msg = fresh_msg
+                    # mark processed so _cb won't re-publish from the same msg
+                    self._processed = True
+                    try:
+                        self.sub.unregister()
+                    except Exception:
+                        pass
+                    self._publish_solution(fresh_msg)
+                    return TriggerResponse(
+                        success=True, message='reloaded with fresh template')
+                elif self.last_wpnts_msg is not None:
+                    self._publish_solution(self.last_wpnts_msg)
+                    return TriggerResponse(
+                        success=True, message='reloaded with cached template')
+                else:
+                    return TriggerResponse(
+                        success=False, message='no template message yet')
+        except Exception as e:
+            import traceback
+            rospy.logerr(f'[velopt] reload failed: {e}')
+            rospy.logerr(traceback.format_exc())
+            return TriggerResponse(success=False, message=str(e)[:200])
+    ## IY : end
 
 
 def main():
@@ -461,9 +744,14 @@ def main():
     # Track CSV is auto-derived from --map as "<map>_3d_smoothed.csv" inside
     # stack_master/maps/<map>/. Raceline CSV is auto-derived as
     # "<map>_3d_<raceline>_timeoptimal.csv" using --raceline below.
-    ap.add_argument('--map', required=True,
+    ## IY : --map no longer argparse-required; cold-start from gg_tuner_3d
+    #       provides it via rosparam (_map:=...). VelOptNode._load_and_solve()
+    #       reads ~map as override, so default here can be empty.
+    ap.add_argument('--map', default=None,
                     help='Map folder name under stack_master/maps/ (e.g. "eng_0410_v5"). '
-                         'Track csv is auto-derived as <map>_3d_smoothed.csv')
+                         'Track csv is auto-derived as <map>_3d_smoothed.csv. '
+                         'If omitted, ~map rosparam is used.')
+    ## IY : end
 
     # --- Shortcut: --racecar <name> sets all three (raceline, gg_dir, vehicle_yml)
     #     consistently to this name, unless they are individually overridden.
@@ -515,18 +803,21 @@ def main():
     # parse_known_args so ROS remapping args (__name:=, __log:=) don't choke argparse
     args, _ = ap.parse_known_args()
 
-    # --- Resolve racecar shortcut ---
-    # Priority for each of raceline / gg_dir / vehicle_yml:
-    #   (1) explicit --raceline / --gg_dir / --vehicle_yml flag
-    #   (2) --racecar <name> shortcut (builds consistent triplet)
-    #   (3) hardcoded default "rc_car_10th"
+    ## IY : argparse values are *initial* values only; VelOptNode._load_and_solve()
+    #       re-reads the same keys from rosparams (~map, ~racecar, ~V_min, ...)
+    #       before every solve, so gg_tuner_3d cold-starts can pass
+    #       "_map:=... _racecar:=..." and override these on-the-fly.
+    #       --map may be None here (cold-start path uses _map rosparam).
+    # --- Resolve racecar shortcut (fallback when rosparams are absent) ---
     _racecar = args.racecar or 'rc_car_10th'
     args.raceline    = args.raceline    or _racecar
     args.gg_dir      = args.gg_dir      or _racecar
     args.vehicle_yml = args.vehicle_yml or f'params_{_racecar}.yml'
+    map_name_init = args.map if args.map else ''  # empty str → _load_and_solve will read ~map
+    ## IY : end
 
     VelOptNode(
-        map_name=args.map,
+        map_name=map_name_init,
         raceline_variant=args.raceline,
         vehicle_yml_file=args.vehicle_yml,
         gg_dir_name=args.gg_dir,

@@ -1,0 +1,100 @@
+## IY : 튜닝 전용 파라미터 (params_rc_car_10th.yml 위에 override됨)
+##      값 변경 후 GG diagram 재계산 필요:
+##        python gen_gg_diagrams.py --vehicle_name rc_car_10th
+##        python gen_diamond_representation.py --vehicle_name rc_car_10th
+---
+# ── GG 크기 조절 (1순위) ──────────────────────────────────────────
+# lambda_mu_x: 종방향 grip 스케일 → 직선 가감속 한계
+#   올리면: 더 세게 가속/감속 가능
+#   내리면: 직선 보수적
+lambda_mu_x: 1.0    # 범위: 0.6 ~ 1.2
+
+# lambda_mu_y: 횡방향 grip 스케일 → 코너 속도 한계 (랩타임에 가장 큰 영향)
+#   올리면: 코너 더 빠르게
+#   내리면: 코너 더 안전하게
+lambda_mu_y: 1.0    # 범위: 0.6 ~ 1.2
+
+# ── 파워/속도 제한 ────────────────────────────────────────────────
+# P_max: 모터 최대 출력 [W] → 고속 직선 가속 cap
+#   V < ~10 m/s: grip이 먼저 걸려서 P_max 무관
+#   V > ~10 m/s: P_max로 가속 제한됨
+P_max: 300.0        # 범위: 150 ~ 300
+
+# v_max: 절대 최고속 [m/s] → 속도 ceiling
+v_max: 12.0          # 범위: 8 ~ 12
+
+# ── GG 형태 조절 (대각선) ─────────────────────────────────────────
+# p_Dx_2: 종방향 하중 의존성 → 코너 중 가감속 영역
+#   0에 가까울수록: combined grip 손실 없음 (낙관적)
+#   음수 클수록: 코너 중 가감속 제한 (보수적)
+p_Dx_2: 0.0        # 범위: -1.0 ~ 1.0 (물리적 정상은 ≤ 0)
+
+# p_Dy_2: 횡방향 하중 의존성 (위와 동일 효과, 횡방향)
+p_Dy_2: 0.0       # 범위: -1.0 ~ 1.0 (물리적 정상은 ≤ 0)
+
+# ── 차량 거동 ─────────────────────────────────────────────────────
+# epsilon: 전후 롤 강성 배분
+#   0.5: 중립 (전후 균등, ay_max 최대)
+#   < 0.5: 오버스티어 경향
+#   > 0.5: 언더스티어 경향
+epsilon: 0.5         # 범위: 0.3 ~ 0.7
+
+# ── NLP 제약 추가 (감속/가속도 제한) ─────────────────────────────
+# P_brake_max: 브레이크 최대 파워 [W] → 고속 감속 한계
+#   null이면 무제한 (현재 기본 동작)
+#   값 넣으면: 감속 시 F_brake * V <= P_brake_max 제약 추가
+#   저속은 grip-limited라 변화 없고, 고속일수록 감속 한계↓
+P_brake_max: 350.0   # 범위: 100 ~ 400 (null=무제한)
+
+# ax_max_cap: 가속 가속도 절대 상한 [m/s²]
+#   null이면 무제한 (타이어+파워로만 결정)
+#   값 넣으면: 모든 속도에서 ax <= ax_max_cap 강제
+ax_max_cap: null     # 범위: 3.0 ~ 10.0 (null=무제한)
+
+# ax_min_cap: 감속 가속도 절대 상한 [m/s²] (양수로 입력)
+#   null이면 무제한
+#   값 넣으면: 모든 속도에서 ax >= -ax_min_cap 강제
+ax_min_cap: null     # 범위: 3.0 ~ 10.0 (null=무제한)
+
+# ay_max_cap: 횡가속 절대 상한 [m/s²]
+#   null이면 무제한
+#   값 넣으면: 코너 통과속도 직접 제한 (V_corner = sqrt(ay_max_cap * R))
+ay_max_cap: null     # 범위: 3.0 ~ 10.0 (null=무제한)
+
+## IY : Diamond 후처리 파라미터 재설계
+##      - 기존: ax_scale (통합), gg_exp_override (NLP 무시)
+##      - 변경: ax_max_scale/ax_min_scale (분리), gg_exp_scale (NLP 존중)
+##      - 기본값: 전부 null (= 적용 안 함, NLP 결과 그대로)
+##      구현 위치: gen_diamond_representation.py (후처리 단계)
+##
+# ── Diamond 후처리: 형태 조절 (combined slip 영역) ────────────────
+# gg_exp_scale: NLP 피팅 exponent × scale, [1.0, 2.0] 범위로 clip
+#   null = NLP 그대로 (기본, 추천)
+#   0.85 = 약한 다이아몬드화 (lap time ~1.6% 손해, 실차 첫 테스트용)
+#   0.75 = 중간 (lap time ~3% 손해, 밀림 심각 시 권장 시작점)
+#   0.65 = 공격적 (lap time ~5% 손해)
+# 효과: 코너 진입/탈출 구간에서 combined slip 사용을 줄여 "가/감속
+#       타이밍 분리" 를 플래너가 자연스럽게 선택하도록 유도.
+#       NLP 의 V/g 별 variation 을 비례적으로 보존하므로 중력/속도에
+#       따른 자연스러운 차이는 유지됨.
+gg_exp_scale: null
+
+# ── Diamond 후처리: 가속/감속 독립 스케일 ────────────────────────
+# ax_max_scale: diamond ax_max (가속 방향) × scale
+#   null = NLP 그대로 (기본)
+#   < 1.0 = 가속 축소 → 코너 탈출 가속 시점 늦춰짐
+#   > 1.0 = 가속 공격화 (NLP 상한 초과, 주의)
+ax_max_scale: null       # 범위: 0.5 ~ 1.2
+
+# ax_min_scale: diamond ax_min (감속 방향) × scale
+#   null = NLP 그대로 (기본)
+#   < 1.0 = 감속 축소 → 코너 진입 브레이크 시점 일찍 당겨짐
+#   > 1.0 = 감속 공격화 (주의)
+ax_min_scale: null       # 범위: 0.5 ~ 1.2
+
+# ay_scale: diamond ay_max (횡가속) × scale
+#   null = NLP 그대로 (기본)
+#   < 1.0 = 코너 속도↓ (보수적)
+#   > 1.0 = 코너 속도↑ (공격적)
+ay_scale: null           # 범위: 0.5 ~ 1.2
+## IY : end
