@@ -14,7 +14,7 @@
        doc="Seconds to let speed/steering settle before recording."/>
   <arg name="record_sec"      default="5.0"
        doc="Seconds of steady-state recording per sweep point."/>
-  <arg name="poly_degree"     default="3"/>
+  <arg name="poly_degree"     default="5"/>
 
   <node pkg="stack_master" type="record_steering_bags.py"
         name="servo_calibration_recorder" output="screen">

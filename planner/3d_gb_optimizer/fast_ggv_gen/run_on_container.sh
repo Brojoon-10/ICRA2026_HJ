@@ -7,7 +7,7 @@ RESOLUTION="${2:---fast}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 source /opt/ros/noetic/setup.bash
-source /home/unicorn/catkin_ws/devel/setup.bash
+source /home/nuc3/catkin_ws/devel/setup.bash
 
 ## IY : opt-in tuning via TUNING=1 env var (default OFF)
 #       This var is either set by direct shell usage inside container,

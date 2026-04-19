@@ -5,10 +5,22 @@
   <arg name="LU_table" default="SRX1-0427" />
   <arg name="MAP_mode" default="safe" />
   <arg name="perception" default="False" />
-  <arg name="enable_planners" default="False" />
-  <arg name="enable_prediction" default="False" />
+  <arg name="enable_planners" default="True" />
+  <arg name="enable_prediction" default="True" />
   <arg name="dynamic_avoidance_mode" default="SQP" />
   <arg name="use_vd_prediction" default="False" />
+  <!-- ### HJ : when true, replace spliner / sqp / recovery_spliner with
+       sampling_based_planner_3d (state-aware OT + RECOVERY). Default false
+       keeps 2D-style planners wired as today. -->
+  <arg name="sampling_planner_enable" default="False" />
+  <!-- ### HJ : When empty, sampling_planner reads /map rosparam set by 3d_base_system.launch.
+       Set MAP_NAME env var to override. -->
+  <arg name="map_name" default="$(optenv MAP_NAME '')"
+       doc="Optional map override. Empty → sampling_planner reads /map rosparam set by 3d_base_system.launch." />
+  <!-- ### HJ : 3D physics model id (gg_diagrams + vehicle_params + time-optimal raceline).
+       Independent of racecar_version (hardware id). Default rc_car_10th_latest. -->
+  <arg name="vehicle_name" default="rc_car_10th"
+       doc="3D vehicle model id for gg_diagrams / params / raceline. NOT the same as racecar_version." />
 
   <param name="measure" value="False" />
 
@@ -44,6 +56,7 @@
   </group>
 
   <!-- ══════════════════ 3D PLANNERS (enable_planners:=True) ══════════════════ -->
+  <!-- ### HJ : legacy planners always active. sampling planner는 observation 전용으로 병렬 기동. -->
   <group if="$(arg enable_planners)">
 
     <!-- Planner tuning servers (rqt: dyn_planner_tuner/) -->
@@ -53,12 +66,13 @@
     </group>
 
     <!-- Recovery (3D) -->
-    <node pkg="recovery_spliner" type="3d_recovery_spliner_node.py" name="recovery_planner_spline" output="screen" />
+    <node pkg="recovery_spliner" type="3d_recovery_spliner_node.py" name="recovery_planner_spline"
+          output="screen" />
 
-    <!-- Start planner (unchanged) -->
+    <!-- Start planner -->
     <node pkg="spliner" type="start_spline_node_v2.py" name="start_planner" output="screen"/>
 
-    <!-- Static Avoidance (3D) -->
+    <!-- Static Avoidance (3D) — feeds /planner/avoidance/static_otwpnts (SMART_STATIC state) -->
     <node pkg="spliner" type="3d_static_avoidance_node.py" name="planner_spline" output="screen">
       <remap from="/planner/avoidance/otwpnts" to="/planner/avoidance/static_otwpnts"/>
     </node>
@@ -66,12 +80,27 @@
   </group>
 
   <!-- ══════════════════ DYNAMIC AVOIDANCE (3D SQP, enable_planners:=True) ══════════════════ -->
+  <!-- ### HJ : SQP owns /planner/avoidance/otwpnts. /sampling_planner/overtake publishes
+       to *_observation topics only until trajectory continuity is resolved. -->
   <group if="$(arg enable_planners)">
     <group if="$(eval dynamic_avoidance_mode == 'SQP')">
       <node pkg="sqp_planner" type="dynamic_sqp_server.py" name="dynamic_sqp_tuner_node" output="screen"/>
       <node pkg="sqp_planner" type="3d_sqp_avoidance_node.py" name="planner_sqp" output="screen"/>
       <node pkg="sqp_planner" type="update_waypoints.py" name="waypoint_updater" output="screen"/>
     </group>
+  </group>
+
+  <!-- ══════════════════ SAMPLING-BASED PLANNER 3D (observation-only) ══════════════════ -->
+  <!-- ### HJ : Observation-only until trajectory continuity is resolved. When
+       sampling_planner_enable:=true, /sampling_planner/{overtake,recovery} instances publish
+       to /planner/{avoidance/otwpnts,recovery/wpnts}_observation only. Actual driving is owned
+       by the legacy sqp / recovery_spliner planners. rqt_reconfigure groups both instances
+       under /sampling_planner/ for unified cost / sampling-grid tuning. -->
+  <group if="$(arg sampling_planner_enable)">
+    <include file="$(find sampling_based_planner_3d)/launch/sampling_planner_multi.launch">
+      <arg name="map_name"     value="$(arg map_name)"/>
+      <arg name="vehicle_name" value="$(arg vehicle_name)"/>
+    </include>
   </group>
 
   <!-- ══════════════════ GP PREDICTION (3D, enable_prediction:=True) ══════════════════ -->

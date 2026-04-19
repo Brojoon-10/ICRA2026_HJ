@@ -1,0 +1,69 @@
+# ============================================================
+# ### HJ : state_overtake.yaml
+# MPC planner — `~state:=overtake` preset.
+#
+# Purpose:
+#   Replaces spliner / SQP / static_avoidance / lane_change. Reference is
+#   raceline (/global_waypoints); avoidance emerges from NLP itself under
+#   the soft repulsive obstacle cost (Phase 3.5 Stage-1). Output topic
+#   (via launch remap): /planner/avoidance/otwpnts_observation
+#   (attach_to_statemachine:=false keeps it debug-only).
+#
+# Design deltas vs. observe:
+#   - w_contour ↓  — raceline pull is weakened so the solver can swing wide
+#                    for avoidance.
+#   - w_dsteering ↑ — lane-change must stay smooth.
+#   - boundary_inflation ↓ — corridor usable closer to edges.
+#   - ipopt_max_iter ↑     — NLP harder with obstacle terms, need more iters.
+#   - w_velocity will be dropped to 0.1 in Phase 4 (shape-first). For now
+#     the original 3.0 is kept so Phase 3 changes are isolated to cost
+#     reshaping + obstacle stubs.
+#
+# Obstacle terms (collision_mode / w_obstacle / obstacle_sigma / n_obs_max /
+# r_safe) become active once Phase 3.5 injects the repulsive cost into the
+# solver. Before then the node reads them but the solver ignores them.
+# ============================================================
+
+planner_freq: 30
+
+# Horizon
+N: 20
+dT: 0.05
+
+# Vehicle
+vehicle_L: 0.33
+
+# Limits
+# ### HJ : Phase 4 — min_speed=0 허용. velocity planner가 덮어쓰는 "형상 우선"
+# 솔버이므로 MPC 내부 속도 하한은 의미가 옅음. degeneracy 는 solver의
+# kinematic_v_eps + w_steer_reg 로 방어.
+max_speed: 10.0
+min_speed: 0.0
+max_steering: 0.6
+
+# Cost weights
+# ### HJ : Phase 4 — w_velocity ↓ (3.0→0.1), v_bias_max ↑ (1.5→3.0).
+# 속도는 2.5d vel planner가 덮어쓰니 tiny anchor만 유지. 형상 중심 cost.
+w_contour: 2.0       # ↓ (allow lateral deviation for avoidance)
+w_lag: 0.8
+w_velocity: 0.1
+v_bias_max: 3.0
+
+# Smoothness
+w_dv: 9.5
+w_dsteering: 20.0    # ↑ (smooth lane change)
+
+# Boundary
+boundary_inflation: 0.05
+w_slack: 2000.0
+
+# IPOPT
+ipopt_max_iter: 1000
+ipopt_print_level: 0
+
+# Obstacle cost (Phase 3.5 Stage-1)
+collision_mode: soft
+w_obstacle: 500.0
+obstacle_sigma: 0.35
+n_obs_max: 2
+r_safe: 0.35

@@ -13,6 +13,8 @@
   <arg name="smoothed_csv"     default="auto" />
   <arg name="raceline_csv"     default="auto" />
   <arg name="run_gg"           default="false" />
+  <!-- ### HJ : forward start_from to run_pipeline.sh so gg_tuner can skip steps 1~4 -->
+  <arg name="start_from"       default="1" />
 
   <!-- ── Step 0: GG diagram generation (optional, one-time per vehicle) ──── -->
   <node if="$(arg run_gg)"
@@ -25,5 +27,5 @@
   <node unless="$(arg run_gg)"
         pkg="global_line_3d" type="run_pipeline.sh" name="run_pipeline"
         output="screen"
-        args="--map-dir $(find stack_master)/maps/$(arg map) --track $(arg map) --vehicle $(arg vehicle) --gg-mode $(arg gg_mode) --safety-distance $(arg safety_distance) --bin-size $(arg bin_size) --smooth-step $(arg smooth_step) --opt-step $(arg opt_step) --output $(arg output) --raw-csv $(arg raw_csv) --gen3d-csv $(arg gen3d_csv) --smoothed-csv $(arg smoothed_csv) --raceline-csv $(arg raceline_csv)" />
+        args="--map-dir $(find stack_master)/maps/$(arg map) --track $(arg map) --vehicle $(arg vehicle) --gg-mode $(arg gg_mode) --safety-distance $(arg safety_distance) --bin-size $(arg bin_size) --smooth-step $(arg smooth_step) --opt-step $(arg opt_step) --output $(arg output) --raw-csv $(arg raw_csv) --gen3d-csv $(arg gen3d_csv) --smoothed-csv $(arg smoothed_csv) --raceline-csv $(arg raceline_csv) --start-from $(arg start_from)" />
 </launch>

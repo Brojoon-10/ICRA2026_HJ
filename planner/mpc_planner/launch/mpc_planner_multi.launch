@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!--
+  ### HJ : Two-instance bring-up for state-aware MPC planner.
+
+  Mirrors sampling_planner_multi.launch so both planners share the same
+  conventions. Both instances live under /mpc_planner namespace so
+  rqt_reconfigure groups them into one tree ("mpc_planner → overtake /
+  recovery"). Node names:
+
+    /mpc_planner/overtake  → /planner/avoidance/otwpnts_observation  (OTWpntArray)
+    /mpc_planner/recovery  → /planner/recovery/wpnts_observation     (WpntArray)
+
+  Observation-first (Phase 1~6). Legacy spliner / recovery_spliner still own
+  the live /planner/{avoidance/otwpnts, recovery/wpnts} topics consumed by
+  state_machine. Phase X flips attach_to_statemachine:=true to swap in the
+  real topic names.
+-->
+<launch>
+  <arg name="attach_to_statemachine" default="false"
+       doc="Phase X gate. false → publish to *_observation. true → overwrite real state_machine topics."/>
+
+  <!-- ### HJ : Per-instance enable flags. OT-only focus for now — recovery
+       kept wired but disabled by default so the two-instance topology stays
+       one-line away. Flip to true to run both in parallel. -->
+  <arg name="enable_overtake" default="true"/>
+  <arg name="enable_recovery" default="false"/>
+
+  <group ns="mpc_planner">
+    <include file="$(find mpc_planner)/launch/mpc_planner_state.launch"
+             if="$(arg enable_overtake)">
+      <arg name="state"                  value="overtake"/>
+      <arg name="instance_name"          value="overtake"/>
+      <arg name="attach_to_statemachine" value="$(arg attach_to_statemachine)"/>
+    </include>
+
+    <include file="$(find mpc_planner)/launch/mpc_planner_state.launch"
+             if="$(arg enable_recovery)">
+      <arg name="state"                  value="recovery"/>
+      <arg name="instance_name"          value="recovery"/>
+      <arg name="attach_to_statemachine" value="$(arg attach_to_statemachine)"/>
+    </include>
+  </group>
+</launch>

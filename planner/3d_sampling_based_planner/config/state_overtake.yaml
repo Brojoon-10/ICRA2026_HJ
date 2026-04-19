@@ -1,0 +1,60 @@
+# ### HJ : sampling_planner_state_node — OVERTAKE preset.
+# Loaded by sampling_planner_state.launch (state:=overtake) and mirrored as the
+# live target of rqt_reconfigure save_params / reset_params.
+
+rate_hz: 30.0
+frame_id: map
+
+# Horizon & sampling grid
+horizon:      1.0     # 1 s horizon matches the observation node; keep short for tight overtakes
+num_samples:  30
+n_samples:    11
+v_samples:    5
+
+# Safety / physics
+safety_distance: 0.20
+gg_abs_margin:   0.0
+gg_margin_rel:   0.0
+friction_check_2d: false
+s_dot_min:       2.5
+kappa_thr:       1.5
+relative_generation: true
+
+# Overtake: obstacle avoidance dominates; raceline looser; continuity strong.
+# ### HJ : Phase 2 splits "best lateral candidate" into three modes
+# (follow / ot_left / ot_right). The base cost weights below are shared across
+# modes — per-mode behavior is shaped by side_weight (target_n) +
+# progress_weight + hysteresis (see below).
+cost:
+  raceline_weight:   0.05
+  velocity_weight:   100.0
+  prediction_weight: 5000.0
+  continuity_weight: 50.0
+  boundary_weight:   100.0
+  safety_margin_m:   0.15      # keep-out band inside half-width
+  side_weight:       100.0     # mode-targeted lateral pull (only OT modes)
+  progress_weight:   5.0       # reward Σs (only OT modes; 0 for follow)
+  opp_pred_ttl_s:    0.5       # drop opponent predictions older than this
+
+# Mode hysteresis — mode-level decision lock to prevent left/right toggling
+# at high speed (PPC cannot follow oscillating reference).
+hysteresis:
+  ttl_s:       1.0     # minimum dwell time after a mode switch
+  margin:      0.3     # require new mode cost < (1-margin)*active mode cost
+  kappa_dot_max: 5.0   # PPC sanity warn threshold on |dκ/dt|
+
+# 1-pole EMA between ticks on (d, V). 1.0 = no filter, 0.0 = frozen.
+filter_alpha: 0.7
+
+# MPPI-style weighted blending — enabled by default to smooth argmin switches.
+mppi:
+  enable:          true
+  temperature_rel: 0.25
+  temporal_weight: 100.0
+
+# Uniform arc-length resampling of the output waypoints (matches race_stack ~0.1 m grid).
+resample_enable: true
+resample_ds_m:   0.1
+
+# OTWpntArray emission default — state machine reads this field to pick overtake side.
+ot_side_default: right

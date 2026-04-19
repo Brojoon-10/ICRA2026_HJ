@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!--
+  ### HJ : Two-instance bring-up for state-aware sampling planner.
+
+  Both instances live under the /sampling_planner namespace so rqt_reconfigure
+  groups them into one tree ("sampling_planner → overtake / recovery") instead
+  of two sibling roots. Node names:
+
+    /sampling_planner/overtake  → /planner/avoidance/otwpnts_observation  (OTWpntArray)
+    /sampling_planner/recovery  → /planner/recovery/wpnts_observation     (WpntArray)
+
+  ### HJ : Observation-only until trajectory continuity is resolved — legacy planners
+  (sqp / recovery_spliner) still own the live /planner/{avoidance/otwpnts, recovery/wpnts}
+  topics that state_machine subscribes to.
+
+  Map / vehicle names are read inside the node from /map and racecar_version
+  rosparams (set by 3d_base_system.launch). Pass map_name / vehicle_name args
+  below only to override those rosparams.
+-->
+<launch>
+  <arg name="map_name"     default=""
+       doc="Optional override. Empty → sampling_planner reads /map rosparam."/>
+  <arg name="vehicle_name" default=""
+       doc="Optional override. Empty → sampling_planner reads racecar_version rosparam."/>
+
+  <group ns="sampling_planner">
+    <include file="$(find sampling_based_planner_3d)/launch/sampling_planner_state.launch">
+      <arg name="state"         value="overtake"/>
+      <arg name="instance_name" value="overtake"/>
+      <arg name="output_topic"  value="/planner/avoidance/otwpnts_observation"/>
+      <arg name="map_name"      value="$(arg map_name)"/>
+      <arg name="vehicle_name"  value="$(arg vehicle_name)"/>
+    </include>
+
+    <include file="$(find sampling_based_planner_3d)/launch/sampling_planner_state.launch">
+      <arg name="state"         value="recovery"/>
+      <arg name="instance_name" value="recovery"/>
+      <arg name="output_topic"  value="/planner/recovery/wpnts_observation"/>
+      <arg name="map_name"      value="$(arg map_name)"/>
+      <arg name="vehicle_name"  value="$(arg vehicle_name)"/>
+    </include>
+  </group>
+</launch>

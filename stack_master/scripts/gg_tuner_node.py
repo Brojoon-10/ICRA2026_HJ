@@ -24,9 +24,7 @@ from std_srvs.srv import Trigger
 
 class GGTunerNode:
 
-    ### IY(0410) : 튜닝 대상 파라미터 키 분류
-    TIRE_KEYS = ['lambda_mu_x', 'lambda_mu_y', 'p_Dx_2', 'p_Dy_2']
-    ## IY : VEHICLE_KEYS 에 cap 포함, POST_KEYS + RACELINE_KEYS 신규
+    TIRE_KEYS = ['lambda_mu_x', 'lambda_mu_y', 'p_Dx_2', 'p_Dy_2', 'friction']
     VEHICLE_KEYS = ['P_max', 'v_max', 'epsilon',
                     'P_brake_max', 'ax_max_cap', 'ax_min_cap', 'ay_max_cap']
     CAP_KEYS = ['P_brake_max', 'ax_max_cap', 'ax_min_cap', 'ay_max_cap']
@@ -38,7 +36,6 @@ class GGTunerNode:
     def __init__(self):
         rospy.loginfo("[GGTuner] Initializing...")
 
-        ### IY(0410) : 경로 설정
         script_dir = os.path.dirname(os.path.abspath(__file__))
         race_stack_root = os.path.dirname(os.path.dirname(script_dir))
         self.race_stack_root = race_stack_root
@@ -47,17 +44,13 @@ class GGTunerNode:
             race_stack_root, 'planner', '3d_gb_optimizer', 'global_line', 'data')
         self.maps_dir = os.path.join(race_stack_root, 'stack_master', 'maps')
 
-        ## IY : fast_ggv_gen paths (primary GGV engine, legacy removed)
         self.fast_ggv_dir = os.path.join(
             race_stack_root, 'planner', '3d_gb_optimizer', 'fast_ggv_gen')
         self.fast_ggv_script = os.path.join(self.fast_ggv_dir, 'run_on_container.sh')
         self.fast_ggv_output_dir = os.path.join(self.fast_ggv_dir, 'output')
-        ## IY : end
 
-        ### IY(0410) : base vehicle 이름
         self.base_vehicle = rospy.get_param("~base_vehicle", "rc_car_10th")
 
-        ## IY : base params 로드 — fallback to _backup.yml if main is broken
         base_yml_path = os.path.join(
             self.data_path, 'vehicle_params',
             'params_' + self.base_vehicle + '.yml')
@@ -86,35 +79,24 @@ class GGTunerNode:
         self.available_maps = self._scan_maps_dir()
         rospy.loginfo(f"[GGTuner] Available maps ({len(self.available_maps)}): "
                       f"{self.available_maps}")
-        ## IY : end
 
-        ## IY : script existence warning
         if not os.path.exists(self.fast_ggv_script):
             rospy.logwarn(f"[GGTuner] fast_ggv script missing: {self.fast_ggv_script}")
         ## IY : end
 
-        ### IY(0410) : 상태 토픽 (latched)
         self.status_pub = rospy.Publisher(
             '/gg_compute_status', String, queue_size=5, latch=True)
         self.status_pub.publish(f"READY: {self.base_vehicle}")
 
-        ## IY : background pipeline state
         self.pipeline_thread = None
         self.pipeline_lock = threading.Lock()
         self.fbga_proc = None
-        ## IY : end
 
-        ## IY : cleanup hook
         rospy.on_shutdown(self._shutdown_cleanup)
-        ## IY : end
 
-        ### IY(0410) : dynamic_reconfigure 서버
         self.srv = Server(GGTunerConfig, self.reconfigure_cb)
         rospy.loginfo("[GGTuner] Ready. Use rqt_reconfigure → /gg_tuner")
 
-    # ==================================================================
-    # Cache / versioning helpers
-    # ==================================================================
     def _round_tuning(self, tuning_dict):
         return {k: round(v, 4) for k, v in sorted(tuning_dict.items())}
 
@@ -159,15 +141,17 @@ class GGTunerNode:
                     continue
                 max_ver = max(max_ver, int(suffix))
         return max_ver + 1
-
-    # ==================================================================
-    ## IY : unified merge — ALL keys in one yml
-    # ==================================================================
+    
     def _merge_all_params(self, tuning_dict):
         merged = copy.deepcopy(self.base_params)
         # NLP: tire
         for key in self.TIRE_KEYS:
             if key in tuning_dict:
+                if key == 'friction':
+                    fric_val = float(tuning_dict[key])
+                    merged['tire_params']['p_Dx_1'] = fric_val
+                    merged['tire_params']['p_Dy_1'] = fric_val
+                    continue
                 merged['tire_params'][key] = tuning_dict[key]
         # NLP: vehicle (caps: 0.0 → None)
         for key in self.VEHICLE_KEYS:
@@ -213,7 +197,6 @@ class GGTunerNode:
             json.dump(meta, f, indent=2, ensure_ascii=False)
         rospy.loginfo(f"[GGTuner] Meta saved: {meta_path}")
 
-    ## IY : latest 전용 헬퍼 (save_now 기반 스냅샷 워크플로우)
     def _write_latest_params_yml(self, merged_params):
         latest_yml = os.path.join(
             self.data_path, 'vehicle_params',
@@ -246,36 +229,98 @@ class GGTunerNode:
         return True
 
     def _snapshot_latest_to_version(self, tuning_dict=None):
+        map_name = rospy.get_param('/map', '')
+        sectors = self._read_friction_sectors(map_name)
+        n_sec = len(sectors)
+
+        ver = self._next_version()
+        version_prefix = f'{self.base_vehicle}_v{ver}'
+        rospy.loginfo(f"[GGTuner] ===== SAVE snapshot: {version_prefix} =====")
+        self.status_pub.publish(f"SAVING: {version_prefix}")
+
+        saved_frictions = set()  # dedup tracker
+
+        if n_sec > 0:
+            # Per-sector latest → v<N>_f<NNN> (unique friction dedup)
+            for i in range(min(n_sec, 5)):
+                sec_name = f'{self.base_vehicle}_latest_sec{i}'
+                sec_gg = os.path.join(
+                    self.data_path, 'gg_diagrams', sec_name)
+                sec_yml = os.path.join(
+                    self.data_path, 'vehicle_params',
+                    f'params_{sec_name}.yml')
+                if not os.path.exists(sec_gg):
+                    rospy.logwarn(
+                        f"[GGTuner] SAVE: latest_sec{i} missing → skip")
+                    continue
+                fric = float(sectors[i]['friction'])
+                fric_int = int(round(fric * 100))
+                if fric_int in saved_frictions:
+                    rospy.loginfo(
+                        f"[GGTuner] SAVE: sec{i} (f={fric:.3f}) already saved "
+                        f"as f{fric_int:03d} → skip")
+                    continue
+                snapshot_name = f'{version_prefix}_f{fric_int:03d}'
+                dst_gg = os.path.join(
+                    self.data_path, 'gg_diagrams', snapshot_name)
+                if os.path.exists(dst_gg):
+                    shutil.rmtree(dst_gg)
+                real_src = (os.path.realpath(sec_gg)
+                            if os.path.islink(sec_gg) else sec_gg)
+                shutil.copytree(real_src, dst_gg)
+                if os.path.exists(sec_yml):
+                    dst_yml = os.path.join(
+                        self.data_path, 'vehicle_params',
+                        f'params_{snapshot_name}.yml')
+                    shutil.copy2(sec_yml, dst_yml)
+                # meta
+                meta = {
+                    'vehicle_name': snapshot_name,
+                    'base_vehicle': self.base_vehicle,
+                    'friction': fric,
+                    'sector_index_source': i,
+                    'tuning': tuning_dict or {},
+                    'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                }
+                meta_path = os.path.join(dst_gg, 'params_used.json')
+                with open(meta_path, 'w') as f:
+                    json.dump(meta, f, indent=2, ensure_ascii=False)
+                saved_frictions.add(fric_int)
+                rospy.loginfo(f"[GGTuner] SAVED: {snapshot_name}")
+
+            if not saved_frictions:
+                rospy.logerr("[GGTuner] SAVE failed: no latest_sec<i> found")
+                self.status_pub.publish("SAVE_FAILED: no latest_sec")
+                return False
+
+            rospy.loginfo(
+                f"[GGTuner] SAVE done: {version_prefix} "
+                f"({len(saved_frictions)} unique frictions)")
+            self.status_pub.publish(f"SAVED: {version_prefix}")
+            return True
+
+        # Fallback: no sectors → legacy single-latest save
         latest_name = f'{self.base_vehicle}_latest'
         latest_gg = os.path.join(self.data_path, 'gg_diagrams', latest_name)
         latest_yml = os.path.join(self.data_path, 'vehicle_params',
                                   f'params_{latest_name}.yml')
         if not os.path.exists(latest_gg):
-            rospy.logerr(f"[GGTuner] SAVE failed: latest gg_diagrams missing: {latest_gg}")
+            rospy.logerr(f"[GGTuner] SAVE failed: {latest_gg} missing")
             self.status_pub.publish("SAVE_FAILED: no latest gg")
             return False
         if not os.path.exists(latest_yml):
-            rospy.logerr(f"[GGTuner] SAVE failed: latest yml missing: {latest_yml}")
+            rospy.logerr(f"[GGTuner] SAVE failed: {latest_yml} missing")
             self.status_pub.publish("SAVE_FAILED: no latest yml")
             return False
-
-        ver = self._next_version()
-        snapshot_name = f'{self.base_vehicle}_v{ver}'
-        rospy.loginfo(f"[GGTuner] ===== SAVE snapshot: {snapshot_name} =====")
-        self.status_pub.publish(f"SAVING: {snapshot_name}")
-
-        # 1) gg_diagrams 복사 (심볼릭이면 실제 타겟까지 따라감)
+        snapshot_name = version_prefix  # no friction tag when no sectors
         dst_gg = os.path.join(self.data_path, 'gg_diagrams', snapshot_name)
-        real_src = os.path.realpath(latest_gg) if os.path.islink(latest_gg) else latest_gg
+        real_src = (os.path.realpath(latest_gg)
+                    if os.path.islink(latest_gg) else latest_gg)
         shutil.copytree(real_src, dst_gg)
-
-        # 2) yml 복사
         dst_yml = os.path.join(self.data_path, 'vehicle_params',
                                f'params_{snapshot_name}.yml')
         shutil.copy2(latest_yml, dst_yml)
 
-        # 3) meta: latest 의 params_used.json 에서 tuning 을 가져와 vehicle_name 갱신,
-        #    없으면 인자로 받은 tuning_dict 로 새로 작성.
         latest_meta_path = os.path.join(latest_gg, 'params_used.json')
         meta = None
         if os.path.exists(latest_meta_path):
@@ -454,7 +499,6 @@ class GGTunerNode:
         return self._run_and_stream(cmd, tag='fast_ggv', timeout=600)
     ## IY : end
 
-    ## IY(0416) : friction sector별 GGV 병렬 생성
     def _read_friction_sectors(self, map_name):
         """Read friction sectors — rosparam first (live rqt values), yaml fallback."""
         # 1) try rosparam (set by friction_sector_server rqt)
@@ -496,73 +540,146 @@ class GGTunerNode:
             rospy.logwarn(f"[GGTuner] friction_scaling.yaml parse error: {e}")
             return []
 
-    def _generate_friction_ggvs(self, vehicle_name, sectors, full_resolution=False):
-        if not sectors:
-            return True
 
+    def _replace_dir(self, dst, src):
+        if os.path.islink(dst):
+            os.unlink(dst)
+        elif os.path.exists(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+
+    def _generate_sector_ggvs(self, vehicle_name, sectors, slot_overrides,
+                               full_resolution, run_ggv):
+
+        n_sec = len(sectors)
+        if n_sec == 0:
+            rospy.loginfo("[GGTuner] No sectors → skip sector-GGVs")
+            return True, "no_sectors"
+
+        # Warn about slots beyond n_sectors
+        for i in range(min(n_sec, 5), 5):
+            slot = (slot_overrides.get(i, '') or '').strip()
+            if slot:
+                rospy.logwarn(
+                    f"[GGTuner] ggv_sector{i}='{slot}' but n_sectors={n_sec} "
+                    f"→ slot ignored")
+
+        # Load base merged yml (for fresh-calc friction variants)
         base_yml = os.path.join(
             self.data_path, 'vehicle_params', f'params_{vehicle_name}.yml')
         if not os.path.exists(base_yml):
-            rospy.logwarn(f"[GGTuner] base yml not found: {base_yml}")
-            return False
+            rospy.logerr(f"[GGTuner] base yml not found: {base_yml}")
+            return False, "base_yml_missing"
         with open(base_yml) as f:
-            base_params = yaml.safe_load(f)
-        base_p_Dx_1 = base_params.get('tire_params', {}).get('p_Dx_1', 0.56)
+            base_merged = yaml.safe_load(f)
 
-        unique_frictions = sorted(set(s['friction'] for s in sectors))
-        to_generate = [f for f in unique_frictions
-                       if abs(f - base_p_Dx_1) > 1e-4]
+        fresh_cache = {}  # friction(float) → source vehicle_name (work dir)
+        workdir_names = []  # track for cleanup
 
-        if not to_generate:
-            rospy.loginfo("[GGTuner] All friction sectors match base p_Dx_1 "
-                          "→ no extra GGVs needed")
-            return True
+        ## IY : pre-populate cache with Stage 2's base latest to avoid recomputing
+        #       the same friction (base_friction == a sector friction).
+        base_friction = float(
+            base_merged.get('tire_params', {}).get('p_Dx_1', 0.56))
+        base_latest_gg = os.path.join(
+            self.data_path, 'gg_diagrams', vehicle_name)
+        if run_ggv and os.path.exists(base_latest_gg):
+            fresh_cache[base_friction] = vehicle_name
+            rospy.loginfo(
+                f"[GGTuner] cache pre-populate: f={base_friction:.3f} "
+                f"-> {vehicle_name} (skip re-compute)")
+        ## IY : end
 
-        rospy.loginfo(f"[GGTuner] Generating friction GGVs: {to_generate} "
-                      f"(base p_Dx_1={base_p_Dx_1:.3f})")
-        self.status_pub.publish(
-            f"FRICTION_GGV: {len(to_generate)} variants")
+        for i in range(min(n_sec, 5)):
+            sector = sectors[i]
+            fric = float(sector['friction'])
+            target_name = f"{self.base_vehicle}_latest_sec{i}"
+            target_gg = os.path.join(
+                self.data_path, 'gg_diagrams', target_name)
+            target_yml = os.path.join(
+                self.data_path, 'vehicle_params', f'params_{target_name}.yml')
+            slot = (slot_overrides.get(i, '') or '').strip()
 
-        threads = []
-        results = {}
-        for fric in to_generate:
-            fric_int = int(round(fric * 100))
-            fric_vehicle = f"{vehicle_name}_f{fric_int:03d}"
+            if slot:
+                # Restore from snapshot (always, regardless of run_ggv)
+                src_gg = os.path.join(self.data_path, 'gg_diagrams', slot)
+                src_yml = os.path.join(
+                    self.data_path, 'vehicle_params', f'params_{slot}.yml')
+                if not os.path.exists(src_gg):
+                    rospy.logerr(
+                        f"[GGTuner] sec{i} slot '{slot}' not found → FAIL")
+                    return False, f"slot_missing:{slot}"
+                self._replace_dir(target_gg, src_gg)
+                if os.path.exists(src_yml):
+                    shutil.copy2(src_yml, target_yml)
+                rospy.loginfo(
+                    f"[GGTuner] sec{i} (f={fric:.3f}): restored from {slot}")
+                continue
 
-            fric_params = copy.deepcopy(base_params)
-            fric_params['tire_params']['p_Dx_1'] = fric
-            fric_params['tire_params']['p_Dy_1'] = fric
-            fric_yml = os.path.join(
-                self.data_path, 'vehicle_params',
-                f'params_{fric_vehicle}.yml')
-            with open(fric_yml, 'w') as f:
-                yaml.dump(fric_params, f, default_flow_style=False,
-                          allow_unicode=True)
-            rospy.loginfo(f"[GGTuner] friction yml: {fric_yml} "
-                          f"(p_Dx_1={fric}, p_Dy_1={fric})")
+            # Empty slot
+            if not run_ggv:
+                if not os.path.exists(target_gg):
+                    rospy.logerr(
+                        f"[GGTuner] sec{i}: latest_sec{i} missing and "
+                        f"run_ggv=False → FAIL")
+                    return False, f"sec{i}_no_existing"
+                rospy.loginfo(
+                    f"[GGTuner] sec{i} (f={fric:.3f}): reusing existing "
+                    f"latest_sec{i}")
+                continue
 
-            def _run_one(vname, fval, res_dict):
-                ok = self._run_fast_ggv(vname, full_resolution)
-                if ok:
-                    ok = self._copy_to_gg_diagrams(vname)
-                res_dict[fval] = ok
+            # run_ggv=True → fresh calc (dedup per unique friction)
+            if fric not in fresh_cache:
+                fric_int = int(round(fric * 100))
+                work_vehicle = f"{self.base_vehicle}_workf{fric_int:03d}"
+                fric_params = copy.deepcopy(base_merged)
+                fric_params.setdefault('tire_params', {})
+                fric_params['tire_params']['p_Dx_1'] = fric
+                fric_params['tire_params']['p_Dy_1'] = fric
+                work_yml = os.path.join(
+                    self.data_path, 'vehicle_params',
+                    f'params_{work_vehicle}.yml')
+                with open(work_yml, 'w') as f:
+                    yaml.dump(fric_params, f, default_flow_style=False,
+                              allow_unicode=True)
+                rospy.loginfo(
+                    f"[GGTuner] sec{i} (f={fric:.3f}): fresh calc via "
+                    f"{work_vehicle}")
+                if not self._run_fast_ggv(work_vehicle, full_resolution):
+                    return False, f"fast_ggv_failed:{work_vehicle}"
+                if not self._copy_to_gg_diagrams(work_vehicle):
+                    return False, f"copy_failed:{work_vehicle}"
+                fresh_cache[fric] = work_vehicle
+                workdir_names.append(work_vehicle)
+            else:
+                rospy.loginfo(
+                    f"[GGTuner] sec{i} (f={fric:.3f}): reuse cached fresh "
+                    f"{fresh_cache[fric]}")
 
-            t = threading.Thread(target=_run_one,
-                                 args=(fric_vehicle, fric, results))
-            t.start()
-            threads.append(t)
+            # Copy cached fresh work dir → latest_sec<i>
+            src_name = fresh_cache[fric]
+            src_gg = os.path.join(self.data_path, 'gg_diagrams', src_name)
+            src_yml = os.path.join(
+                self.data_path, 'vehicle_params', f'params_{src_name}.yml')
+            self._replace_dir(target_gg, src_gg)
+            if os.path.exists(src_yml):
+                shutil.copy2(src_yml, target_yml)
 
-        for t in threads:
-            t.join()
+        # Cleanup intermediate work dirs
+        for work_name in workdir_names:
+            for path in [
+                os.path.join(self.data_path, 'gg_diagrams', work_name),
+                os.path.join(self.data_path, 'vehicle_params',
+                             f'params_{work_name}.yml')]:
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    elif os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
 
-        failed = [f for f, ok in results.items() if not ok]
-        if failed:
-            rospy.logerr(f"[GGTuner] Friction GGV failed for: {failed}")
-            return False
-
-        rospy.loginfo(f"[GGTuner] All friction GGVs generated: {to_generate}")
-        return True
-    ## IY(0416) : end
+        return True, "ok"
+    ## IY : end
 
     ## IY : raceline — passes safety_distance from rqt
     def _run_raceline(self, vehicle_name, map_name, safety_distance=0.20):
@@ -589,51 +706,6 @@ class GGTunerNode:
         return ok
     ## IY : end
 
-    ## IY : _run_fbga_planner 재작성 — hot-reload 우선, 실패 시 cold start.
-    #       원본 로직은 항상 cold restart 였음 (rosnode kill + sleep + Popen).
-    # --- (기존 _run_fbga_planner 원본, 보존용 주석) ---
-    # def _run_fbga_planner(self, vehicle_name, enable_mu=True):
-    #     rospy.loginfo(f"[GGTuner] [fbga] restarting: {vehicle_name}, enable_mu={enable_mu}")
-    #     self.status_pub.publish(f"FBGA_STARTED: {vehicle_name}")
-    #     try:
-    #         subprocess.run(['rosnode', 'kill', '/fbga_planner'],
-    #                        capture_output=True, timeout=5, check=False)
-    #         time.sleep(1)
-    #     except (subprocess.TimeoutExpired, FileNotFoundError):
-    #         pass
-    #     if self.fbga_proc is not None and self.fbga_proc.poll() is None:
-    #         try:
-    #             self.fbga_proc.terminate()
-    #             self.fbga_proc.wait(timeout=3)
-    #         except subprocess.TimeoutExpired:
-    #             self.fbga_proc.kill()
-    #     self.fbga_proc = None
-    #     gg_bin = os.path.join(
-    #         self.data_path, 'gg_diagrams', vehicle_name,
-    #         'velocity_frame', 'gg.bin')
-    #     params_yml = os.path.join(
-    #         self.data_path, 'vehicle_params',
-    #         'params_' + vehicle_name + '.yml')
-    #     if not os.path.exists(params_yml):
-    #         rospy.logerr(f"[GGTuner] params yml missing: {params_yml}")
-    #         self.status_pub.publish(f"FAILED_FBGA: {vehicle_name}")
-    #         return False
-    #     cmd = [
-    #         'rosrun', 'stack_master', 'fbga_velocity_planner.py',
-    #         '__name:=fbga_planner',
-    #         f'_gg_bin:={gg_bin}',
-    #         f'_params_yml:={params_yml}',
-    #         f'_enable_mu:={str(enable_mu).lower()}',
-    #     ]
-    #     rospy.loginfo(f"[GGTuner] [fbga] launching: {' '.join(cmd)}")
-    #     try:
-    #         self.fbga_proc = subprocess.Popen(cmd)
-    #         return True
-    #     except OSError as e:
-    #         rospy.logerr(f"[GGTuner] Failed to start FBGA: {e}")
-    #         self.status_pub.publish(f"FAILED_FBGA: {vehicle_name}")
-    #         return False
-    # --- (원본 끝) ---
     def _run_fbga_planner(self, vehicle_name, enable_mu=True, force_restart=False):
         rospy.loginfo(
             f"[GGTuner] [fbga] update: {vehicle_name}, enable_mu={enable_mu}, "
@@ -651,12 +723,10 @@ class GGTunerNode:
             self.status_pub.publish(f"FAILED_FBGA: {vehicle_name}")
             return False
 
-        # 파라미터 서버 갱신 (reload/cold start 양쪽 모두 사용)
         rospy.set_param('/fbga_planner/gg_bin', gg_bin)
         rospy.set_param('/fbga_planner/params_yml', params_yml)
         rospy.set_param('/fbga_planner/enable_mu', bool(enable_mu))
 
-        # --- hot-reload 우선 시도 ---
         if not force_restart:
             try:
                 rospy.wait_for_service('/fbga/reload', timeout=0.5)
@@ -730,126 +800,72 @@ class GGTunerNode:
                 rospy.loginfo(f"[GGTuner] options: {run_opts}")
                 self.status_pub.publish(f"STARTED: {self.base_vehicle}")
 
-                ## IY : 파이프라인은 항상 latest 에 덮어쓰기 (중간 v<N> 파일 생성 X).
-                #       v<N> 저장은 save_now 체크박스로만 수동 트리거됨 → _snapshot_latest_to_version.
-                # --- (기존 Stage 1/2 원본, 보존용 주석) ---
-                # if not run_opts['run_ggv']:
-                #     latest_link = os.path.join(
-                #         self.data_path, 'gg_diagrams',
-                #         f'{self.base_vehicle}_latest')
-                #     if os.path.exists(latest_link):
-                #         vehicle_name = os.path.basename(os.readlink(latest_link)) \
-                #             if os.path.islink(latest_link) else f'{self.base_vehicle}_latest'
-                #     else:
-                #         vehicle_name = self.base_vehicle
-                #     self.status_pub.publish(f"GGV_SKIP: {vehicle_name}")
-                # else:
-                #     cached_name = self._find_cached(tuning)
-                #     if cached_name is not None:
-                #         vehicle_name = cached_name
-                #         self.status_pub.publish(f"CACHED: {vehicle_name}")
-                #         self._save_params_yml(vehicle_name,
-                #                               self._merge_all_params(tuning))
-                #         self._update_dir_symlinks(vehicle_name)
-                #     else:
-                #         ver = self._next_version()
-                #         vehicle_name = f"{self.base_vehicle}_v{ver}"
-                #         merged = self._merge_all_params(tuning)
-                #         self._save_params_yml(vehicle_name, merged)
-                #         ok = self._run_fast_ggv(vehicle_name,
-                #                                 full_resolution=run_opts['full_resolution'])
-                #         if not ok: ... return
-                #         if not self._copy_to_gg_diagrams(vehicle_name): ... return
-                #         self._save_meta(vehicle_name, tuning)
-                #         self._update_dir_symlinks(vehicle_name)
-                #         self.status_pub.publish(f"GGV_DONE: {vehicle_name}")
-                # --- (원본 끝) ---
                 vehicle_name = f"{self.base_vehicle}_latest"
 
-                user_ggv = run_opts.get('ggv_name', '')
-                ggv_override_applied = False
-                if user_ggv:
-                    src_gg = os.path.join(
-                        self.data_path, 'gg_diagrams', user_ggv)
-                    if os.path.exists(src_gg):
-                        rospy.loginfo(
-                            f"[GGTuner] ggv_name='{user_ggv}' → restore to latest")
-                        if self._restore_to_latest(user_ggv):
-                            self.status_pub.publish(f"GGV_USER: {user_ggv}")
-                            ggv_override_applied = True
-                        else:
-                            rospy.logwarn(
-                                f"[GGTuner] ggv_name='{user_ggv}' restore failed "
-                                f"→ 기본 파이프라인 진행")
-                    else:
-                        rospy.logwarn(
-                            f"[GGTuner] ggv_name='{user_ggv}' not found at "
-                            f"{src_gg} → 기본 파이프라인 진행 (latest 사용)")
-
-                if ggv_override_applied:
-                    rospy.loginfo(
-                        f"[GGTuner] GGV override: skip Stage 2 "
-                        f"(using restored latest from '{user_ggv}')")
-                elif not run_opts['run_ggv']:
+                if not run_opts['run_ggv']:
                     latest_gg = os.path.join(
                         self.data_path, 'gg_diagrams', vehicle_name)
                     if not os.path.exists(latest_gg):
                         rospy.logerr(
-                            f"[GGTuner] latest gg_diagrams missing: {latest_gg}")
+                            f"[GGTuner] latest gg_diagrams missing: {latest_gg} "
+                            f"(run_ggv=False)")
                         self.status_pub.publish("FAILED: no latest")
                         return
                     rospy.loginfo(
-                        f"[GGTuner] GGV skip (run_ggv=False), using latest")
+                        f"[GGTuner] Stage 2 SKIP (run_ggv=False), reusing latest")
                     self.status_pub.publish(f"GGV_SKIP: {vehicle_name}")
                 else:
-                    cached_name = self._find_cached(tuning)
-                    if cached_name is not None:
-                        rospy.loginfo(
-                            f"[GGTuner] cache hit: {cached_name} → restore to latest")
-                        self.status_pub.publish(f"CACHED: {cached_name}")
-                        if not self._restore_to_latest(cached_name):
-                            self.status_pub.publish("FAILED: restore")
-                            return
-                        # params.yml latest 도 현재 tuning 으로 재기록 (merged 기준)
-                        self._write_latest_params_yml(self._merge_all_params(tuning))
-                    else:
-                        # ---- Cache miss: latest 에 직접 계산/저장 ----
-                        rospy.loginfo(
-                            f"[GGTuner] cache miss → compute fresh into latest")
-                        merged = self._merge_all_params(tuning)
-                        # 1) latest yml 먼저 기록 (fast_ggv 가 이걸 읽음)
-                        self._write_latest_params_yml(merged)
-                        # 2) fast_ggv 실행 (output/<latest_name>/ 에 생성)
-                        ok = self._run_fast_ggv(
-                            vehicle_name,
-                            full_resolution=run_opts['full_resolution'])
-                        if not ok:
-                            self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
-                            return
-                        # 3) fast_ggv output → gg_diagrams/latest/ 복사
-                        if not self._copy_to_gg_diagrams(vehicle_name):
-                            self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
-                            return
-                        # 4) meta 저장 (tuning 기록 — save 시 v<N> 로 복사됨)
-                        self._save_meta(vehicle_name, tuning)
-                        self.status_pub.publish(f"GGV_DONE: {vehicle_name}")
+                    rospy.loginfo(
+                        f"[GGTuner] Stage 2: compute fresh into latest "
+                        f"(friction={tuning.get('friction', '?')})")
+                    merged = self._merge_all_params(tuning)
+                    self._write_latest_params_yml(merged)
+                    ok = self._run_fast_ggv(
+                        vehicle_name,
+                        full_resolution=run_opts['full_resolution'])
+                    if not ok:
+                        self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
+                        return
+                    if not self._copy_to_gg_diagrams(vehicle_name):
+                        self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
+                        return
+                    self._save_meta(vehicle_name, tuning)
+                    self.status_pub.publish(f"GGV_DONE: {vehicle_name}")
                 ## IY : end
-
-                ## IY(0416) : Stage 2.5 — friction sector별 GGV 병렬 생성
-                if run_opts['run_ggv'] or ggv_override_applied:
-                    friction_sectors = self._read_friction_sectors(run_opts['map'])
-                    if friction_sectors:
-                        ok = self._generate_friction_ggvs(
-                            vehicle_name, friction_sectors,
-                            full_resolution=run_opts['full_resolution'])
-                        if ok:
-                            self.status_pub.publish(
-                                f"FRICTION_GGV_DONE: {vehicle_name}")
-                        else:
-                            rospy.logwarn(
-                                "[GGTuner] Friction GGV generation failed "
-                                "→ FBGA will use single GGV fallback")
-                ## IY(0416) : end
+                    
+                slot_overrides = {
+                    i: run_opts[f'ggv_sector{i}'] for i in range(5)
+                }
+                friction_sectors = self._read_friction_sectors(run_opts['map'])
+                ## IY : rqt sec_friction override (>0 overrides; no write-back)
+                for i, sec in enumerate(friction_sectors):
+                    if i >= 5:
+                        break
+                    rqt_fric = run_opts.get(f'sec_friction{i}', 0.0)
+                    if rqt_fric > 0.0:
+                        old_fric = sec.get('friction', 0.0)
+                        sec['friction'] = rqt_fric
+                        rospy.loginfo(
+                            f"[GGTuner] sec{i} friction override: "
+                            f"{old_fric:.3f} -> {rqt_fric:.3f} (rqt)")
+                ## IY : end
+                if friction_sectors:
+                    ok, reason = self._generate_sector_ggvs(
+                        vehicle_name, friction_sectors, slot_overrides,
+                        full_resolution=run_opts['full_resolution'],
+                        run_ggv=run_opts['run_ggv'])
+                    if not ok:
+                        rospy.logerr(
+                            f"[GGTuner] Stage 2.5 FAILED: {reason} "
+                            f"→ aborting apply")
+                        self.status_pub.publish(f"FAILED_STAGE25: {reason}")
+                        return
+                    self.status_pub.publish(
+                        f"SECTOR_GGV_DONE: {vehicle_name}")
+                else:
+                    rospy.loginfo(
+                        "[GGTuner] No sectors → single-GGV mode")
+                ## IY : end
 
                 # ---- Stage 3: raceline (optional) ----
                 if run_opts['regen_raceline']:
@@ -862,20 +878,6 @@ class GGTunerNode:
                 else:
                     rospy.loginfo(f"[GGTuner] raceline regen SKIP")
 
-                ## IY : Stage 4 재작성 — run_fbga=True 는 reload 우선, False 는 kill.
-                #       raceline 이 regen 된 경우(force_restart=True) cold start 강제
-                #       (reload는 캐시된 옛 wpnts 를 쓰므로 새 raceline 반영 불가).
-                # --- (기존 Stage 4 원본, 보존용 주석) ---
-                # if run_opts['run_fbga']:
-                #     ok = self._run_fbga_planner(vehicle_name,
-                #                                 enable_mu=run_opts['enable_mu'])
-                #     if not ok:
-                #         return
-                #     self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
-                # else:
-                #     rospy.loginfo(f"[GGTuner] fbga restart SKIP")
-                #     self.status_pub.publish(f"DONE: {vehicle_name}")
-                # --- (원본 끝) ---
                 if run_opts['run_fbga']:
                     force_restart = bool(run_opts['regen_raceline'])
                     ok = self._run_fbga_planner(
@@ -886,7 +888,6 @@ class GGTunerNode:
                         return
                     self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
                 else:
-                    # run_fbga=False → FBGA 노드 완전 종료
                     self._kill_fbga_planner()
                     rospy.loginfo(f"[GGTuner] fbga killed (run_fbga=False)")
                     self.status_pub.publish(f"DONE_FBGA_OFF: {vehicle_name}")
@@ -907,7 +908,7 @@ class GGTunerNode:
             if self.pipeline_thread is not None and self.pipeline_thread.is_alive():
                 rospy.logwarn(
                     "[GGTuner] SAVE ignored: pipeline running "
-                    "(apply 중간에 저장하면 불완전한 상태가 될 수 있음)")
+                    " ")
             else:
                 try:
                     self._snapshot_latest_to_version()
@@ -915,7 +916,6 @@ class GGTunerNode:
                     rospy.logerr(f"[GGTuner] SAVE exception: {e}")
                     self.status_pub.publish(f"SAVE_EXCEPTION: {str(e)[:80]}")
             config.save_now = False
-            # apply 가 같이 체크돼 있지 않으면 여기서 끝
             if not config.apply:
                 return config
         ## IY : end
@@ -933,7 +933,6 @@ class GGTunerNode:
         # collect ALL tuning parameters
         tuning = {k: config[k] for k in self.ALL_TUNING_KEYS}
 
-        ## IY : collect pipeline options
         run_opts = {
             'run_ggv':          bool(config.run_ggv),
             'full_resolution':  bool(config.full_resolution),
@@ -942,8 +941,19 @@ class GGTunerNode:
             'run_fbga':         bool(config.run_fbga),
             'enable_mu':        bool(config.enable_mu),
             'safety_distance':  float(config.safety_distance),
-            ### HJ : 사용자 지정 GGV 이름 (빈 문자열이면 latest 사용)
-            'ggv_name':         str(getattr(config, 'ggv_name', '')).strip(),
+            ## IY : Y1 mode — per-sector GGV slots (max 5)
+            'ggv_sector0':      str(getattr(config, 'ggv_sector0', '')).strip(),
+            'ggv_sector1':      str(getattr(config, 'ggv_sector1', '')).strip(),
+            'ggv_sector2':      str(getattr(config, 'ggv_sector2', '')).strip(),
+            'ggv_sector3':      str(getattr(config, 'ggv_sector3', '')).strip(),
+            'ggv_sector4':      str(getattr(config, 'ggv_sector4', '')).strip(),
+            ## IY : per-sector friction override (0=use yaml, >0=override)
+            'sec_friction0':    float(getattr(config, 'sec_friction0', 0.0)),
+            'sec_friction1':    float(getattr(config, 'sec_friction1', 0.0)),
+            'sec_friction2':    float(getattr(config, 'sec_friction2', 0.0)),
+            'sec_friction3':    float(getattr(config, 'sec_friction3', 0.0)),
+            'sec_friction4':    float(getattr(config, 'sec_friction4', 0.0)),
+            ## IY : end
         }
         ## IY : end
 

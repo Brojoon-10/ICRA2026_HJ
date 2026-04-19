@@ -1,15 +1,15 @@
 n_sectors: 2
 Static_Obs_sector0:
   start: 0
-  end: 225
+  end: 178
   s_start: 0.0
-  s_end: 22.47906972299521
+  s_end: 17.793322434460233
   name: sector_1
   static_obs_section: false
 Static_Obs_sector1:
-  start: 225
-  end: 639
-  s_start: 22.47906972299521
-  s_end: 63.84055801330643
+  start: 178
+  end: 765
+  s_start: 17.793322434460233
+  s_end: 76.47130147394432
   name: sector_2
   static_obs_section: false

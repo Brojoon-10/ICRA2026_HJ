@@ -146,22 +146,33 @@ class OppTrajPredictor:
         max_vel = max((wp.vx_mps for wp in self.wpnts_updated), default=10.0)
         if max_vel <= 1e-3:
             max_vel = 10.0
-        # OppWpnt has no z_m field; pull track-surface z from spline_z(s) so
-        # cylinders sit on the actual 3D surface instead of z=0.
-        s_arr = np.array([wp.s_m for wp in oppwpnts_list])
+        ### HJ : x,y,z를 모두 frenet2glob 3D service로 일관되게 받음.
+        # 기존에는 w.x_m/w.y_m(2D 값)과 self.converter.spline_z(s)(존재하지 않는 attr)
+        # 를 섞어 써서 교차 구간에서 z=0 fallback이 발동해 trajectory marker가 꼬였음.
+        # Frenet2GlobArr 응답은 (s,d)에서 x,y,z를 동일 3D spline으로 계산해주므로
+        # 같은 x,y에 여러 z가 겹치는 구간에서도 올바른 레이어 z가 나옴.
+        s_list = [wp.s_m for wp in oppwpnts_list]
+        d_list = [wp.d_m for wp in oppwpnts_list]
         try:
-            z_surface_arr = np.asarray(self.converter.spline_z(s_arr)).flatten()
-        except Exception:
-            z_surface_arr = np.zeros(len(s_arr))
+            resp = self.frenet2glob(s_list, d_list)
+            x_arr = np.asarray(resp.x).flatten()
+            y_arr = np.asarray(resp.y).flatten()
+            z_arr = np.asarray(resp.z).flatten()
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, f"[Opp. Pred.] frenet2glob viz fallback: {e}")
+            x_arr = np.array([wp.x_m for wp in oppwpnts_list])
+            y_arr = np.array([wp.y_m for wp in oppwpnts_list])
+            z_arr = np.zeros(len(s_list))
+        ### HJ : end
         for i in range(len(oppwpnts_list)):
             # Orange marks unobserved regions (proj_vs_mps is the
             # raceline-vx * 0.9 fallback, not a GP posterior).
             is_sentinel = not oppwpnts_list[i].is_observed
             marker_height = oppwpnts_list[i].proj_vs_mps / max_vel
             marker = Marker(header=rospy.Header(frame_id="map"), id=i, type=Marker.CYLINDER)
-            marker.pose.position.x = oppwpnts_list[i].x_m
-            marker.pose.position.y = oppwpnts_list[i].y_m
-            marker.pose.position.z = float(z_surface_arr[i]) + marker_height / 2
+            marker.pose.position.x = float(x_arr[i])
+            marker.pose.position.y = float(y_arr[i])
+            marker.pose.position.z = float(z_arr[i]) + marker_height / 2
             marker.pose.orientation.w = 1.0
             marker.scale.x = min(max(5 * oppwpnts_list[i].d_var, 0.07), 0.7)
             marker.scale.y = min(max(5 * oppwpnts_list[i].d_var, 0.07), 0.7)

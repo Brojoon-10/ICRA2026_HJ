@@ -392,6 +392,8 @@ class Controller_manager:
         friction = self._get_current_friction()
         self.controller.accel_lim_ax_max = rospy.get_param('dyn_controller/accel_lim_ax_max', 5.0) * friction
         self.controller.accel_lim_ay_max = rospy.get_param('dyn_controller/accel_lim_ay_max', 4.5) * friction
+        self.controller.accel_lim_horizon = rospy.get_param('dyn_controller/accel_lim_horizon', 0.3)
+        self.controller.accel_lim_lookahead = rospy.get_param('dyn_controller/accel_lim_lookahead', 0.3)
         ### HJ : end
 
         ### HJ : GP residual + yaw rate feedback from dyn_reconfigure
@@ -399,6 +401,8 @@ class Controller_manager:
         self.controller.gp_max_correction = rospy.get_param('dyn_controller/gp_max_correction', 0.05)
         self.controller.gp_uncertainty_thres = rospy.get_param('dyn_controller/gp_uncertainty_thres', 0.1)
         self.controller.K_yr = rospy.get_param('dyn_controller/K_yr', 0.0)
+        self.controller.K_yr_sat = rospy.get_param('dyn_controller/K_yr_sat', 0.05)
+        self.controller.K_us = rospy.get_param('dyn_controller/K_us', 0.0)
         ### HJ : end
 
         ### HJ : brake control params from dyn_reconfigure
@@ -425,7 +429,12 @@ class Controller_manager:
         self.speed_now = data.twist.twist.linear.x
         self.speed_now_y = data.twist.twist.linear.y
         self.controller.speed_now = self.speed_now
-        
+
+        ### HJ : yaw rate from odom (IMU /imu/data dead) — ENU, left+
+        self.yaw_rate = data.twist.twist.angular.z
+        self.controller.yaw_rate = self.yaw_rate
+        ### HJ : end
+
         # velocity for follow the gap (needed to set gap radius)
         self.ftg_controller.set_vel(data.twist.twist.linear.x)
         

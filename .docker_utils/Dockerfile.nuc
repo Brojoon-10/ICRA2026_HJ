@@ -2,7 +2,7 @@
 # Container Creation for the F110 race-stack at Center for Project Based Learning, ETH
 #
 
-FROM base_x86_nuc14:latest
+FROM base_x86_2nd_car:latest
 
 # update install_utils from host (base image may have stale version)
 ADD ./.devcontainer/.install_utils /.install_utils
