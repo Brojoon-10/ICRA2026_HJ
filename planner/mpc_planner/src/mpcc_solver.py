@@ -2,11 +2,7 @@
 Kinematic MPC Solver for planner use.
 
 Simplified from the original EVO-MPCC port (see mpcc_solver_original.py).
-This version removes s (arc-length) and p (progress) from the NLP since
-they are dead variables when the reference is pre-sliced by the caller
-(the solver's job is to track waypoint[k] at step k, not to decide
-progress).  LUTs are removed for the same reason: with pre-sliced
-reference, no symbolic interpolation in CasADi is needed.
+Reference is pre-sliced by the caller, so s/p/LUTs are removed.
 
 States:   [x, y, psi]   - position and heading
 Controls: [v, delta]    - forward speed and steering angle
@@ -16,18 +12,40 @@ Cost:
   - lag error (e_l / 0.5)^2
   - velocity tracking: w_velocity * ((v - ref_v) / v_bias_max)^2
   - control smoothness: w_dv, w_dsteering
+  - ### HJ : Phase 3.5 — per-step per-obstacle soft repulsive cost:
+      sum_o  w_obs_o * exp(-((x_k - ox)^2 + (y_k - oy)^2) / (2 sigma^2))
+    Obstacles are passed in as (n_obs_max, N, 3) = [ox, oy, w_obs].
+    Unused slots set w_obs = 0 AND coord = FAR_XY so they contribute
+    numerically zero.
+  - ### HJ : Phase 4.1 — tiny w_steer_reg * delta^2 regularizer so that
+    at v ≈ 0 the control delta still has a well-defined minimizer.
 
 Constraints:
-  - Dynamics: kinematic bicycle (Euler)
-  - Track boundary: single half-plane per step, from (left, right) pair
-  - Box: state/control bounds
+  - Dynamics: kinematic bicycle (Euler) with v_eff = v + kinematic_v_eps
+    so yaw-rate v/L * tan(delta) does not vanish identically at v=0.
+  - Track boundary: single half-plane per step, soft (slack).
+  - Box: state/control/slack bounds.
+
+Run-time mutators (no NLP rebuild):
+  - update_box_bounds(v_min, v_max, theta_max)  → lbx/ubx swap
+  - update_inflation(inflation)                 → caller-side ref slice only
+
+Run-time mutators (NLP rebuild):
+  - rebuild_nlp(**kwargs)  → any cost weight, ipopt_max_iter, obstacle_sigma.
 """
 
 import numpy as np
-from casadi import (MX, atan2, cos, sin, tan, vertcat, reshape, nlpsol)
+from casadi import (MX, atan2, cos, sin, tan, exp, vertcat, reshape, nlpsol)
 
 
 class MPCCSolver:
+
+    # ### HJ : Phase 3.5 — parameter-vector slot layout.
+    # Per step: [ref_x, ref_y, ref_dx, ref_dy, ref_v, bound_a, bound_b,
+    #            ox_0, oy_0, w_0,  ox_1, oy_1, w_1,  ...]
+    REF_BLOCK = 7      # reference (x, y, dx, dy, v, bound_a, bound_b)
+    OBS_BLOCK = 3      # per obstacle (ox, oy, w_obs)
+    FAR_XY = 1.0e4     # "obstacle at infinity" sentinel for unused slots
 
     def __init__(self, params):
         # Horizon
@@ -50,8 +68,15 @@ class MPCCSolver:
 
         # Boundary
         self.inflation = params.get('boundary_inflation', 0.1)
-        # Soft-boundary slack penalty (heavier = harder boundary)
         self.w_slack = params.get('w_slack', 1000.0)
+
+        # ### HJ : Phase 3.5 — obstacle cost
+        self.n_obs_max = int(params.get('n_obs_max', 2))
+        self.obstacle_sigma = float(params.get('obstacle_sigma', 0.35))
+
+        # ### HJ : Phase 4.1 — v→0 degeneracy guards
+        self.kinematic_v_eps = float(params.get('kinematic_v_eps', 0.05))
+        self.w_steer_reg = float(params.get('w_steer_reg', 1.0e-3))
 
         # IPOPT
         self.ipopt_max_iter = params.get('ipopt_max_iter', 200)
@@ -60,6 +85,9 @@ class MPCCSolver:
         # Dimensions
         self.n_states = 3    # x, y, psi
         self.n_controls = 2  # v, delta
+
+        # Per-step parameter block size (ref + obstacles)
+        self.STEP_BLOCK = self.REF_BLOCK + self.OBS_BLOCK * self.n_obs_max
 
         # State
         self.solver_nlp = None
@@ -70,11 +98,64 @@ class MPCCSolver:
         self.u0 = None
         self.warm = False
 
+        # Last-solve diagnostics
+        self.last_return_status = 'unset'
+        self.last_iter_count = -1
+        self.last_slack_max = 0.0
+        self.last_u_sol = None
+
     def setup(self):
         """Build the NLP. Call once after construction."""
         self._build_nlp()
         self.ready = True
 
+    # ----------------------------------------------------------------- rebuild
+    def rebuild_nlp(self, **kwargs):
+        """### HJ : Phase 5 — rebuild the NLP with updated weights/iter/sigma.
+
+        Called by dyn_reconfigure for knobs that bake into the symbolic NLP
+        (weights, sigma) or the nlpsol instance (ipopt_max_iter). Box bound
+        changes should prefer update_box_bounds(); this path is for true
+        structure/coef changes.
+        """
+        for key in ('w_contour', 'w_lag', 'w_velocity', 'v_bias_max',
+                    'w_dv', 'w_dsteering', 'w_slack',
+                    'obstacle_sigma', 'ipopt_max_iter',
+                    'kinematic_v_eps', 'w_steer_reg'):
+            if key in kwargs and kwargs[key] is not None:
+                setattr(self, key, type(getattr(self, key))(kwargs[key]))
+        # Invalidate warm start — symbolic coefficients changed, stale X0/u0
+        # can confuse IPOPT in the first restart.
+        self.warm = False
+        self._build_nlp()
+        self.ready = True
+
+    def update_box_bounds(self, v_min=None, v_max=None, theta_max=None):
+        """### HJ : Phase 5 — hot swap of v/δ box bounds (lbx/ubx only)."""
+        if v_min is not None:
+            self.v_min = float(v_min)
+        if v_max is not None:
+            self.v_max = float(v_max)
+        if theta_max is not None:
+            self.theta_max = float(theta_max)
+        if not self.ready:
+            return
+        ns = self.n_states
+        nc = self.n_controls
+        N = self.N
+        state_count = ns * (N + 1)
+        for k in range(N):
+            self.lbx[state_count:state_count + nc, 0] = [self.v_min, -self.theta_max]
+            self.ubx[state_count:state_count + nc, 0] = [self.v_max, self.theta_max]
+            state_count += nc
+
+    def update_inflation(self, inflation):
+        """Corridor inflation lives on the node side (used when slicing ref).
+        Solver just stores the current value so node can query via
+        solver.inflation."""
+        self.inflation = float(inflation)
+
+    # ----------------------------------------------------------------- build
     def _build_nlp(self):
         N = self.N
         ns = self.n_states
@@ -82,15 +163,13 @@ class MPCCSolver:
 
         X = MX.sym('X', ns, N + 1)
         U = MX.sym('U', nc, N)
-        # Slack variables for soft boundary (one per step, non-negative).
-        # Keeps the NLP always feasible: the solver may overshoot the track
-        # half-plane at the cost of a heavy quadratic penalty.
         SL = MX.sym('SL', N, 1)
-        # Per-step reference block:
-        #   [ref_x, ref_y, ref_dx, ref_dy, ref_v, bound_a, bound_b]
-        self.REF_BLOCK = 7
-        n_params = ns + self.REF_BLOCK * N
+
+        STEP_BLOCK = self.STEP_BLOCK
+        n_params = ns + STEP_BLOCK * N
         P = MX.sym('P', n_params)
+
+        inv_two_sigma2 = 1.0 / (2.0 * self.obstacle_sigma * self.obstacle_sigma)
 
         obj = 0
         g = []
@@ -103,7 +182,7 @@ class MPCCSolver:
             st_next = X[:, k + 1]
             con = U[:, k]
 
-            ref_idx = ns + self.REF_BLOCK * k
+            ref_idx = ns + STEP_BLOCK * k
             ref_x = P[ref_idx]
             ref_y = P[ref_idx + 1]
             t_dx = P[ref_idx + 2]
@@ -124,27 +203,43 @@ class MPCCSolver:
             # Velocity tracking
             obj += self.w_velocity * ((con[0] - ref_v) / self.v_bias_max) ** 2
 
+            # ### HJ : Phase 4.1 — steering regularizer (tiny; keeps v=0 sane)
+            obj += self.w_steer_reg * (con[1] ** 2)
+
             # Control smoothness
             if k < N - 1:
                 con_next = U[:, k + 1]
                 obj += self.w_dv * (con_next[0] - con[0]) ** 2
                 obj += self.w_dsteering * (con_next[1] - con[1]) ** 2
 
-            # Slack penalty (quadratic, large weight keeps boundary near-hard)
+            # Slack penalty (boundary softening)
             obj += self.w_slack * SL[k] ** 2
 
-            # Dynamics (Euler kinematic bicycle)
+            # ### HJ : Phase 3.5 — soft repulsive obstacle cost, evaluated at
+            # the *next* state so k=0 term already acts on the first predicted
+            # pose rather than the fixed initial state.
+            obs_base = ref_idx + self.REF_BLOCK
+            for o in range(self.n_obs_max):
+                ob = obs_base + self.OBS_BLOCK * o
+                ox = P[ob]
+                oy = P[ob + 1]
+                w_o = P[ob + 2]
+                dx = st_next[0] - ox
+                dy = st_next[1] - oy
+                obj += w_o * exp(-(dx * dx + dy * dy) * inv_two_sigma2)
+
+            # Dynamics (Euler kinematic bicycle with v_eff)
+            # ### HJ : Phase 4.1 — v_eff = v + eps so yaw-rate term stays
+            # alive when v → 0 (recovery / min_speed=0).
+            v_eff = con[0] + self.kinematic_v_eps
             st_next_euler = st + self.dT * vertcat(
                 con[0] * cos(st[2]),
                 con[0] * sin(st[2]),
-                (con[0] / self.L) * tan(con[1]),
+                (v_eff / self.L) * tan(con[1]),
             )
             g.append(st_next - st_next_euler)
 
             # Soft boundary: lo - slack <= bound_a*x - bound_b*y <= hi + slack
-            # Implemented as two inequalities with slack_k >= 0:
-            #   c - slack_k <= hi    (upper)
-            #   c + slack_k >= lo    (lower)
             c_expr = bound_a * st_next[0] - bound_b * st_next[1]
             g.append(c_expr - SL[k])   # upper side (ubg = hi)
             g.append(c_expr + SL[k])   # lower side (lbg = lo)
@@ -180,10 +275,11 @@ class MPCCSolver:
             self.ubx[state_count:state_count + nc, 0] = [self.v_max, self.theta_max]
             state_count += nc
 
-        # Slack bounds: slack_k >= 0, upper = +inf (no cap, penalty keeps it small)
+        # ### HJ : Phase 4.2 R6 — slack cap (2 m) so degenerate slack cannot
+        # blow up gradient; penalty still drives it to ~0 in healthy solves.
         for k in range(N):
             self.lbx[state_count, 0] = 0.0
-            self.ubx[state_count, 0] = 1e3
+            self.ubx[state_count, 0] = 2.0
             state_count += 1
 
         nlp = {'f': obj, 'x': OPT_variables, 'g': g, 'p': P}
@@ -200,7 +296,24 @@ class MPCCSolver:
         self.solver_nlp = nlpsol('solver', 'ipopt', nlp, opts)
         self.n_params = n_params
 
-    def solve(self, initial_state, ref_data):
+    # ----------------------------------------------------------------- solve
+    @staticmethod
+    def _coerce_obstacles(obstacles, n_obs_max, N):
+        """### HJ : Phase 3.5 — normalize obstacles arg to (n_obs_max, N, 3).
+
+        None / shape-mismatch → all-disabled slots (far + w=0).
+        """
+        arr = np.zeros((n_obs_max, N, 3), dtype=np.float64)
+        arr[:, :, 0] = MPCCSolver.FAR_XY
+        arr[:, :, 1] = MPCCSolver.FAR_XY
+        if obstacles is None:
+            return arr
+        obstacles = np.asarray(obstacles, dtype=np.float64)
+        if obstacles.shape != (n_obs_max, N, 3):
+            return arr
+        return obstacles
+
+    def solve(self, initial_state, ref_data, obstacles=None):
         """
         Args:
             initial_state: [x, y, psi]
@@ -210,6 +323,8 @@ class MPCCSolver:
                 right_points:  (>=N, 2)   right boundary points
                 ref_v:         (>=N,)     reference speeds
                 ref_dx, ref_dy: (>=N,)    reference tangent unit vector
+            obstacles: optional (n_obs_max, N, 3) ndarray with per-step
+                [ox, oy, w_obs]. Unused slots pass w_obs=0 and far coords.
 
         Returns:
             speed (u_0[0]), steering (u_0[1]), trajectory (N+1, 3), success
@@ -219,17 +334,21 @@ class MPCCSolver:
 
         N = self.N
         ns = self.n_states
+        nc = self.n_controls
 
-        # Yaw wrap-around (keep continuity with previous warm-start solution)
-        if self.warm:
-            delta_yaw = self.X0[1, 2] - initial_state[2]
-            if abs(delta_yaw) >= np.pi:
-                ceil_val = initial_state[2] + np.ceil(delta_yaw / (2 * np.pi)) * (2 * np.pi)
-                floor_val = initial_state[2] + np.floor(delta_yaw / (2 * np.pi)) * (2 * np.pi)
-                if abs(ceil_val - self.X0[1, 2]) < abs(floor_val - self.X0[1, 2]):
-                    initial_state[2] = ceil_val
-                else:
-                    initial_state[2] = floor_val
+        # ### HJ : Phase 4.2 R2 — unwrap against the last *solved* yaw, even
+        # on fresh warm starts where X0 was just seeded from the ref.
+        ref_yaw_anchor = self.X0[1, 2] if self.X0 is not None else initial_state[2]
+        delta_yaw = ref_yaw_anchor - initial_state[2]
+        if abs(delta_yaw) >= np.pi:
+            ceil_val = initial_state[2] + np.ceil(delta_yaw / (2 * np.pi)) * (2 * np.pi)
+            floor_val = initial_state[2] + np.floor(delta_yaw / (2 * np.pi)) * (2 * np.pi)
+            if abs(ceil_val - ref_yaw_anchor) < abs(floor_val - ref_yaw_anchor):
+                initial_state[2] = ceil_val
+            else:
+                initial_state[2] = floor_val
+
+        obs = self._coerce_obstacles(obstacles, self.n_obs_max, N)
 
         # Parameter vector
         p = np.zeros(self.n_params)
@@ -242,12 +361,10 @@ class MPCCSolver:
         ref_dx = ref_data['ref_dx']
         ref_dy = ref_data['ref_dy']
 
-        # Very large finite bounds (used in place of +/- inf so IPOPT's
-        # default bound-treatment stays numerically well-behaved).
         BIG = 1e6
 
         for k in range(N):
-            ref_idx = ns + self.REF_BLOCK * k
+            ref_idx = ns + self.STEP_BLOCK * k
             idx = min(k, len(center) - 1)
 
             p[ref_idx] = center[idx, 0]
@@ -266,15 +383,19 @@ class MPCCSolver:
             lo = min(val_r, val_l)
             hi = max(val_r, val_l)
 
-            # Layout per step: ns dynamics (lbg=ubg=0) + upper bnd + lower bnd
             base = ns + k * (ns + 2)
-            # Dynamics rows already zero-initialized.
-            # Upper side: (c - slack_k) <= hi, i.e. free below
             self.lbg[base + ns, 0] = -BIG
             self.ubg[base + ns, 0] = hi
-            # Lower side: (c + slack_k) >= lo, i.e. free above
             self.lbg[base + ns + 1, 0] = lo
             self.ubg[base + ns + 1, 0] = BIG
+
+            # ### HJ : Phase 3.5 — pack obstacle slots for step k.
+            obs_base = ref_idx + self.REF_BLOCK
+            for o in range(self.n_obs_max):
+                ob = obs_base + self.OBS_BLOCK * o
+                p[ob] = obs[o, k, 0]
+                p[ob + 1] = obs[o, k, 1]
+                p[ob + 2] = obs[o, k, 2]
 
         # Warm start
         if not self.warm:
@@ -282,8 +403,8 @@ class MPCCSolver:
 
         x_init = vertcat(
             reshape(self.X0.T, ns * (N + 1), 1),
-            reshape(self.u0.T, self.n_controls * N, 1),
-            np.zeros((N, 1)),  # slack warm start: zero (boundary satisfied)
+            reshape(self.u0.T, nc * N, 1),
+            np.zeros((N, 1)),
         )
 
         sol = self.solver_nlp(x0=x_init, lbx=self.lbx, ubx=self.ubx,
@@ -295,15 +416,16 @@ class MPCCSolver:
         self.last_iter_count = stats.get('iter_count', -1)
 
         state_end = ns * (N + 1)
-        ctrl_end = state_end + self.n_controls * N
+        ctrl_end = state_end + nc * N
         x_sol = reshape(sol['x'][:state_end], ns, N + 1).T
-        u_sol = reshape(sol['x'][state_end:ctrl_end], self.n_controls, N).T
+        u_sol = reshape(sol['x'][state_end:ctrl_end], nc, N).T
         slack_sol = np.array(sol['x'][ctrl_end:ctrl_end + N].full()).flatten()
         self.last_slack_max = float(np.max(slack_sol)) if slack_sol.size else 0.0
 
         speed = float(u_sol[0, 0])
         steering = float(u_sol[0, 1])
         trajectory = np.array(x_sol.full())
+        self.last_u_sol = np.array(u_sol.full())
 
         self.X0 = np.array(vertcat(x_sol[1:, :], x_sol[-1, :]).full())
         self.u0 = np.array(vertcat(u_sol[1:, :], u_sol[-1, :]).full())
@@ -340,7 +462,6 @@ class MPCCSolver:
             y_next = float(center[idx, 1])
             psi_next = float(np.arctan2(ref_dy[idx], ref_dx[idx]))
 
-            # Gentle initial speed guess (half of local ref, floor 1 m/s)
             init_speed = max(float(ref_v_arr[idx]) * 0.5, 1.0)
 
             dpsi = np.arctan2(
