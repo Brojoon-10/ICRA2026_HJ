@@ -350,8 +350,21 @@ class SQPAvoidance3DNode:
         self.obs_downsampled_min_dist = np.array([])
 
         for ob in considered_obs:
-            obs_idx_start = np.abs(s_avoidance - ob.s_start).argmin()
-            obs_idx_end = np.abs(s_avoidance - ob.s_end).argmin()
+            ### HJ : wrap-unwrap ob.s_end across lap boundary.
+            # Obstacle publisher emits s_start/s_end modulo scaled_max_s,
+            # so when the obstacle straddles s=0 the raw s_end < s_start.
+            # argmin on monotonic s_avoidance then gives obs_idx_end <
+            # obs_idx_start, and np.full(obs_idx_end - obs_idx_start + 1, ...)
+            # below crashes with "negative dimensions are not allowed".
+            # Unwrap s_end relative to s_start so downstream index math
+            # stays monotonic; no effect when s_end >= s_start already.
+            ob_s_start = ob.s_start
+            ob_s_end = ob.s_end
+            if ob_s_end < ob_s_start:
+                ob_s_end += self.scaled_max_s
+            ### HJ : end
+            obs_idx_start = np.abs(s_avoidance - ob_s_start).argmin()
+            obs_idx_end = np.abs(s_avoidance - ob_s_end).argmin()
 
             if obs_idx_start < len(s_avoidance) - 2:
                 if ob.is_static or obs_idx_end == obs_idx_start:

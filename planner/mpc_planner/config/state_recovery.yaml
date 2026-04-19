@@ -1,0 +1,64 @@
+# ============================================================
+# ### HJ : state_recovery.yaml
+# MPC planner — `~state:=recovery` preset.
+#
+# Scope note:
+#   Recovery-specific tuning is intentionally deferred. This preset mirrors
+#   state_observe.yaml so the recovery instance still runs in parallel
+#   (per plan — both overtake and recovery spin up together via
+#   mpc_planner_multi.launch) without taking focus while OT is being built
+#   out. Current OT-only workstream: Phase 3 → 3.5 → 4 → 5 → 6.
+#
+# Planned recovery-specific deltas (NOT applied yet — revisit in a later
+# phase once OT pipeline lands):
+#   - w_contour: 1.5       (was 3.9 in observe — allow overshoot back to line)
+#   - w_velocity: 0.5      (velocity secondary — priority is returning)
+#   - min_speed: 0.0       (stopping allowed; needs Phase 4 R4 regularizer)
+#   - boundary_inflation: 0.02  (use full corridor)
+#   - max_speed: 4.0
+#   - ipopt_max_iter: 1500
+#
+# Output topic (via launch remap): /planner/recovery/wpnts_observation
+# (attach_to_statemachine:=false keeps it debug-only).
+# ============================================================
+
+planner_freq: 30
+
+# Horizon
+N: 20
+dT: 0.05
+
+# Vehicle
+vehicle_L: 0.33
+
+# Limits (observe-equivalent; recovery-specific changes deferred)
+max_speed: 12.0
+min_speed: 0.5
+max_steering: 0.6
+
+# Cost weights
+w_contour: 3.9
+w_lag: 2.0
+w_velocity: 3.0
+v_bias_max: 1.0
+
+# Smoothness
+w_dv: 9.5
+w_dsteering: 14.0
+
+# Boundary
+boundary_inflation: 0.1
+w_slack: 1000.0
+
+# IPOPT
+ipopt_max_iter: 500
+ipopt_print_level: 0
+
+# Obstacle cost — recovery never injects obstacles by design (raceline
+# return only). Kept at 'none' so the solver skips the cost term regardless
+# of Phase 3.5 implementation details.
+collision_mode: none
+w_obstacle: 0.0
+obstacle_sigma: 0.35
+n_obs_max: 2
+r_safe: 0.35

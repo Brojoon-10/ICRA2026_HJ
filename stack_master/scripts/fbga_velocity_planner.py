@@ -66,8 +66,9 @@ class FBGAVelocityPlanner:
     def __init__(self):
         rospy.loginfo("[FBGA] Initializing...")
 
-        # === 경로 설정 (컨테이너 내부 절대경로) ===
-        race_stack = '/home/unicorn/catkin_ws/src/race_stack'
+        # === 경로 설정 ===
+        ### HJ : derive race_stack root from this script's path to avoid hardcoded /home/unicorn
+        race_stack = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
         self.fbga_bin = rospy.get_param(
             "~fbga_bin",
             os.path.join(race_stack, 'f110_utils', 'libs', 'FBGA', 'bin', 'GIGI_test_unicorn.exe'))
@@ -201,33 +202,41 @@ class FBGAVelocityPlanner:
             rospy.loginfo("[FBGA] No friction sectors → single GGV mode")
             return
 
-        # build per-waypoint friction (will be resized when waypoints arrive)
         self._friction_sectors_raw = sectors
 
-        # locate gg.bin per unique friction
-        gg_parent = os.path.dirname(self.gg_base_dir)  # gg_diagrams/
-        base_name = os.path.basename(self.gg_base_dir)  # rc_car_10th_latest
-        unique_frics = sorted(set(s['friction'] for s in sectors))
+        ## IY : sector-based lookup — gg_tuner 가 <base>_latest_sec<i>/ 로 저장.
+        #       old: per-friction-value lookup (<base>_fNNN/). preserved below.
+        # --- (original friction-value lookup, preserved) ---
+        # gg_parent = dirname(self.gg_base_dir); base_name = basename(...)
+        # unique_frics = sorted(set(s['friction'] for s in sectors))
+        # for fric in unique_frics: fric_bin = f"{base_name}_f{NNN}/.../gg.bin"
+        # --- (end) ---
+        gg_parent = os.path.dirname(self.gg_base_dir)
+        base_name = os.path.basename(self.gg_base_dir)
         all_found = True
-        for fric in unique_frics:
-            if abs(fric - self.base_p_Dx_1) < 1e-4:
-                self.friction_gg_bins[fric] = self.gg_bin
-                continue
-            fric_int = int(round(fric * 100))
-            fric_bin = os.path.join(gg_parent,
-                                    f'{base_name}_f{fric_int:03d}',
-                                    'velocity_frame', 'gg.bin')
-            if not os.path.exists(fric_bin):
-                rospy.logwarn(f"[FBGA] friction gg.bin not found: {fric_bin}")
+        for i, sec in enumerate(sectors):
+            fric = sec['friction']
+            if fric in self.friction_gg_bins:
+                continue  # same friction already mapped (sectors sharing fric)
+            sec_bin = os.path.join(
+                gg_parent, f'{base_name}_sec{i}',
+                'velocity_frame', 'gg.bin')
+            if not os.path.exists(sec_bin):
+                rospy.logwarn(
+                    f"[FBGA] sector GGV not found: {sec_bin}")
                 all_found = False
                 break
-            self.friction_gg_bins[fric] = fric_bin
+            self.friction_gg_bins[fric] = sec_bin
 
         if not all_found or len(self.friction_gg_bins) <= 1:
             self.friction_gg_bins = {}
-            rospy.loginfo("[FBGA] Friction GGVs incomplete → single GGV mode")
+            rospy.loginfo("[FBGA] Sector GGVs incomplete → single GGV mode")
         else:
-            rospy.loginfo(f"[FBGA] Multi-GGV friction: {self.friction_gg_bins}")
+            rospy.loginfo(
+                f"[FBGA] Multi-GGV (sector-based): "
+                f"{len(self.friction_gg_bins)} unique frictions across "
+                f"{len(sectors)} sectors")
+        ## IY : end
     ## IY(0416) : end
 
     def _read_g_range(self):

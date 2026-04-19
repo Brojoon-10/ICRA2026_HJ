@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<!--
+  ### HJ : Observation-only bring-up of the MPC planner.
+
+  Intended usage:
+    T1: roslaunch glim_ros glil_cpu.launch        # localization
+    T2: roslaunch stack_master 3d_base_system.launch
+    T3: roslaunch stack_master 3d_headtohead.launch   # legacy planners own live topics
+    T4: roslaunch mpc_planner mpc_planner_observation.launch   # THIS FILE
+
+  T4 spins up overtake + recovery MPC instances with attach_to_statemachine
+  forced to false. They publish only to:
+
+    /planner/avoidance/otwpnts_observation
+    /planner/recovery/wpnts_observation
+    /mpc_planner/{overtake,recovery}/best_trajectory_observation
+    /mpc_planner/{overtake,recovery}/best_sample
+    /mpc_planner/{overtake,recovery}/status
+    /mpc_planner/{overtake,recovery}/timing_ms
+
+  No state_machine rewiring. Kill T4 to stop observing; T3 is unaffected.
+  Phase X (gate) replaces this launch with a 3d_headtohead.launch arg that
+  swaps legacy planners out for MPC at the source.
+-->
+<launch>
+  <include file="$(find mpc_planner)/launch/mpc_planner_multi.launch">
+    <arg name="attach_to_statemachine" value="false"/>
+  </include>
+</launch>

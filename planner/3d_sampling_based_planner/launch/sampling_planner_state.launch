@@ -1,0 +1,57 @@
+<?xml version="1.0"?>
+<!--
+  ### HJ : State-aware sampling planner (single-instance template).
+
+  One instance = one (state, output_topic) pair.
+    state:=overtake  → publishes OTWpntArray on <output_topic or ~out/otwpnts>
+    state:=recovery  → publishes   WpntArray on <output_topic or ~out/wpnts>
+    state:=observe   → no role output, debug-only (same as original observe launch)
+
+  sampling_planner_multi.launch includes this twice (overtake + recovery) with
+  the appropriate output_topic remaps for 3d_state_machine_node subscriptions.
+
+  Map name is read by the node from the /map rosparam (set by
+  3d_base_system.launch via <param name="map" .../>). Paths are constructed as
+  stack_master/maps/<map>/<map>_3d_*.csv and global_line_3d/data/<vehicle>/...
+  The map_name / *_path args below are optional — set to override rosparam.
+-->
+<launch>
+  <arg name="state"          default="overtake"
+       doc="overtake | recovery | observe"/>
+  <!-- ### HJ : When launched via sampling_planner_multi.launch this is set to "overtake"/"recovery"
+       inside <group ns="sampling_planner">, producing node names /sampling_planner/overtake etc.
+       Kept the short form as default so standalone invocation also stays clean. -->
+  <arg name="instance_name"  default="$(arg state)"/>
+  <arg name="config_file"    default="$(find sampling_based_planner_3d)/config/state_$(arg state).yaml"/>
+  <arg name="output_topic"   default=""
+       doc="When non-empty, remaps the role-specific topic (~out/otwpnts or ~out/wpnts) here."/>
+
+  <!-- Optional overrides. Empty → node resolves from /map + racecar_version rosparams. -->
+  <arg name="map_name"       default=""
+       doc="Optional override. If empty, node reads /map rosparam set by 3d_base_system.launch."/>
+  <arg name="vehicle_name"   default=""
+       doc="Optional override. If empty, node reads 'racecar_version' rosparam."/>
+  <arg name="track_csv"      default=""/>
+  <arg name="raceline_csv"   default=""/>
+  <arg name="gg_dir"         default=""/>
+  <arg name="vehicle_params" default=""/>
+
+  <node pkg="sampling_based_planner_3d"
+        type="sampling_planner_state_node.py"
+        name="$(arg instance_name)"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)"/>
+    <param name="state"               value="$(arg state)"/>
+    <param name="instance_yaml"       value="$(arg config_file)"/>
+    <param name="map_name"            value="$(arg map_name)"/>
+    <param name="vehicle_name"        value="$(arg vehicle_name)"/>
+    <param name="track_csv_path"      value="$(arg track_csv)"/>
+    <param name="raceline_csv_path"   value="$(arg raceline_csv)"/>
+    <param name="gg_dir_path"         value="$(arg gg_dir)"/>
+    <param name="vehicle_params_path" value="$(arg vehicle_params)"/>
+
+    <!-- Role-specific topic remap. Only one of the two remaps applies per state. -->
+    <remap from="~out/otwpnts" to="$(arg output_topic)" if="$(eval arg('output_topic') != '' and arg('state') == 'overtake')"/>
+    <remap from="~out/wpnts"   to="$(arg output_topic)" if="$(eval arg('output_topic') != '' and arg('state') == 'recovery')"/>
+  </node>
+</launch>
