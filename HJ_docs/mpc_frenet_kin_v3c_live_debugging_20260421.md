@@ -1,7 +1,7 @@
 # MPC Frenet Kinematic — v3c live debugging 결과 (2026-04-21)
 
 - **작성일**: 2026-04-21
-- **상태**: v3c 핵심 3 fix + RViz tier-color + **HSL ma27 swap (solve_ms ~2× 가속)** 적용, live 검증 통과 (solver_pass=1: 1997/1997, solve_ms p99=48.6ms)
+- **상태**: v3c 핵심 3 fix + RViz tier-color + **HSL ma27 + CasADi JIT (solve_ms 누적 ~5× 가속, p50 9.3ms)** 적용, live 검증 통과 (solver_pass=1: 1997/1997, p99=32.5ms)
 - **선행 문서**: [mpc_redesign_frenet_kin_20260420.md](mpc_redesign_frenet_kin_20260420.md) (v1~v3b)
 - **남은 TODO**: obstacle cost의 차폭/장애물폭 body-edge 거리 기반 재정의 (본 문서 §5)
 
@@ -177,22 +177,26 @@
 |---|---|---|---|
 | `ipopt_max_iter` | 200 | max iter | v3b 1000→200. 실패 시 ~40ms 컷 (이전 ~210ms) |
 | `ipopt_print_level` | 0 | quiet | |
-| `linear_solver` | `ma27` | IPOPT 선형 솔버 (HSL) | **v3c+ (2026-04-21)**. MUMPS 대비 **solve_ms 약 2× 가속** (p50 45.5→21.6, p99 91.1→48.6ms). `mumps`로 설정하면 기본 복귀. libhsl.so는 `planner/3d_gb_optimizer/fast_ggv_gen/solver/setup_hsl.sh`가 빌드·심볼릭링크 |
+| `linear_solver` | `ma27` | IPOPT 선형 솔버 (HSL) | **v3c+ (2026-04-21)**. MUMPS→ma27 단독으로도 약 2×. libhsl.so 없을 때는 자동 mumps fallback (`_resolve_linear_solver`). |
+| `ipopt_jit` | `true` | CasADi JIT (obj/constr/Jac/Hess 네이티브 C 컴파일) | **v3c+ (2026-04-21)**. ma27 위에 얹어 추가 ~2×. 첫 런치 시 10~20s 컴파일 지연 (런타임 영향 없음). `false`로 끌 수 있음. |
 
-**apples-to-apples 비교 (same Gazebo scenario, 60s)**
+**apples-to-apples 누적 비교 (same Gazebo scenario, 60s)**
 
-| metric | MUMPS (1088 ticks) | **ma27 (1416 ticks)** | gain |
-|---|---|---|---|
-| solve_ms p50 | 45.5 | **21.6** | **2.11×** |
-| solve_ms p95 | 73.3 | **38.2** | 1.92× |
-| solve_ms p99 | 91.1 | **48.6** | 1.87× |
-| solve_ms max | 115.9 | **80.2** | 1.45× |
-| iter p50 / p95 | 16 / 18 | 16 / 18 | — (수렴 경로 불변) |
-| tick rate | 18.1 Hz | **23.6 Hz** | solve 단축분 → rate↑ |
-| traj n range | −0.90 ~ +1.10 | −0.91 ~ +1.22 | ≈ 동일 |
-| fails | 0 | 0 | — |
+| metric | MUMPS (1088 ticks) | ma27 only (1416) | **ma27 + JIT (1419)** | MUMPS → 최종 |
+|---|---|---|---|---|
+| solve_ms p50 | 45.5 | 21.6 | **9.3** | **4.9×** |
+| solve_ms p95 | 73.3 | 38.2 | **19.0** | 3.9× |
+| solve_ms p99 | 91.1 | 48.6 | **32.5** | 2.8× |
+| solve_ms max | 115.9 | 80.2 | **42.7** | 2.7× |
+| iter p50 / p95 | 16 / 18 | 16 / 18 | 16 / 17 | 동일 (수렴 경로 불변) |
+| jitter_rms p50 | 0.146 | 0.129 | 0.114 | 오히려 소폭 개선 |
+| traj n range | −0.90 ~ +1.10 | −0.91 ~ +1.22 | −0.91 ~ +1.22 | ≈ 동일 |
+| fails | 0 | 0 | 0 | — |
 
-iter 수 동일 + solve_ms 반 토막 → **linear-solve 자체가 빨라진 순수 효과**. 수치 품질 영향 없음.
+iter 수 불변 + solve_ms만 1/5 → **수치 품질 영향 없이 linear-solve + function-eval 둘 다 순수 가속**. p50 <10ms / max 42.7ms로 30Hz budget(33ms) 근접 진입.
+
+### HSL 미설치 환경 자동 fallback
+`_resolve_linear_solver`가 `linear_solver`를 검사해서 `ma*` 계열이면 `ca.__file__` 옆 `libhsl.so` 또는 `ctypes.CDLL('libhsl.so')`로 로드 가능성 검증. 실패 시 `warnings.warn(...)` + `mumps`로 자동 전환. 따라서 HSL 미설치 포크/환경에서도 **코드 수정 없이 동작**.
 
 ---
 

@@ -78,8 +78,55 @@ Outputs:
     success = bool
 """
 
+import os
+import ctypes
+import warnings
 import numpy as np
 import casadi as ca
+
+
+# ### HJ : v3c+ — linear_solver auto-fallback. HSL (ma27/ma57/ma77/ma86/ma97)
+# requires libhsl.so dlopen-able by IPOPT. libhsl.so is built by
+# planner/3d_gb_optimizer/fast_ggv_gen/solver/setup_hsl.sh. For users
+# without HSL, we silently fall back to MUMPS (bundled with CasADi).
+_HSL_NAMES = ('ma27', 'ma57', 'ma77', 'ma86', 'ma97')
+
+
+def _hsl_available():
+    """Probe whether libhsl.so is loadable. Checks the CasADi-local symlink
+    first (where setup_hsl.sh installs it), then ld-cache via ctypes."""
+    try:
+        ca_dir = os.path.dirname(ca.__file__)
+        cand = os.path.join(ca_dir, 'libhsl.so')
+        if os.path.exists(cand):
+            return True
+    except Exception:
+        pass
+    for name in ('libhsl.so', 'libcoinhsl.so'):
+        try:
+            ctypes.CDLL(name)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _resolve_linear_solver(requested):
+    req = (requested or 'mumps').strip().lower()
+    if req == 'mumps':
+        return 'mumps'
+    if req in _HSL_NAMES:
+        if _hsl_available():
+            return req
+        warnings.warn(
+            "[frenet_kin_solver] linear_solver=%r requested but libhsl.so "
+            "not loadable; falling back to 'mumps'. To enable HSL, run "
+            "planner/3d_gb_optimizer/fast_ggv_gen/solver/setup_hsl.sh "
+            "inside the Docker container." % req)
+        return 'mumps'
+    warnings.warn(
+        "[frenet_kin_solver] unknown linear_solver=%r; using 'mumps'." % req)
+    return 'mumps'
 
 
 SIDE_CLEAR = 0
@@ -159,9 +206,17 @@ class FrenetKinMPC:
         self.ipopt_max_iter = int(params.get('ipopt_max_iter', 1000))
         self.ipopt_print_level = int(params.get('ipopt_print_level', 0))
         # ### HJ : v3c+ — HSL ma27 2× faster than MUMPS on our sparsity.
-        # libhsl.so provided via solver/setup_hsl.sh (fast_ggv_gen). Falls
-        # back to mumps silently if HSL not loadable (warn-level log only).
-        self.linear_solver = str(params.get('linear_solver', 'ma27'))
+        # libhsl.so provided via solver/setup_hsl.sh (fast_ggv_gen). If HSL
+        # not installed, auto-fall back to mumps (probe below).
+        requested_solver = str(params.get('linear_solver', 'ma27'))
+        self.linear_solver = _resolve_linear_solver(requested_solver)
+        # ### HJ : v3c+ — CasADi JIT. Compiles obj/constraint/Jacobian/Hessian
+        # to native C at construct time (one-shot ~10-20s cold start). With
+        # HSL already absorbing most linear-solve cost, JIT targets the
+        # remaining function-eval cost. Set False to skip compile entirely.
+        self.ipopt_jit = bool(params.get('ipopt_jit', True))
+        self.ipopt_jit_flags = list(params.get(
+            'ipopt_jit_flags', ['-O3', '-march=native', '-ffast-math']))
 
         # runtime state
         self.n_obs_max = int(params.get('n_obs_max', 2))
@@ -359,13 +414,22 @@ class FrenetKinMPC:
              + J_cont + J_term + J_slack)
 
         opti.minimize(J)
-        opti.solver('ipopt', {
+        solver_opts = {
             'ipopt.max_iter':       self.ipopt_max_iter,
             'ipopt.print_level':    self.ipopt_print_level,
             'ipopt.linear_solver':  self.linear_solver,
             'print_time':           0,
             'ipopt.sb':             'yes',
-        })
+        }
+        # ### HJ : v3c+ — attach JIT (compile symbolic fns to native C).
+        if self.ipopt_jit:
+            solver_opts['jit'] = True
+            solver_opts['compiler'] = 'shell'
+            solver_opts['jit_options'] = {
+                'flags':   self.ipopt_jit_flags,
+                'verbose': False,
+            }
+        opti.solver('ipopt', solver_opts)
 
         self._opti = opti
         self._vars = dict(n=n_, mu=mu, v=v_, de=de,

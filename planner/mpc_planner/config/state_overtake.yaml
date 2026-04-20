@@ -87,8 +87,15 @@ ipopt_print_level: 0
 # ### HJ : v3c+ — HSL ma27 (2~3× faster than MUMPS on our sparsity).
 # libhsl.so path: /usr/local/lib/python3.8/dist-packages/casadi/libhsl.so
 # (symlink to fast_ggv_gen/solver/install/.../libcoinhsl.so, built by
-# setup_hsl.sh). Set to 'mumps' to revert.
+# setup_hsl.sh). Auto-falls back to 'mumps' with warning if libhsl.so not
+# loadable (see _resolve_linear_solver in frenet_kin_solver.py).
 linear_solver: ma27
+
+# ### HJ : v3c+ — CasADi JIT. Compiles IPOPT's symbolic functions
+# (objective / constraints / Jacobian / Hessian) to native C at solver
+# construction. Cold-start: +10-20s one-time compile. Runtime: extra
+# function-eval gain on top of HSL. Set 'ipopt_jit: false' to skip compile.
+ipopt_jit: true
 
 # Obstacle cost (Phase 3.5 Stage-1)
 # ### HJ : tuning 이력

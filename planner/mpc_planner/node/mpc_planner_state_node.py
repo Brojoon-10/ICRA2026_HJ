@@ -164,6 +164,9 @@ class MPCPlannerStateNode:
             # ### HJ : v3c+ — HSL ma27 swap. set '~linear_solver:=mumps' to revert.
             params['linear_solver'] = str(
                 rospy.get_param('~linear_solver', 'ma27'))
+            # ### HJ : v3c+ — CasADi JIT. compile-time cost ~10-20s, runtime
+            # function-eval gain on top of ma27's linear-solve gain.
+            params['ipopt_jit'] = bool(rospy.get_param('~ipopt_jit', True))
             self.solver = FrenetKinMPC(**params)
             self.n_obs_max = params['n_obs_max']
             self.wall_safe = params['wall_safe']
