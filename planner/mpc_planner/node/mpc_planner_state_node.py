@@ -161,6 +161,9 @@ class MPCPlannerStateNode:
             # ### HJ : v3b — solver-side ego half-width (was only in decider).
             params['ego_half_width'] = float(
                 rospy.get_param('~ego_half_width', 0.15))
+            # ### HJ : v3c+ — HSL ma27 swap. set '~linear_solver:=mumps' to revert.
+            params['linear_solver'] = str(
+                rospy.get_param('~linear_solver', 'ma27'))
             self.solver = FrenetKinMPC(**params)
             self.n_obs_max = params['n_obs_max']
             self.wall_safe = params['wall_safe']
