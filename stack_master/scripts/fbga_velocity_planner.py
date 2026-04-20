@@ -164,7 +164,6 @@ class FBGAVelocityPlanner:
         rospy.loginfo(f"[FBGA] gg.bin generated: nv={nv}, ng={ng}, size={os.path.getsize(bin_path)} bytes")
 
     def _convert_params_yml(self, yml_path):
-        """params YAML → params.txt (FBGA C++ runner 입력)"""
         with open(yml_path) as f:
             cfg = yaml.safe_load(f)
         vp = cfg['vehicle_params']
@@ -175,6 +174,8 @@ class FBGAVelocityPlanner:
             f.write(f"mu_x={tp['p_Dx_1']}\n")
             f.write(f"mu_y={tp['p_Dy_1']}\n")
             f.write(f"v_max={vp['v_max']}\n")
+        ## IY : cache v_max for publish-time hard clamp
+        self.v_max = float(vp['v_max'])
         rospy.loginfo(f"[FBGA] params.txt saved: m={vp['m']}, P_max={vp['P_max']}, v_max={vp['v_max']}")
 
     ## IY : resolve per-sector gg.bin (rosparam snapshot → legacy _sec<i> → default)
@@ -573,12 +574,16 @@ class FBGAVelocityPlanner:
             valid_ax = np.where(~ax_nan_mask)[0]
             ax_new[ax_nan_mask] = np.interp(np.where(ax_nan_mask)[0], valid_ax, ax_new[valid_ax])
 
+        ## IY : hard v_max clamp (belt-and-suspenders; GGV grid already saturates)
+        v_new = np.minimum(v_new, self.v_max)
+
         for i in range(n):
             wpnts[i].vx_mps = float(v_new[i])
             wpnts[i].ax_mps2 = float(ax_new[i])
 
         msg.wpnts = wpnts
-        rospy.loginfo(f"[FBGA] Publishing: v=[{v_new.min():.2f},{v_new.max():.2f}] m/s")
+        rospy.loginfo(f"[FBGA] Publishing: v=[{v_new.min():.2f},{v_new.max():.2f}] m/s "
+                      f"(v_max={self.v_max})")
         self.pub.publish(msg)
 
 
