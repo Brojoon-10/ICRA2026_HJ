@@ -29,7 +29,7 @@
 |---|---|---|---|---|
 | SQP (one-shot SLSQP) | 공용 | `planner/sqp_planner/src/3d_sqp_avoidance_node.py` | `/planner/avoidance/otwpnts` | 기본 활성, state_machine 직결 (베이스라인) |
 | **Sampling + MPPI** | **HJ** | `planner/3d_sampling_based_planner/node/sampling_planner_state_node.py` | `~out/otwpnts`, `~out/wpnts` | 코드 완성, **연속성 튜닝 진행 중** |
-| **MPCC (kinematic, 2D NLP + 3D lift)** | **HJ** | `planner/mpc_planner/node/mpc_planner_state_node.py` | `/planner/avoidance/otwpnts_observation` 등 | Phase 1 스켈레톤 완료, **Phase 2~5 진행** |
+| **MPCC → Frenet kinematic MPC** | **HJ** | `planner/mpc_planner/node/mpc_planner_state_node.py` | `/planner/avoidance/otwpnts_observation` 등 | **2026-04-20 재설계 완료 (코드+빌드), live-test 미완** |
 | Rolling-horizon (CasADi+IPOPT, 20Hz) | IY | `planner/overtaking_iy/src/overtaking_iy_node.py` | `/planner/rolling/otwpnts` | HJ 작업 범위 밖 — `IY_docs/TODO_HJ.md` 참조 |
 
 ---
@@ -54,17 +54,24 @@
 - [ ] **resample_ds_m** on/off 비교 (공간 등간격)
 - [ ] **tail-blending** 동작 확인 — `_pub_local_wpnts()` 내부 cosine ramp (end 1~2m) — observation 모드에서는 blending 없이 발행하는지 vs blend 버전 비교
 
-### 2.2 MPCC state-aware (mpc_planner_state_node)
-- [ ] **Phase 2 완료 확인** — `mpc_track3d_lifter.py`로 Wpnt의 `z_m, psi_rad, kappa_radpm, mu_rad, d_left, d_right` 정상 채워지는지 (Δz < 5cm vs `/global_waypoints`)
-- [ ] **Phase 3 — state별 preset**
-  - observe: 기본 mpcc_params.yaml
-  - overtake: raceline reference + obstacle 주입 전용 cost
-  - recovery: 현재 pose → raceline 복귀 arc
-- [ ] **Phase 4 — obstacle 주입** (SQP와 동일 입력 계약)
-  - `/opponent_prediction/obstacles`, `/opponent_trajectory`, `/tracking/obstacles` fusion + freshness 100ms
-  - soft repulsive cost 1차 → hard collision constraint 2차
-- [ ] **Phase 5 — 4단 fallback**: NLP OK → HOLD-LAST (s-shifted) → GEOMETRIC (복귀 arc) → RACELINE-SLICE. "절대 안 죽음" 보장
-- [ ] **Phase 9 메트릭**: Δκ RMS, corridor margin, solve_ms. 합격 시 Phase X에서 `_observation` suffix 제거 검토
+### 2.2 MPC 재설계 (Frenet kinematic + external side decider)
+
+> ⚠️ **2026-04-20 비상 재설계** — 기존 n(s)-only `frenet_d_solver` 백엔드가 벽 hug/tick 진동/속도 추적 실패. 상세: `HJ_docs/mpc_redesign_frenet_kin_20260420.md`.
+> 코드 + Docker 빌드까지 완료, **live-test 및 튜닝 미완**. 다음 세션 첫 할 일.
+
+- [x] **271-tick 진단** — `margin_L_min=-0.00`(wall_safe 미적용), `jitter_rms p95=0.24m`, `u0.v=6.7 vs ego.v=3.5` 괴리 확인
+- [x] **백업 규칙 적용** — solver/node/configs/launch `_backup_20260420` 접미사 보존 (롤백 가능)
+- [x] **FrenetKinMPC 솔버 구현** — `src/frenet_kin_solver.py`. state `[n, mu, v]`, control `[a, delta]`, Liniger 이산 동역학. hard corridor + slack, half-plane 장애물 제약, progress-maximization cost
+- [x] **SideDecider 구현** — `src/side_decider.py`. LEFT/RIGHT/TRAIL/CLEAR, hold_ticks=5 hysteresis
+- [x] **노드 와이어링** — `node/mpc_planner_state_node.py`에 `solver_backend=frenet_kin` 기본, `_decide_side`, `_lift_frenet_to_xy`(xy round-trip 없음)
+- [x] **Live debug 토픽** — `~debug/tick_json` (std_msgs/String), `~debug/markers` (MarkerArray). Claude가 rostopic echo로 실시간 모니터
+- [x] **launch 충돌 해소** — `instance_name` 기본값 `mpc_$(state)` → sampling의 `/overtake`와 분리
+- [ ] **Live smoke-test** — 3D 환경 기동 후 tick_json 합격선 (margin_L_min≥0.15, jitter_rms p95≤0.05, u0.v≈ego.v) 확인. **다음 세션 최우선**
+- [ ] **첫 solve infeasible 대응** — `_seed_warm_start` 초기 시드 품질 점검, 필요시 IPOPT iter 상한/warm-start 전략 튜닝
+- [ ] **state=observe/recovery 교차 검증** — 세 state 각각 한 번씩 돌려서 role output 동작 확인
+- [ ] **장애물 없을 때 SIDE_CLEAR 경로** — corridor-only 케이스 smooth 유지 (obs 주입 게이팅 확인)
+- [ ] **TRAIL per-k v cap** — 현재 `ref_v`만 의존, 장애물 가속/감속 예측은 미포함 (GP predictor 연결은 후순위)
+- [ ] **합격 시 Phase X 진입** — `_observation` suffix 제거, state_machine 직결 (사용자 승인 필수)
 
 ### 2.3 SQP (3d_sqp_avoidance_node) — 베이스라인 유지
 - [ ] **회귀 유지**: HJ 백엔드 튜닝 중 SQP가 여전히 gazebo_wall_2에서 무고장 동작하는지 정기 확인
@@ -115,7 +122,8 @@
 - HJ 집중 문서:
   - `HJ_docs/sampling_planner_state_machine_integration.md` — Sampling state-aware 통합 플랜
   - `HJ_docs/mpcc_planner_trial_v1.md` — MPCC 초기 포팅
-  - `HJ_docs/mpc_planner_state_machine_integration.md` — MPCC state-aware 통합 플랜
+  - `HJ_docs/mpc_planner_state_machine_integration.md` — MPCC state-aware 통합 플랜 (기존 Phase 계획, 재설계로 일부 대체됨)
+  - **`HJ_docs/mpc_redesign_frenet_kin_20260420.md` — Frenet kinematic MPC 재설계 (현행)**
   - `HJ_docs/3d_dynamic_prediction_and_planner.md` — 3D prediction + SQP 포팅 (베이스라인 참고)
 - IY 작업분 (HJ는 참고만):
   - `IY_docs/rolling_horizon_overtake_planner.md`, `IY_docs/TODO_HJ.md`
