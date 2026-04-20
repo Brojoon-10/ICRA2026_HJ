@@ -1,7 +1,7 @@
 # Sampling Planner 꼬불거림 (Wobble) 진단 + 다음 세션 복귀 가이드
 
-- **작성일**: 2026-04-20 (비상 스냅샷) / **갱신 2026-04-21 (rate constraint fix 적용 완료)**
-- **상태**: 진단 완료 / **L1+B-plan+velocity-aware cap+rate-constraint-with-hold 모두 적용**. 30s live 회귀: `|Δn_end|` max=0.120m (rate_cap 정확히), p95=0.075m, **0% violation**. margin≥0.449m 유지, solve<60ms. 다음 작업: MPCC tracker 붙이기.
+- **작성일**: 2026-04-20 (비상 스냅샷) / **갱신 2026-04-21 (rate constraint fix + shifted-raceline refactor 완료 → 늦은 오후: soft-relax rate penalty + smootherstep blend + marker lifetime)**
+- **상태**: 진단 완료 / **L1+B-plan+velocity-aware cap+rate-constraint-with-hold + shifted-raceline connector + soft-relax rate + C² smootherstep + marker lifetime 0.2s 모두 적용**. 20s live 회귀 (soft-relax): rollback 0/463 (0.0%), timing total_ms p99=44.7ms, best_idx changes 55.4%, `/best_sample/markers` 30Hz 안정. 다음 작업: **n 방향 샘플 개수 ↑, 범위 좁게, cost로 유도**.
 - **대상 노드**: `planner/3d_sampling_based_planner/node/sampling_planner_state_node.py`
   + `planner/3d_sampling_based_planner/src/sampling_based_planner.py`
 - **테스트 맵/모드**: `gazebo_wall_2` sim, HJ 모드, `state:=overtake`
@@ -285,3 +285,140 @@ state = {..., 'n_start': n_now, 'n_dot': n_dot_start, 'n_ddot': 0.0, ...}
 **제외** (다른 세션/다른 작업자 것): `planner/mpc_planner/`, `stack_master/maps/`, `f110_utils/`, submodule 들, `IY_docs/`, `HJ_docs/backup/`, `HJ_docs/debug/`, `HJ_docs/mpc_planner_state_machine_integration.md`, `planner/3d_gb_optimizer/`, etc. HJ 세션 내 sampling 작업분만 선별.
 
 참고: `SamplingCost.cfg` / `state_overtake.yaml` / `debug_log/.gitignore` 도 modified로 찍히는데, 이번 세션 이전에 이미 건드린 것으로 보임 (diff 내용 확인 후 sampling fix 세션에서 같이 정리 예정). 비상 스냅샷엔 포함하지 않음 → 다음 세션에서 명확히 추적 후 commit.
+
+---
+
+## 2026-04-21 후속 수정 2: Shifted-raceline + Hermite connector sampling
+
+### 배경
+Rate constraint + hold-snapshot 으로 wobble은 잡혔지만, 근본 표현(quintic BVP in time)이
+boundary chi/n_ddot 혼합 + time-domain 3차 도함수 제약이라 candidate 모양이 raceline과
+"비슷하지만 다른 다항식" 이었음. 사용자 지시:
+
+> "d 방향 변화는 고를때마다 순간이동하면 안돼. 제약으로 부드럽게 전환되게 해야지."
+> "글로벌 레이스라인과 비슷하게 생긴 경로에 부드럽게 이어주는궤적이 샘플링 되는게 맞아?"
+> "n은 그렇게 하고 s를 기존처럼 v기반으로 주고, 거기까지 이어지는걸 내 위치와 헤딩 고려한
+>  recovery method로 샘플링해서 그중에 고르게 한다면?"
+
+→ **Quintic BVP 를 버리고, 각 candidate = [ego → Hermite connector → 평행이동된 raceline tail]
+구조로 전면 교체**. (recovery_spliner 의 BPoly 스타일과 동등한 아이디어)
+
+### 새 구조 (generate_lateral_curves 재설계)
+각 candidate 의 lateral profile n(s) 는 두 구간의 조합:
+
+1. **Connector** (s ∈ [s0, s0+L_conn])
+   - Cubic Hermite in s:
+     `n(s) = h00·n_start + h10·L·m0 + h01·n_bc_end + h11·L·m1`
+   - `n_bc_end = n_rl(s_trans) + d_i`, `d_i = n_end − n_rl(s_end)`
+   - `m0 = n_dot_start / s_dot_start` (ego 기울기), `m1 = dn_rl/ds(s_trans)` (스플라이스에서 C¹)
+2. **Tail** (s ∈ [s_trans, s_end])
+   - `n_tail(s) = n_rl(s) + d_i`  (raceline 을 정확히 `d_i` 만큼 평행이동)
+   - 자연스럽게 `n_tail(s_end) = n_rl(s_end) + d_i = n_end` (endpoint 정확 일치)
+
+**3번째 샘플링 축 (factor=2 slot 재활용)**: `L_conn ∈ {3m, 6m}` 두 variant.
+짧은 connector = sharp recovery, 긴 connector = gentle recovery. 전체 candidate 수는
+2 × 11 × 5 = 110 유지.
+
+**Endpoint sampling**: `n_end_values` 선택 로직(prev-anchored + velocity-aware cap + B-plan)
+은 이전 세션 코드 그대로. 즉 **rate constraint 는 그대로 보존**.
+
+**API 유지**: `raceline_tendency`, `endpoint_chi_raceline_only` 파라미터는 남아있지만 내부에서
+무시됨 (tail 이 자동으로 raceline-parallel 이라 endpoint chi/n_ddot 가 강제로 raceline 것과
+동일).
+
+### 30s live 회귀 (shifted-raceline, 705 ticks, gazebo_wall_2)
+
+| 지표 | Corner (s=50~70) | Straight (s=20~30) | Corner-exit (s=80~89) | 이전(quintic) 대비 |
+|---|---|---|---|---|
+| `|Δn_end|` p50 | 0.003m | 0.015m | 0.008m | ~동일 |
+| `|Δn_end|` p95 | 0.096m | 0.089m | 0.079m | +0.013m (여전히 < cap) |
+| `|Δn_end|` max | 0.120m | 0.110m | 0.108m | 동일 (cap 에 붙음) |
+| violations > cap | 0% | 0% | 0% | **변함없이 0%** |
+| `boundary_min_margin` p05 | 0.444m | 0.450m | 0.424m | −0.005m 정도 |
+| `solve_ms` p95 | **25.4ms** | **27.4ms** | **26.3ms** | **quintic 41ms → 25ms (−40%)** |
+| hold rate (전체) | — | — | — | 70.5% → 58.5% |
+
+**해석**:
+- Rate constraint / margin / feasibility 전부 regression 없음.
+- Solve time 이 40% 줄어 MPCC tracker 붙이기 위한 여유 확보. 6×6 `np.linalg.solve` × 110번 → Hermite basis ×4 numpy ops × 110번.
+- Hold rate 감소(70→58%) 는 오히려 긍정 — 평행이동 tail 이 raceline에 더 붙어서 argmin 이
+  tick-to-tick 으로 더 자주 개선을 찾음. 절대 jump 는 rate cap 이 여전히 0.12m로 막고 있음.
+
+### 변경 파일
+- `planner/3d_sampling_based_planner/src/sampling_based_planner.py` —
+  `generate_lateral_curves` quintic → Hermite+tail; `calc_trajectory` 가
+  tight(3m)/loose(6m) 두 번 호출.
+- 백업: `sampling_based_planner_backup_20260421_rate_constraint.py` (이 리팩터 직전의
+  rate-constraint 최종본).
+
+### 남은 과제
+- MPCC tracker 붙이기 (canonical "sampling(decision) → MPCC(tracker)" 아키텍처).
+- `L_conn_tight`/`L_conn_loose` 를 rosparam 으로 노출 (현재 하드코드 3.0/6.0).
+- 저속 주행 시 `L_conn_loose=6m` 가 horizon s-range 를 초과 → tail 이 사라지는 경우
+  connector-only 가 됨. 이 자체는 안전하나 두 variant 가 동일해져 실효 factor=1 로 떨어짐.
+  필요 시 `L_conn = clip(horizon_s * α, 1.5, 6.0)` 식으로 속도적응.
+
+---
+
+## 2026-04-21 늦은 오후 세션 — κ-kick + 롤백 + 잔상 3종 fix
+
+커밋: `sampling_planner: soft-relax rate cap + smootherstep blend + marker lifetime` (ebd93bc..f511831).
+
+### 증상
+- **(S1) best_sample/markers 에서 κ 봉우리**가 커브 구간에 관측 → V 가 뚝 떨어져 "차가 멈추는 것 같음". 실제 ego v_min=1.5 m/s (정지는 아님).
+- **(S2) RViz 에서 마커 잔상 + 한참 뒤 재등장**.
+- **(S3)** `/candidates` 빨강은 tick 마다 움직이는데 `/best_sample/markers` 는 가만히 있음 → "best 가 안 따라옴". 매우 자주 발생.
+
+### 근본 원인 (세 개 독립)
+
+1. **α-blend 가 C¹ smoothstep** (`2u³-3u²+1`) 이라 u=1 에서 `d²α/ds²` 에 `6/L²` jump.
+   → n̈(s) 불연속 → κ 에 kick → GGV 로 V 급감 → 로컬 감속 "멈춤"처럼 보임.
+
+2. **Marker lifetime=0** 이 기본값 → publish gap 이 생기면 RViz 가 이전 프레임을
+   계속 보여주고, 새 tick 이 오면 DELETEALL 로 지웠다가 바로 새 marker 표시 →
+   "잔상 + 끊김" 체감.
+
+3. **n_end rate constraint 가 hard filter**: chosen_mode 의 모든 candidate 가
+   `|Δn_end| > rate_cap` 이면 `best_idx_per_mode[chosen_mode] = -1` → spin 루프가
+   `self.planner.trajectory = _prev_traj` 로 **이전 tick 경로를 고정** 재발행.
+   - `/best_sample/markers` (= `/out/otwpnts`, 컨트롤러 입력)도 prev 경로 유지 → 차가 "옛날 plan" 을 추종.
+   - `_publish_candidates(prev_idx)` 가 fresh candidate 배열에 prev 인덱스를 적용해서
+     빨강 표시하므로 **표시되는 빨강은 사실 아무 의미 없는 후보**. "best 가 안 따라옴"
+     체감의 원인.
+
+### Fix 3종
+
+| # | 포인트 | 코드 |
+|---|---|---|
+| 1 | α-blend 를 C² smootherstep `6u⁵-15u⁴+10u³` (1-S) 로 교체. u=0,1 양끝에서 α, α', α'' 전부 0 → n̈(s) 연속. | `sampling_based_planner.py:991-1005` |
+| 2 | `_publish_best_markers` SPHERE/CYLINDER 마커에 `lifetime=rospy.Duration(0.2)` 부여. publish gap 에도 0.2s 후 자동 소멸. | `sampling_planner_state_node.py:2186-2223` |
+| 3 | rate cap 을 **soft penalty** 로 변경. `rate_penalty = w_rate_penalty * (max(|Δn_end|-cap, 0)/cap)²` 를 mode cost 에 더하고 argmin → 항상 실제 인덱스 반환 → rollback 소멸. `~w_rate_penalty` rosparam (default 5.0). | `sampling_planner_state_node.py:181-189, 1858-1887` |
+| + | `tick_json` 에 `rollback: bool` 필드 추가 (regression 방지). | `sampling_planner_state_node.py:1503, 1658` |
+
+### 회귀 수치 (20s, 463 ticks)
+
+| 지표 | soft-relax 적용 후 | 비고 |
+|---|---|---|
+| `rollback` 발생 | **0 / 463 (0.0%)** | hard-filter 시 "매우 자주" 라 사용자가 지적 |
+| `status` 분포 | OK 307 / CONTINUITY_SWITCH 156 / NO_FEASIBLE 0 | 정상 |
+| `mode` 분포 | ot_left 226 / ot_right 188 / follow 49 | left/right 양방 사용 |
+| `best_idx` changes | 55.4% | tick 마다 실제로 재선택 중 |
+| `total_ms` | p50=17.7, p95=30.5, p99=44.7, max=59.9 | ~30Hz 유지 |
+| `/best_sample/markers` rate | 29.97 Hz, max gap 73ms | lifetime 0.2s 안쪽 |
+
+### 남은 과제 (이 세션 이후)
+
+- **n 샘플 그리드 재설계** (다음 세션 0순위):
+  - 현재: `n_samples=11` 개를 벽 폭 전체(`n_min_track ~ n_max_track`, ~1.5m 범위)에 linspace
+  - 문제: endpoint 간격이 넓어서 (~15cm) 최적해를 "중간 d_i" 로만 잡을 수 있고, 비슷비슷한
+    후보들로 cost 표면이 평평해짐 → small perturbation 에 argmin 이 jitter.
+  - 방향: `n_samples` 를 **증가 (예: 21~31)**, 범위는 **prev_chosen_n_end 중심의 좁은 윈도우**
+    (예: ±0.4m, rate_cap 의 수 배) 로 제한 → 촘촘한 grid + 넓은 탐색은 cost 페널티로 유도
+    (soft-relax rate penalty 가 이미 이 역할 일부 담당). racing line 쪽으로 `w_race` 가
+    자연스럽게 끌고 가도록 유지.
+  - 구현 위치 후보: `generate_lateral_curves` 의 `n_end_values` 생성부(`sampling_based_planner.py`
+    상단부근) + `~n_samples`, `~n_end_window_half_m` rosparam 추가.
+
+- soft-relax 전제에서 `w_rate_penalty`, `rate_cap` 의 실전 튜닝 (현재 5.0, 0.12 경험값).
+- `_publish_candidates` 의 빨강 인덱스도 이론상 `optimal_idx` 와 항상 일치하게 됐으니,
+  rollback flag 가 계속 0 이면 관련 가드 코드 완전 제거 가능.
