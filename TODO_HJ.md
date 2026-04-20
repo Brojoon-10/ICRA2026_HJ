@@ -46,7 +46,7 @@
 - [x] **check_stats** 를 upstream `calc_trajectory` 에 추가 (curvature/path/friction 각 단계 kill 수치화).
 - [x] **꼬불거림 근본 원인 진단 완료** — 3중 결합 (공간/시간/초기 tangent) + YAML-overwrite 버그. 수정 계획은 wobble 진단 문서 참조.
 - [ ] **L1 — 벽 경계 영향 차단**: `endpoint_chi_raceline_only: true` (YAML + cfg default). `sampling_based_planner.py:999-1004` 의 boundary-interp 경로 비활성.
-- [ ] **L2 — 시간축 smoothing**: `filter_alpha: 0.6` 1차. 부족하면 endpoint 전용 continuity cost 추가.
+- [x] **L2 — 시간축 smoothing**: `filter_alpha: 0.6` 1차 + **n_end rate constraint** (2026-04-21). `|n_end_t+1 − n_end_t| ≤ rate_cap=0.12m`, empty rate-ok pool 시 snapshot restore로 hold. 결과: p50=0.003 / p95=0.075 / max=0.120 / 0% violation (30s, 665 ticks). 구현: planner-side prev-anchored narrow linspace + node-side hard constraint + prev-traj snapshot. 파일: `sampling_based_planner.py:986-1001`, `sampling_planner_state_node.py:1760-1776, 1853-1883`.
 - [ ] **L3 — heading feedback**: node state dict `n_dot_start = v·tan(chi_raceline_rel)·(1-Ω_z·n)` 실측 주입. `_ego_chi_vs_raceline()` 헬퍼 재사용.
 - [ ] **YAML-overwrite 버그**: dynreg 서버 초기 콜백이 cfg default로 YAML 덮어씀 (live `w_pred=5000, w_race=0.1` 가 cfg default와 정확히 일치). `_weight_cb` 첫 호출 처리 또는 `update_configuration(yaml_dict)` 패턴으로 해결.
 - [ ] **OVERTAKE + RECOVERY 병렬 기동** — 두 인스턴스 동시 기동 시 네임스페이스 충돌 없는지
