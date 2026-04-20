@@ -207,6 +207,57 @@ class GGTunerNode:
         rospy.loginfo(f"[GGTuner] latest yml written: {latest_yml}")
         return latest_yml
 
+    ## IY : overlay rqt RACELINE_KEYS onto existing latest yml in-place
+    def _update_raceline_keys_in_yml(self, vehicle_name, tuning):
+        yml_path = os.path.join(
+            self.data_path, 'vehicle_params',
+            'params_' + vehicle_name + '.yml')
+        if not os.path.exists(yml_path):
+            rospy.logerr(f"[GGTuner] raceline-keys overlay: yml missing: {yml_path}")
+            return False
+        try:
+            with open(yml_path, 'r') as f:
+                data = yaml.safe_load(f) or {}
+        except (yaml.YAMLError, OSError) as e:
+            rospy.logerr(f"[GGTuner] raceline-keys overlay: yml load failed: {e}")
+            return False
+        overlaid = {}
+        for k in self.RACELINE_KEYS:
+            if k in tuning:
+                data[k] = float(tuning[k])
+                overlaid[k] = data[k]
+        try:
+            with open(yml_path, 'w') as f:
+                yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+        except OSError as e:
+            rospy.logerr(f"[GGTuner] raceline-keys overlay: yml write failed: {e}")
+            return False
+        rospy.loginfo(f"[GGTuner] raceline keys merged into {os.path.basename(yml_path)}: {overlaid}")
+        return True
+    ## IY : end
+
+    ## IY : copy snapshot GGV+yml into _latest slot (snapshot remains unchanged)
+    def _activate_snapshot_as_latest(self, snapshot_name):
+        latest_name = f'{self.base_vehicle}_latest'
+        src_gg = os.path.join(self.data_path, 'gg_diagrams', snapshot_name)
+        dst_gg = os.path.join(self.data_path, 'gg_diagrams', latest_name)
+        src_yml = os.path.join(self.data_path, 'vehicle_params',
+                               f'params_{snapshot_name}.yml')
+        dst_yml = os.path.join(self.data_path, 'vehicle_params',
+                               f'params_{latest_name}.yml')
+        if not os.path.isdir(src_gg):
+            rospy.logerr(f"[GGTuner] snapshot gg_diagrams missing: {src_gg}")
+            return False
+        if not os.path.exists(src_yml):
+            rospy.logerr(f"[GGTuner] snapshot yml missing: {src_yml}")
+            return False
+        self._replace_dir(dst_gg, src_gg)
+        shutil.copy2(src_yml, dst_yml)
+        rospy.loginfo(f"[GGTuner] activated snapshot '{snapshot_name}' as _latest")
+        self.status_pub.publish(f"RACELINE_GGV_ACTIVATED: {snapshot_name}")
+        return True
+    ## IY : end
+
     def _restore_to_latest(self, cached_name):
         latest_name = f'{self.base_vehicle}_latest'
         src_gg = os.path.join(self.data_path, 'gg_diagrams', cached_name)
@@ -803,6 +854,14 @@ class GGTunerNode:
                 vehicle_name = f"{self.base_vehicle}_latest"
 
                 if not run_opts['run_ggv']:
+                    ## IY : raceline_ggv override — activate snapshot into _latest
+                    if run_opts['raceline_ggv']:
+                        if not self._activate_snapshot_as_latest(
+                                run_opts['raceline_ggv']):
+                            self.status_pub.publish(
+                                f"FAILED: snapshot_missing:{run_opts['raceline_ggv']}")
+                            return
+                    ## IY : end
                     latest_gg = os.path.join(
                         self.data_path, 'gg_diagrams', vehicle_name)
                     if not os.path.exists(latest_gg):
@@ -869,6 +928,9 @@ class GGTunerNode:
 
                 # ---- Stage 3: raceline (optional) ----
                 if run_opts['regen_raceline']:
+                    ## IY : overlay rqt RACELINE_KEYS onto latest yml (idempotent)
+                    self._update_raceline_keys_in_yml(vehicle_name, tuning)
+                    ## IY : end
                     ok = self._run_raceline(
                         vehicle_name, run_opts['map'],
                         safety_distance=run_opts['safety_distance'])
@@ -953,6 +1015,8 @@ class GGTunerNode:
             'sec_friction2':    float(getattr(config, 'sec_friction2', 0.0)),
             'sec_friction3':    float(getattr(config, 'sec_friction3', 0.0)),
             'sec_friction4':    float(getattr(config, 'sec_friction4', 0.0)),
+            ## IY : raceline-dedicated snapshot (empty=latest)
+            'raceline_ggv':     str(getattr(config, 'raceline_ggv', '')).strip(),
             ## IY : end
         }
         ## IY : end
