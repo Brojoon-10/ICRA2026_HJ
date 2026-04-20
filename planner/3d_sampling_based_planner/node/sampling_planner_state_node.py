@@ -179,6 +179,13 @@ class SamplingPlannerStateNode:
         # toward prev n_end) so trajectory still continuous, not a jump.
         self._prev_chosen_n_end = None
         self.n_end_rate_cap     = float(rospy.get_param('~n_end_rate_cap', 0.12))  # m / tick
+        # ### HJ : soft-relax rate cap — instead of hard-filtering out candidates
+        # outside the cap (which produces best_idx=-1 → rollback to prev traj,
+        # visually the car follows a stale path), add a quadratic penalty on
+        # |Δn_end| − cap so argmin still picks the "least bad" candidate.
+        # Penalty is applied in normalized cost space (rate_penalty = w_rate *
+        # (excess/cap)²) so it's commensurate with existing normalized terms.
+        self.w_rate_penalty     = float(rospy.get_param('~w_rate_penalty', 5.0))
 
         # -- OT defaults -------------------------------------------------------------------------
         self.ot_side_default = str(rospy.get_param('~ot_side_default', 'right'))
@@ -1360,7 +1367,8 @@ class SamplingPlannerStateNode:
 
     def _collect_tick_fields(self, ego_s, ego_n, ego_v, prediction, status,
                               chosen_mode, prev_mode, cost_per_mode, best_idx_per_mode,
-                              n_valid, n_total, calc_traj_ms, post_add_ms, total_tick_ms):
+                              n_valid, n_total, calc_traj_ms, post_add_ms, total_tick_ms,
+                              rollback=False):
         """spin() per-tick metrics → DebugLogger.log_tick fields dict.
         실패하지 말 것 (spin 죽이면 안 됨) — 호출 측에서 try/except 으로 감싸 있음."""
         traj = self.planner.trajectory or {}
@@ -1491,6 +1499,7 @@ class SamplingPlannerStateNode:
             'post_add_ms':   float(post_add_ms),
             'total_tick_ms': float(total_tick_ms),
             'status': str(status),
+            'rollback': bool(rollback),
         }
         fields.update(self._active_params_for_tick())
         # ### HJ : MPPI blending stats (set by _mppi_blend; empty if blend skipped).
@@ -1653,6 +1662,7 @@ class SamplingPlannerStateNode:
                 'post_add': self._jnum(fields.get('post_add_ms')),
                 'total':    self._jnum(fields.get('total_tick_ms')),
             },
+            'rollback': bool(fields.get('rollback', False)),
             # ### HJ : hot-reconfigurable params subset — enough to correlate cost shape
             # with a weight change without replaying the YAML snapshot.
             'params': {
@@ -1750,6 +1760,7 @@ class SamplingPlannerStateNode:
             tick_best_idx_per_mode = {}
             tick_n_valid = 0
             tick_n_total = 0
+            tick_rollback = False
             tick_calc_ms = 0.0
             self._last_mppi_stats = {}  # reset; _mppi_blend fills if it runs this tick
             tick_post_add_ms = 0.0
@@ -1854,32 +1865,32 @@ class SamplingPlannerStateNode:
                                 if detour_n is not None:
                                     mc = mc + detour_n
                                 mode_cost_arrays[mode] = mc
-                                # ### HJ : n_end rate constraint — candidate's endpoint n
-                                # must be within n_end_rate_cap of prev chosen n_end.
-                                # If no valid+rate-ok candidate exists for this mode,
-                                # mark the mode as infeasible (cost=inf, bi=-1). Upstream
-                                # mode selection then falls through to whichever mode
-                                # still has a rate-ok option (typically follow, since it
-                                # stays near the raceline). If ALL modes are rate-empty,
-                                # the selection loop below holds the previous trajectory
-                                # (no teleport). Matches the user directive: "valid 하지
-                                # 못한 경로를 뽑게된다면 그냥 앞차를 따라가는 걸 선택".
+                                # ### HJ : n_end rate constraint as SOFT penalty
+                                # (was hard filter → rollback → car follows stale path).
+                                # rate_penalty = w_rate * (max(|Δn_end|−cap, 0) / cap)²
+                                # added directly to mode cost. Candidates inside the cap
+                                # pay nothing; those outside pay quadratically. argmin
+                                # still always picks a real index, so rollback never
+                                # fires and best_sample stays synchronized with the
+                                # actual chosen candidate every tick.
                                 n_end_all = np.asarray(cands['n'])[:, -1]
                                 if self._prev_chosen_n_end is not None:
-                                    dn_prev = np.abs(n_end_all - self._prev_chosen_n_end)
-                                    rate_ok = dn_prev <= self.n_end_rate_cap
-                                    eligible = valid & rate_ok
-                                    if eligible.any():
-                                        masked = np.where(eligible, mc, np.inf)
-                                        bi = int(np.argmin(masked))
-                                        cost_per_mode[mode] = float(mc[bi]) if np.isfinite(mc[bi]) else float(np.inf)
-                                    else:
-                                        bi = -1
-                                        cost_per_mode[mode] = float(np.inf)
+                                    cap_safe = max(self.n_end_rate_cap, 1e-6)
+                                    excess = np.maximum(
+                                        np.abs(n_end_all - self._prev_chosen_n_end) - self.n_end_rate_cap,
+                                        0.0,
+                                    )
+                                    rate_penalty = self.w_rate_penalty * (excess / cap_safe) ** 2
+                                    mc_with_rate = mc + rate_penalty
                                 else:
-                                    masked = np.where(valid, mc, np.inf)
-                                    bi = int(np.argmin(masked))
-                                    cost_per_mode[mode] = float(mc[bi]) if np.isfinite(mc[bi]) else float(np.inf)
+                                    mc_with_rate = mc
+                                masked = np.where(valid, mc_with_rate, np.inf)
+                                bi = int(np.argmin(masked)) if valid.any() else -1
+                                cost_per_mode[mode] = (
+                                    float(mc_with_rate[bi])
+                                    if bi >= 0 and np.isfinite(mc_with_rate[bi])
+                                    else float(np.inf)
+                                )
                                 best_idx_per_mode[mode] = bi
 
                             # ### HJ : opp 위치 기반 mode hard filter — opp 가 좌/우로 치우치면
@@ -1904,7 +1915,11 @@ class SamplingPlannerStateNode:
                                     changed = True
                             elif _prev_traj is not None:
                                 # hold: roll back to snapshot so trajectory doesn't jump.
+                                # With soft-relax rate penalty above, this branch should
+                                # essentially never fire (bi≥0 whenever any candidate is
+                                # valid). Track it so we can verify.
                                 self.planner.trajectory = _prev_traj
+                                tick_rollback = True
                             self._publish_mode_debug(cost_per_mode_filtered, chosen_mode)
                             tick_cost_per_mode = cost_per_mode_filtered
                             tick_best_idx_per_mode = best_idx_per_mode
@@ -1969,6 +1984,7 @@ class SamplingPlannerStateNode:
                     n_valid=tick_n_valid, n_total=tick_n_total,
                     calc_traj_ms=tick_calc_ms, post_add_ms=tick_post_add_ms,
                     total_tick_ms=total_tick_ms,
+                    rollback=tick_rollback,
                 )
             except Exception as _e:
                 rospy.logwarn_throttle(5.0,
@@ -2183,6 +2199,10 @@ class SamplingPlannerStateNode:
                     max(0.0, min(1.0, 2.0 * t)),
                     0.0)
 
+        # ### HJ : marker lifetime — self-expire after 0.2s so a publish gap
+        # (> one tick) doesn't leave stale spheres in RViz (afterimage).
+        mk_life = rospy.Duration(0.2)
+
         loc_markers = MarkerArray()
         clr = Marker(); clr.header = header; clr.action = Marker.DELETEALL
         loc_markers.markers.append(clr)
@@ -2198,6 +2218,7 @@ class SamplingPlannerStateNode:
             mk.pose.position.y = float(ys_arr[i])
             mk.pose.position.z = float(zs_arr[i])
             mk.pose.orientation.w = 1.0
+            mk.lifetime = mk_life
             loc_markers.markers.append(mk)
         self.pub_best_markers.publish(loc_markers)
 
@@ -2219,6 +2240,7 @@ class SamplingPlannerStateNode:
             mk.pose.position.y = float(ys_arr[i])
             mk.pose.position.z = float(zs_arr[i]) + height * 0.5
             mk.pose.orientation.w = 1.0
+            mk.lifetime = mk_life
             vel_markers.markers.append(mk)
         self.pub_vel_markers.publish(vel_markers)
 
