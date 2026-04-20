@@ -80,29 +80,25 @@ g_earth = 9.81
 #       V lookups to the nearest v_list entry, so V=1.0~1.99 queries return
 #       the V=2.0 envelope — equivalent to a hard floor at V=2, but much
 #       cleaner than the original clamp hack.
+## IY : V_max bound to vehicle_params['v_max'] after yml load
 if fast_mode:
-    ### HJ : reduced resolution for interactive tuning
-    # V_min = 1.5
     V_min = 2.0
-    V_max = 12.0
-    V_N = 5            # 15 → 5
+    V_N = 5
     g_factor_min = 1.0 / g_earth
     g_factor_max = 20.0 / g_earth
-    g_N = 3            # 9 → 3
-    alpha_N_nlp = 20   # 125 → 20
-    alpha_N_interp = 125  # output resolution (interpolated, not NLP)
-    print(f'[fast_gg] FAST mode: {V_N}×{g_N}×{alpha_N_nlp} = {V_N*g_N*alpha_N_nlp} NLP calls')
+    g_N = 3
+    alpha_N_nlp = 20
+    alpha_N_interp = 125
+    print(f'[fast_gg] FAST mode: V_N={V_N} g_N={g_N} alpha_N={alpha_N_nlp}')
 else:
-    # V_min = 1.5
     V_min = 2.0
-    V_max = 12.0
     V_N = 15
     g_factor_min = 1.0 / g_earth
     g_factor_max = 20.0 / g_earth
     g_N = 9
     alpha_N_nlp = 125
     alpha_N_interp = 125
-    print(f'[fast_gg] FULL mode: {V_N}×{g_N}×{alpha_N_nlp} = {V_N*g_N*alpha_N_nlp} NLP calls')
+    print(f'[fast_gg] FULL mode: V_N={V_N} g_N={g_N} alpha_N={alpha_N_nlp}')
 ## IY : end
 
 g_list = np.round(np.linspace(g_earth * g_factor_min, g_earth * g_factor_max, g_N), 6)
@@ -136,7 +132,9 @@ if args.tuning:
         with open(tuning_path, 'r') as stream:
             tuning = yaml.safe_load(stream)
         if tuning:
-            for key in ['lambda_mu_x', 'lambda_mu_y', 'p_Dx_2', 'p_Dy_2']:
+            ## IY : include p_Dx_1/p_Dy_1 so rqt friction flows into NLP
+            for key in ['lambda_mu_x', 'lambda_mu_y',
+                        'p_Dx_1', 'p_Dy_1', 'p_Dx_2', 'p_Dy_2']:
                 if key in tuning:
                     tire_params[key] = tuning[key]
             ## IY : extend tuning override keys to include NLP constraint params
@@ -171,6 +169,13 @@ if args.tuning:
             ## IY : end
     else:
         print(f'[fast_gg] WARNING: --tuning specified but {tuning_path} not found')
+
+## IY : V_max = v_max * 1.1 so last grid point exceeds v_max → NLP saturates ax/ay=0
+_v_max_cfg = float(vehicle_params['v_max'])
+V_max = _v_max_cfg * 1.1
+if V_max <= V_min:
+    raise ValueError(f'[fast_gg] v_max ({_v_max_cfg}) must be > V_min ({V_min})')
+print(f'[fast_gg] v_max={_v_max_cfg} → V_max={V_max:.2f} m/s (V_list={V_min}~{V_max:.2f}, N={V_N})')
 
 # calculate maximum slip maps
 N_list, kappa_max_list, lambda_max_list = calc_max_slip_map(tire_params=tire_params)
