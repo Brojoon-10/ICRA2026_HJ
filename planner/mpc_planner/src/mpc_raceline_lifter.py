@@ -162,6 +162,49 @@ class MPCRacelineLifter:
         return float(x_r + n * nx), float(y_r + n * ny)
 
     # ---------------- public API ----------------
+    def fill_wpnt_from_s(self, s_ref, n_ref, x, y, psi_mpc,
+                         vx_mpc, ax_mpc, psi_blend=0.5):
+        """### HJ : v3 — s-direct variant (no xy round-trip).
+
+        The 2D project_xy_to_sn used by fill_wpnt() fails at overpass
+        crossings in 3D tracks: both floors share the same (x, y), so
+        nearest-xy returns the wrong floor's s and z flips between the
+        ground and the bridge every tick. The MPC solver already holds
+        s on the correct floor (frenet state), so we pass s directly
+        and skip the inverse projection entirely.
+
+        Used by _publish_outputs when the solver is frenet_kin / frenet_d.
+        """
+        s = float(s_ref) % self.L
+        n = float(n_ref)
+
+        z = self._interp(s, self.g_z)
+        kappa = self._interp(s, self.g_kappa)
+        mu = self._interp(s, self.g_mu)
+        dleft = self._interp(s, self.g_dleft)
+        dright = self._interp(s, self.g_dright)
+        psi_track = self._interp_psi(s)
+
+        dpsi = np.arctan2(np.sin(psi_mpc - psi_track),
+                          np.cos(psi_mpc - psi_track))
+        psi_out = psi_track + psi_blend * dpsi
+
+        return {
+            's_m': float(s),
+            'd_m': float(n),
+            'x_m': float(x),
+            'y_m': float(y),
+            'z_m': float(z),
+            'psi_rad': float(np.arctan2(np.sin(psi_out),
+                                        np.cos(psi_out))),
+            'kappa_radpm': float(kappa),
+            'vx_mps': float(vx_mpc),
+            'ax_mps2': float(ax_mpc),
+            'mu_rad': float(mu),
+            'd_left': float(dleft),
+            'd_right': float(dright),
+        }
+
     def fill_wpnt(self, x, y, psi_mpc, vx_mpc, ax_mpc, psi_blend=0.5, idx_hint=None):
         """Return a dict of Wpnt fields at (x, y).
 

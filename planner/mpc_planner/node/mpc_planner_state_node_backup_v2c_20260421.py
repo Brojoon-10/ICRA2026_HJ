@@ -145,22 +145,12 @@ class MPCPlannerStateNode:
             params['n_obs_max']     = int(rospy.get_param('~n_obs_max', 2))
             params['ipopt_max_iter']= int(rospy.get_param('~ipopt_max_iter', 200))
             # ### HJ : v2 redesign — soft obstacle bubble + side bias + wall cushion
-            params['w_obs']         = float(rospy.get_param('~w_obs', 180.0))
+            params['w_obs']         = float(rospy.get_param('~w_obs', 300.0))
             params['sigma_s_obs']   = float(rospy.get_param('~sigma_s_obs', 0.7))
-            params['sigma_n_obs']   = float(rospy.get_param('~sigma_n_obs', 0.18))
-            params['w_side_bias']   = float(rospy.get_param('~w_side_bias', 25.0))
-            params['w_wall_buf']    = float(rospy.get_param('~w_wall_buf', 2500.0))
-            params['wall_buf']      = float(rospy.get_param('~wall_buf', 0.30))
-            # ### HJ : v3 — C^1 curvature (δ as state) + continuity + terminal
-            params['r_dd']          = float(rospy.get_param('~r_dd', 5.0))
-            params['r_dd_rate']     = float(rospy.get_param('~r_dd_rate', 1.0))
-            params['w_cont']        = float(rospy.get_param('~w_cont', 20.0))
-            params['q_n_term']      = float(rospy.get_param('~q_n_term', 10.0))
-            params['q_v_term']      = float(rospy.get_param('~q_v_term', 0.5))
-            params['delta_rate_max'] = float(rospy.get_param('~delta_rate_max', 3.0))
-            # ### HJ : v3b — solver-side ego half-width (was only in decider).
-            params['ego_half_width'] = float(
-                rospy.get_param('~ego_half_width', 0.15))
+            params['sigma_n_obs']   = float(rospy.get_param('~sigma_n_obs', 0.3))
+            params['w_side_bias']   = float(rospy.get_param('~w_side_bias', 80.0))
+            params['w_wall_buf']    = float(rospy.get_param('~w_wall_buf', 150.0))
+            params['wall_buf']      = float(rospy.get_param('~wall_buf', 0.20))
             self.solver = FrenetKinMPC(**params)
             self.n_obs_max = params['n_obs_max']
             self.wall_safe = params['wall_safe']
@@ -189,33 +179,17 @@ class MPCPlannerStateNode:
             ego_half_width=float(rospy.get_param('~ego_half_width', 0.15)),
             gap_lat=float(rospy.get_param('~gap_lat', 0.25)),
             trail_dv_thresh=float(rospy.get_param('~trail_dv_thresh', 0.5)),
-            hold_ticks=int(rospy.get_param('~side_hold_ticks', 10)),
-            min_pass_margin=float(rospy.get_param('~min_pass_margin', 0.10)),
-            trail_entry_ticks=int(rospy.get_param('~trail_entry_ticks', 3)),
-            # ### HJ : v3b — mirror solver's hard-corridor wall inset so
-            # decider's can_pass matches what the solver can actually do.
-            wall_safe=float(rospy.get_param('~wall_safe', 0.15)),
-            inflation=float(rospy.get_param('~boundary_inflation', 0.05)),
+            hold_ticks=int(rospy.get_param('~side_hold_ticks', 5)),
         )
         self._last_side_int = SIDE_CLEAR
         self._last_side_str = 'clear'
         self._last_side_scores = {}
-        # ### HJ : v3 — bias ramp REMOVED. Solution continuity cost + stable
-        # side decision (feasibility gate) make ramp unnecessary / harmful.
-        # Kept attributes as stubs so tick_json stays backward compatible.
+        # ### HJ : v2c — side bias ramp. After a side flip, bias_scale starts
+        # at 0 and ramps linearly to 1.0 over side_ramp_ticks so warm-start
+        # can deform the trajectory continuously instead of a cost jump.
+        self.side_ramp_ticks = int(rospy.get_param('~side_ramp_ticks', 8))
         self._ticks_since_flip = 0
-        self._last_bias_scale = 1.0
-        # ### HJ : v3 — obstacle s/n EMA filter. Opponent predictor jitter
-        # makes the bubble centre wobble tick-to-tick, which shakes the cost
-        # landscape and induces tiny trajectory jitter. EMA smoothes it.
-        self.obs_ema_alpha = float(rospy.get_param('~obs_ema_alpha', 0.30))
-        self._obs_arr_ema = None
-        # ### HJ : v3 — TRAIL velocity ramp. On TRAIL commit, v_target is
-        # ramped from current down to v_obs*0.95 over trail_vel_ramp_ticks
-        # ticks. Softens the "deceleration feel" during fallback.
-        self.trail_vel_ramp_ticks = int(
-            rospy.get_param('~trail_vel_ramp_ticks', 8))
-        self._trail_ticks_since_enter = 0
+        self._last_bias_scale = 0.0
 
         # ### HJ : Phase 3 — obstacle cost params (read; honored by solver in
         # Phase 3.5). Kept on the node side so dynamic_reconfigure (Phase 5)
@@ -1010,15 +984,10 @@ class MPCPlannerStateNode:
 
     # ---------------------------------------------------------------- lift
     def _lift_frenet_to_xy(self, traj_frenet, ref_slice):
-        """Convert solver (s, n, mu, v) trajectory into (x, y, psi, s, z).
-        Uses ref_slice center_points + tangent (ref_dx, ref_dy) so no
-        xy→frenet round-trip is needed (CLAUDE.md: 3D 트랙에서 Frenet xy
-        round-trip 금지). `s` is the solver's Frenet station (raceline
-        arc-length) which uniquely identifies the overpass floor; `z` is
-        interpolated from g_z at that s. Downstream viz/markers MUST use
-        the carried s/z instead of re-projecting (x, y) — otherwise the
-        2D nearest-xy lookup aliases overpass layers at crossing points.
-        Returned shape: (M, 5) columns [x, y, psi, s, z]."""
+        """Convert solver (s, n, mu, v) trajectory into the (x, y, psi) tuple
+        the rest of the pipeline expects. Uses ref_slice center_points +
+        tangent (ref_dx, ref_dy) so no xy→frenet round-trip is needed.
+        (CLAUDE.md: 3D 트랙에서 Frenet xy round-trip 금지.)"""
         N1 = traj_frenet.shape[0]
         rc = ref_slice['center_points']          # (N+1, 2)
         rdx = ref_slice['ref_dx']                # cos(psi_ref)
@@ -1027,18 +996,16 @@ class MPCPlannerStateNode:
         # Left (+n) normal in xy = (-sin(psi_ref), cos(psi_ref)) = (-rdy, rdx)
         lnx = -rdy[:M]
         lny = rdx[:M]
-        out = np.zeros((M, 5), dtype=np.float64)
+        xy_psi = np.zeros((M, 3), dtype=np.float64)
         for k in range(M):
-            s_k = float(traj_frenet[k, 0])
             n_k = float(traj_frenet[k, 1])
             mu_k = float(traj_frenet[k, 2])
-            out[k, 0] = float(rc[k, 0] + n_k * lnx[k])
-            out[k, 1] = float(rc[k, 1] + n_k * lny[k])
+            xy_psi[k, 0] = float(rc[k, 0] + n_k * lnx[k])
+            xy_psi[k, 1] = float(rc[k, 1] + n_k * lny[k])
+            # Ego heading = ref_psi + mu_k
             psi_ref = float(np.arctan2(rdy[k], rdx[k]))
-            out[k, 2] = psi_ref + mu_k
-            out[k, 3] = s_k
-            out[k, 4] = float(self.lifter._interp(s_k, self.lifter.g_z))
-        return out
+            xy_psi[k, 2] = psi_ref + mu_k
+        return xy_psi
 
     def _slice_local_ref(self, s_cur):
         """Build N+1 local reference from /global_waypoints around s_cur.
@@ -1125,33 +1092,6 @@ class MPCPlannerStateNode:
         # ### HJ : Phase 3.5 — fuse obstacle inputs and hand to solver.
         obs_arr, obs_tag = self._build_obstacle_array(s_cur)
 
-        # ### HJ : v3 — obstacle EMA filter. Blend new obs_arr with prev
-        # tick's (same shape (n_slot, N+1, 3)). Only blend (s, n) columns;
-        # keep active-weight (col 2) as a hard on/off to avoid zombie slots.
-        if self.solver_backend == 'frenet_kin':
-            if obs_arr is None:
-                # no obstacles this tick — drop stale EMA so a future
-                # re-acquisition doesn't blend against 5-sec-old data.
-                self._obs_arr_ema = None
-            elif (self._obs_arr_ema is not None
-                    and self._obs_arr_ema.shape == obs_arr.shape):
-                a = float(self.obs_ema_alpha)
-                blend = self._obs_arr_ema.copy()
-                # carry active gate from new (fresh activation decisions)
-                blend[:, :, 2] = obs_arr[:, :, 2]
-                # EMA on (s, n) only where both prev and new are active
-                active_mask = (obs_arr[:, :, 2] > 0.0) \
-                              & (self._obs_arr_ema[:, :, 2] > 0.0)
-                for col in (0, 1):
-                    blend[:, :, col] = np.where(
-                        active_mask,
-                        a * obs_arr[:, :, col] + (1.0 - a) * self._obs_arr_ema[:, :, col],
-                        obs_arr[:, :, col])
-                self._obs_arr_ema = blend
-                obs_arr = blend
-            else:
-                self._obs_arr_ema = obs_arr.copy()
-
         # ### HJ : Build initial_state + side decision per backend.
         if self.solver_backend == 'frenet_kin':
             # ψ_ref at s_cur (ref_psi[0]).
@@ -1161,24 +1101,19 @@ class MPCPlannerStateNode:
             mu0 = (mu0 + np.pi) % (2.0 * np.pi) - np.pi
             v0 = float(getattr(self, 'car_vx', 0.5))
             initial_state = np.array([float(ego_n), mu0, v0])
-            # side decision (rule-based, external, now feasibility-aware)
+            # side decision (rule-based, external)
             side_int, side_str, side_scores = self._decide_side(obs_arr, ref_slice)
-            # ### HJ : v3 — bias_scale ramp REMOVED. Continuity cost in
-            # solver handles tick-to-tick smoothness directly. Fixed 1.0.
+            # ### HJ : bias ramp — when side flips, start with bias_scale=0
+            # and ramp linearly to 1.0 over side_ramp_ticks ticks. This keeps
+            # the cost landscape C^1 AND smooth in time → trajectory morphs
+            # across the flip instead of snapping to the other side.
             if side_int != self._last_side_int:
                 self._ticks_since_flip = 0
             else:
                 self._ticks_since_flip += 1
-            bias_scale = 1.0
+            ramp = max(1, int(self.side_ramp_ticks))
+            bias_scale = float(min(1.0, self._ticks_since_flip / float(ramp)))
             self._last_bias_scale = bias_scale
-            # TRAIL entry tick counter (for debug only; velocity ramp lives
-            # in the solver via v_max cap when side==TRAIL)
-            if side_int == SIDE_TRAIL and self._last_side_int != SIDE_TRAIL:
-                self._trail_ticks_since_enter = 0
-            elif side_int == SIDE_TRAIL:
-                self._trail_ticks_since_enter += 1
-            else:
-                self._trail_ticks_since_enter = 0
             self._last_side_int = side_int
             self._last_side_str = side_str
             self._last_side_scores = side_scores
@@ -1310,6 +1245,7 @@ class MPCPlannerStateNode:
                 'q_n':            float(s.q_n),
                 'gamma_progress': float(s.gamma),
                 'r_a':            float(s.r_a),
+                'r_delta':        float(s.r_delta),
                 'r_steer_reg':    float(s.r_reg),
                 'w_slack':        float(s.w_slack),
                 'v_min':          float(s.v_min),
@@ -1317,7 +1253,6 @@ class MPCPlannerStateNode:
                 'a_min':          float(s.a_min),
                 'a_max':          float(s.a_max),
                 'delta_max':      float(s.delta_max),
-                'delta_rate_max': float(s.delta_rate_max),
                 'mu_max':         float(s.mu_max),
                 'inflation':      float(s.inflation),
                 'wall_safe':      float(s.wall_safe),
@@ -1329,17 +1264,6 @@ class MPCPlannerStateNode:
                 'w_side_bias':    float(s.w_side_bias),
                 'w_wall_buf':     float(s.w_wall_buf),
                 'wall_buf':       float(s.wall_buf),
-                # ### HJ : v3 — C^1 / continuity / terminal weights
-                'r_dd':           float(s.r_dd),
-                'r_dd_rate':      float(s.r_dd_rate),
-                'w_cont':         float(s.w_cont),
-                'q_n_term':       float(s.q_n_term),
-                'q_v_term':       float(s.q_v_term),
-                # feasibility gate + obstacle filter (node-side)
-                'min_pass_margin':    float(self.side_decider.min_pass_margin),
-                'trail_entry_ticks':  int(self.side_decider.trail_entry_ticks),
-                'obs_ema_alpha':      float(self.obs_ema_alpha),
-                'trail_vel_ramp_ticks': int(self.trail_vel_ramp_ticks),
                 'ipopt_max_iter': int(s.ipopt_max_iter),
             }
         # Legacy frenet_d / xy (kept for A/B rollback).
@@ -1576,13 +1500,6 @@ class MPCPlannerStateNode:
 
         wp_arr = WpntArray()
         wp_arr.header = header
-        # ### HJ : v3 — for frenet backends the solver holds s directly
-        # (frenet state). Use fill_wpnt_from_s to skip xy→s argmin which
-        # fails at overpass crossings in 3D (CLAUDE.md: xy round-trip 금지).
-        fren_traj = getattr(self, '_last_frenet_traj', None)
-        use_s_direct = (fren_traj is not None
-                        and fren_traj.shape[0] == N_traj
-                        and self.solver_backend in ('frenet_kin', 'frenet_d'))
         idx_hint = None
         for i in range(N_traj):
             x = float(trajectory[i, 0])
@@ -1600,19 +1517,12 @@ class MPCPlannerStateNode:
                 vx = float(u_sol[-1, 0]) if u_sol is not None else 0.0
                 ax = 0.0
 
-            if use_s_direct:
-                s_i = float(fren_traj[i, 0])
-                n_i = float(fren_traj[i, 1])
-                fields = self.lifter.fill_wpnt_from_s(
-                    s_ref=s_i, n_ref=n_i,
-                    x=x, y=y, psi_mpc=psi_mpc,
-                    vx_mpc=vx, ax_mpc=ax,
-                )
-            else:
-                fields = self.lifter.fill_wpnt(
-                    x, y, psi_mpc, vx_mpc=vx, ax_mpc=ax, idx_hint=idx_hint,
-                )
-                idx_hint = self.lifter._nearest_idx(x, y)
+            fields = self.lifter.fill_wpnt(
+                x, y, psi_mpc, vx_mpc=vx, ax_mpc=ax, idx_hint=idx_hint,
+            )
+            # Reuse nearest segment as hint for the next step (horizon is
+            # monotone along s — saves an O(M) argmin per step).
+            idx_hint = self.lifter._nearest_idx(x, y)
 
             w = Wpnt()
             w.id = i
@@ -1652,13 +1562,6 @@ class MPCPlannerStateNode:
     def _publish_debug_markers(self, header, trajectory):
         arr = MarkerArray()
 
-        # ### HJ : 3D 트랙의 overpass(교차 층)에서 같은 (x, y)에 서로 다른 z가
-        # 존재 → project_xy_to_sn(2D 최단)로 s를 역산하면 아래층/위층이
-        # 뒤섞임. frenet_kin 백엔드는 _lift_frenet_to_xy에서 (x, y, psi, s, z)
-        # 5컬럼을 싣고 내려오므로 컬럼이 ≥5면 담긴 z를 그대로 쓴다. Fallback
-        # 타이어(tier2/3)는 3컬럼이라 s를 모르므로 z=0을 사용.
-        has_sz = trajectory.shape[1] >= 5
-
         # LINE_STRIP — predicted path
         line = Marker()
         line.header = header
@@ -1676,10 +1579,12 @@ class MPCPlannerStateNode:
             line.color = ColorRGBA(r=0.1, g=0.9, b=0.2, a=0.9)   # green
         line.pose.orientation.w = 1.0
         for i in range(trajectory.shape[0]):
+            s_i, _ = self.lifter.project_xy_to_sn(
+                float(trajectory[i, 0]), float(trajectory[i, 1]))
             pt = Point()
             pt.x = float(trajectory[i, 0])
             pt.y = float(trajectory[i, 1])
-            pt.z = float(trajectory[i, 4]) if has_sz else 0.0
+            pt.z = self.lifter._interp(s_i, self.lifter.g_z)
             line.points.append(pt)
         arr.markers.append(line)
 
@@ -1694,10 +1599,12 @@ class MPCPlannerStateNode:
         pts.color = ColorRGBA(r=line.color.r, g=line.color.g, b=line.color.b, a=0.9)
         pts.pose.orientation.w = 1.0
         for i in range(trajectory.shape[0]):
+            s_i, _ = self.lifter.project_xy_to_sn(
+                float(trajectory[i, 0]), float(trajectory[i, 1]))
             pt = Point()
             pt.x = float(trajectory[i, 0])
             pt.y = float(trajectory[i, 1])
-            pt.z = float(trajectory[i, 4]) if has_sz else 0.0
+            pt.z = self.lifter._interp(s_i, self.lifter.g_z)
             pts.points.append(pt)
         arr.markers.append(pts)
 
@@ -1878,8 +1785,6 @@ class MPCPlannerStateNode:
                             for k, v in (getattr(self, '_last_side_scores', {}) or {}).items()},
             'bias_scale': round(float(getattr(self, '_last_bias_scale', 0.0)), 3),
             'ticks_since_flip': int(getattr(self, '_ticks_since_flip', 0)),
-            # ### HJ : v3 — TRAIL entry dwell counter (0 when not trailing)
-            'trail_ticks': int(getattr(self, '_trail_ticks_since_enter', 0)),
             'n_obs_raw': int(getattr(self, '_last_n_obs_raw', 0)),
             'n_obs_used': len(obs_list),
             'obstacles': obs_list,

@@ -41,12 +41,16 @@
        for normal runs; flip true when diagnosing trajectory quality issues.
        Output lands in $(find mpc_planner)/debug_log/runs/<timestamp>_.../
        (gitignored). -->
-  <!-- ### HJ : solver backend. `frenet_d` (default) perturbs n(s) on a fixed
-       s-grid with a hard corridor box → trajectory never leaves d_left/d_right
-       by construction. `xy` keeps the original kinematic bicycle MPCC (for
-       A/B comparison or rollback). -->
-  <arg name="solver_backend"              default="frenet_d"
-       doc="frenet_d | xy"/>
+  <!-- ### HJ : solver backend.
+       `frenet_kin` (default, 2026-04-20 redesign) — Frenet kinematic bicycle
+           MPC. State [n, mu, v], hard corridor with wall_safe + inflation,
+           half-plane obstacle constraint, external SideDecider with
+           5-tick hysteresis. See src/frenet_kin_solver.py.
+       `frenet_d` — legacy n(s)-perturbation MPCC (hard corridor box but
+           cost-only smoothness → tick jitter + wall-hug).
+       `xy` — original kinematic bicycle MPCC (rollback path). -->
+  <arg name="solver_backend"              default="frenet_kin"
+       doc="frenet_kin | frenet_d | xy"/>
 
   <arg name="debug_log_enable"            default="false"/>
   <arg name="debug_log_dir"               default="$(find mpc_planner)/debug_log/runs"/>
