@@ -173,6 +173,13 @@ class SamplingPlannerStateNode:
         self._prev_best_V     = None
         self._prev_best_xyz   = None   # (xs, ys, zs) for the translucent marker
 
+        # ### HJ : n_end rate constraint — enforce |Δn_end| ≤ n_end_rate_cap per tick
+        # so candidate selection can't teleport laterally. If no valid candidate
+        # meets rate cap, fall back to "closest-to-prev" (move as much as possible
+        # toward prev n_end) so trajectory still continuous, not a jump.
+        self._prev_chosen_n_end = None
+        self.n_end_rate_cap     = float(rospy.get_param('~n_end_rate_cap', 0.12))  # m / tick
+
         # -- OT defaults -------------------------------------------------------------------------
         self.ot_side_default = str(rospy.get_param('~ot_side_default', 'right'))
 
@@ -267,9 +274,14 @@ class SamplingPlannerStateNode:
         # ### HJ : _gg_lock guards swaps of self.gg / self.planner.gg_handler from the dynreg
         # thread so the planner tick never observes a half-rebuilt handler.
         self._gg_lock = threading.Lock()
-        self._suppress_dynreg_cb = False
+        # ### HJ : suppress FIRST callback so the .cfg-defaults-seeded initial invocation
+        # doesn't overwrite YAML-loaded self.* (prediction_weight etc.). _weight_cb
+        # early-returns while suppressed; _push_params_to_dynreg then seeds the server
+        # with our YAML values.
+        self._suppress_dynreg_cb = True
         self._dyn_srv = Server(SamplingCostConfig, self._weight_cb)
         self._push_params_to_dynreg()
+        self._suppress_dynreg_cb = False
 
         # -- DebugLogger -------------------------------------------------------------------------
         # ### HJ : per-tick CSV + event JSONL + meta YAML 로 OT 튜닝 분석용 데이터 dump.
@@ -395,6 +407,11 @@ class SamplingPlannerStateNode:
             self._suppress_dynreg_cb = False
 
     def _weight_cb(self, config, level):
+        # ### HJ : YAML-overwrite guard. When suppressed we're inside Server init or
+        # _push_params_to_dynreg — self.* already hold the authoritative YAML values,
+        # so don't let config's (possibly .cfg-default-seeded) fields overwrite them.
+        if self._suppress_dynreg_cb:
+            return config
         # save / reset one-shot triggers
         if config.save_params:
             self._save_yaml(config)
@@ -1699,12 +1716,26 @@ class SamplingPlannerStateNode:
             self._prev_xyz    = (x_cur, y_cur, z_cur)
             self._prev_stamp  = rospy.Time.now().to_sec()
 
+            # ### HJ : L3 fix - feed measured heading into n_dot so samples fan from
+            # the real tangent, not the raceline. n_dot = s_dot * tan(chi) * (1 - Ω_z·n).
+            s_dot_eff = max(self.s_dot_min, v_cur)
+            chi_rel = self._ego_chi_vs_raceline(s_cent)
+            if chi_rel is not None and s_cent is not None:
+                try:
+                    Omega_z = float(np.interp(float(s_cent),
+                                              np.asarray(self.track.s),
+                                              np.asarray(self.track.Omega_z)))
+                except Exception:
+                    Omega_z = 0.0
+                n_dot_start = s_dot_eff * math.tan(chi_rel) * (1.0 - Omega_z * float(n_cent or 0.0))
+            else:
+                n_dot_start = 0.0
             state = {
                 's':      s_cent,
                 'n':      n_cent,
-                's_dot':  max(self.s_dot_min, v_cur),
+                's_dot':  s_dot_eff,
                 's_ddot': 0.0,
-                'n_dot':  0.0,
+                'n_dot':  n_dot_start,
                 'n_ddot': 0.0,
             }
             # ### HJ : Phase 2 — feed cached opponent predictions into the upstream
@@ -1727,6 +1758,21 @@ class SamplingPlannerStateNode:
                 # ### HJ : hold _gg_lock so a concurrent rqt-triggered GGManager rebuild
                 # cannot swap self.planner.gg_handler mid-calc_trajectory.
                 with self._gg_lock:
+                    # ### HJ : inject prev-tick n_end + rate cap so the sampler can
+                    # center its linspace around prev_chosen_n_end within the rate
+                    # window (empty rate-ok pool → ping-pong fix).
+                    self.planner.prev_chosen_n_end = self._prev_chosen_n_end
+                    self.planner.n_end_rate_cap    = float(self.n_end_rate_cap)
+                    # ### HJ : snapshot previous trajectory BEFORE calc_trajectory so
+                    # the mode-loop can restore it when all modes are rate-empty (hold).
+                    _prev_traj = None
+                    try:
+                        _pt = getattr(self.planner, 'trajectory', None)
+                        if _pt and 'x' in _pt and len(_pt['x']) > 0:
+                            _prev_traj = {k: (v.copy() if hasattr(v, 'copy') else v)
+                                          for k, v in _pt.items()}
+                    except Exception:
+                        _prev_traj = None
                     self.planner.calc_trajectory(
                         state=state,
                         prediction=prediction,
@@ -1808,10 +1854,33 @@ class SamplingPlannerStateNode:
                                 if detour_n is not None:
                                     mc = mc + detour_n
                                 mode_cost_arrays[mode] = mc
-                                masked = np.where(valid, mc, np.inf)
-                                bi = int(np.argmin(masked))
+                                # ### HJ : n_end rate constraint — candidate's endpoint n
+                                # must be within n_end_rate_cap of prev chosen n_end.
+                                # If no valid+rate-ok candidate exists for this mode,
+                                # mark the mode as infeasible (cost=inf, bi=-1). Upstream
+                                # mode selection then falls through to whichever mode
+                                # still has a rate-ok option (typically follow, since it
+                                # stays near the raceline). If ALL modes are rate-empty,
+                                # the selection loop below holds the previous trajectory
+                                # (no teleport). Matches the user directive: "valid 하지
+                                # 못한 경로를 뽑게된다면 그냥 앞차를 따라가는 걸 선택".
+                                n_end_all = np.asarray(cands['n'])[:, -1]
+                                if self._prev_chosen_n_end is not None:
+                                    dn_prev = np.abs(n_end_all - self._prev_chosen_n_end)
+                                    rate_ok = dn_prev <= self.n_end_rate_cap
+                                    eligible = valid & rate_ok
+                                    if eligible.any():
+                                        masked = np.where(eligible, mc, np.inf)
+                                        bi = int(np.argmin(masked))
+                                        cost_per_mode[mode] = float(mc[bi]) if np.isfinite(mc[bi]) else float(np.inf)
+                                    else:
+                                        bi = -1
+                                        cost_per_mode[mode] = float(np.inf)
+                                else:
+                                    masked = np.where(valid, mc, np.inf)
+                                    bi = int(np.argmin(masked))
+                                    cost_per_mode[mode] = float(mc[bi]) if np.isfinite(mc[bi]) else float(np.inf)
                                 best_idx_per_mode[mode] = bi
-                                cost_per_mode[mode] = float(masked[bi])
 
                             # ### HJ : opp 위치 기반 mode hard filter — opp 가 좌/우로 치우치면
                             # 같은 쪽 OT mode 에 multiplicative 페널티. _select_mode_with_hysteresis
@@ -1819,15 +1888,35 @@ class SamplingPlannerStateNode:
                             opp_n_for_filter = self._lead_opp_n(prediction, s_cent)
                             cost_per_mode_filtered = self._apply_mode_filter(cost_per_mode, opp_n_for_filter)
                             chosen_mode = self._select_mode_with_hysteresis(cost_per_mode_filtered)
-                            if chosen_mode is not None and chosen_mode in mode_cost_arrays:
+                            # ### HJ : if chosen mode's best_idx == -1 (no rate-ok valid
+                            # candidate) OR all modes are inf-cost, restore previous
+                            # trajectory (don't teleport). calc_trajectory already wrote
+                            # a fresh self.planner.trajectory internally via its own
+                            # unconstrained argmin, so skipping the extract below is not
+                            # enough — we must overwrite with the snapshot.
+                            if (chosen_mode is not None
+                                    and chosen_mode in mode_cost_arrays
+                                    and best_idx_per_mode.get(chosen_mode, -1) >= 0):
                                 self.planner.cost_array = mode_cost_arrays[chosen_mode]
                                 bi = best_idx_per_mode[chosen_mode]
                                 if bi != int(self.planner.trajectory.get('optimal_idx', -1)):
                                     self.planner.trajectory = self._extract_traj_from_candidate(bi)
                                     changed = True
+                            elif _prev_traj is not None:
+                                # hold: roll back to snapshot so trajectory doesn't jump.
+                                self.planner.trajectory = _prev_traj
                             self._publish_mode_debug(cost_per_mode_filtered, chosen_mode)
                             tick_cost_per_mode = cost_per_mode_filtered
                             tick_best_idx_per_mode = best_idx_per_mode
+                            # ### HJ : persist chosen n_end for next-tick rate constraint.
+                            if (chosen_mode is not None
+                                    and chosen_mode in best_idx_per_mode
+                                    and best_idx_per_mode[chosen_mode] >= 0):
+                                _bi = best_idx_per_mode[chosen_mode]
+                                try:
+                                    self._prev_chosen_n_end = float(np.asarray(cands['n'])[_bi, -1])
+                                except Exception:
+                                    pass
                             tick_n_valid = int(np.count_nonzero(valid))
                             tick_n_total = int(valid.size)
                 tick_post_add_ms = (time.time() - t_post) * 1000.0
@@ -1854,8 +1943,9 @@ class SamplingPlannerStateNode:
                     })
 
             except Exception as e:
-                rospy.logerr_throttle(2.0, '[sampling][%s] calc_trajectory failed: %s',
-                                     rospy.get_name(), e)
+                import traceback
+                rospy.logerr_throttle(2.0, '[sampling][%s] calc_trajectory failed: %s\n%s',
+                                     rospy.get_name(), e, traceback.format_exc())
                 tick_status = 'EXCEPTION:' + type(e).__name__
                 self._publish_status(tick_status)
                 self._log_event_safe('exception', {

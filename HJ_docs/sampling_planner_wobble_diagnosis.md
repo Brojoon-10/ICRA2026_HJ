@@ -1,7 +1,7 @@
 # Sampling Planner 꼬불거림 (Wobble) 진단 + 다음 세션 복귀 가이드
 
-- **작성일**: 2026-04-20 (비상 스냅샷 — 워크스페이스 유실 가능성 때문에 즉시 푸시)
-- **상태**: 진단 완료 / 수정 미적용 / 다음 세션에서 코드 fix 들어가야 함
+- **작성일**: 2026-04-20 (비상 스냅샷) / **갱신 2026-04-21 (rate constraint fix 적용 완료)**
+- **상태**: 진단 완료 / **L1+B-plan+velocity-aware cap+rate-constraint-with-hold 모두 적용**. 30s live 회귀: `|Δn_end|` max=0.120m (rate_cap 정확히), p95=0.075m, **0% violation**. margin≥0.449m 유지, solve<60ms. 다음 작업: MPCC tracker 붙이기.
 - **대상 노드**: `planner/3d_sampling_based_planner/node/sampling_planner_state_node.py`
   + `planner/3d_sampling_based_planner/src/sampling_based_planner.py`
 - **테스트 맵/모드**: `gazebo_wall_2` sim, HJ 모드, `state:=overtake`
@@ -235,6 +235,40 @@ state = {..., 'n_start': n_now, 'n_dot': n_dot_start, 'n_ddot': 0.0, ...}
 3. 또는 `_weight_cb` 첫 호출 플래그 `self._first_cb=True` 처리: 첫 호출일 때 **cfg가 준 값이 아니라 self.yaml_dict를 서버에 되돌려 넣기** (`self.dyn_srv.update_configuration(self.yaml_dict)`).
 
 검증: 부팅 직후 `rostopic echo -n 1 /sampling_overtake/debug/tick_json` → `params.w_pred` 가 YAML 값과 일치하는지.
+
+---
+
+## 2026-04-21 후속 수정 요약 (wobble → rate-constrained smoothness)
+
+**문제**: L1/L2/L3 + YAML-overwrite 수정 이후에도 best idx가 tick마다 바뀌면서 `n_end`가 0.3~0.8m 단위로 왕복. 사용자 피드백: "d 방향 변화는 고를때마다 순간이동하면 안돼. 제약으로 부드럽게 전환되게 해야지. valid 하지 못한 경로를 뽑게된다면 그냥 앞차를 따라가는 걸 선택하면 되는거야."
+
+**진단** (30s tick_json 분석):
+- Raceline-anchored B-plan + velocity-aware cap 적용 후에도 `|Δn_end|` p95=0.29m, max=0.76m. 특정 구간(s≈81, s≈15)에서 ping-pong.
+- 원인: n_samples=11 grid 간격 0.15m > rate_cap 0.12m → rate window에 후보 0개 → fallback ("closest valid to prev")이 먼 후보 선택 → 다음 tick에서 다시 먼 후보 → 진동.
+- 추가 원인: `calc_trajectory` 내부에서 `self.planner.trajectory` 를 이미 argmin으로 덮어씀. node가 rate-saturated fallback을 포기해도 planner의 unconstrained trajectory가 publish 됨.
+
+**수정 3종**:
+1. **Planner-side prev-anchored narrow linspace** — `sampling_based_planner.py:981-1001`. `self.prev_chosen_n_end` 있으면 해당 값 주변 `±min(3·rate_cap, d_side)` 범위로 `n_samples-1` 포인트 linspace + raceline point append. grid가 항상 rate window를 포함하도록 보장.
+2. **Node-side hard rate constraint + hold fallback** — `sampling_planner_state_node.py:1853-1883`. mode별로 `rate_ok = |n_end - prev_n_end| ≤ rate_cap` 마스크 적용. rate-ok + valid 후보 없으면 `cost_per_mode[mode] = inf`, `bi = -1`. `_select_mode_with_hysteresis` 가 inf 모드를 필터링하므로 rate-ok 모드로 스위치되거나 전부 inf면 active mode 유지.
+3. **Trajectory snapshot restore** — `sampling_planner_state_node.py:1760-1776, 1892-1896`. `calc_trajectory` 호출 전 이전 tick의 trajectory 스냅샷을 저장. rate-empty로 chosen mode의 `bi = -1` 이면 snapshot을 되돌려 놓아 "hold previous" 가 실제 publish까지 반영되게 함.
+4. **prev_chosen_n_end 주입** — `sampling_planner_state_node.py:1760-1765`. `calc_trajectory` 직전에 `self.planner.prev_chosen_n_end = self._prev_chosen_n_end`, `self.planner.n_end_rate_cap = float(self.n_end_rate_cap)` 설정. `~n_end_rate_cap` rosparam default 0.12m.
+
+**회귀 결과 (30s, 665 ticks, state=overtake, opp present)**:
+| metric | before B-plan | after B-plan | **after rate+hold** |
+|---|---|---|---|
+| `|Δn_end|` p50 | 0.10m | 0.02m | **0.003m** |
+| `|Δn_end|` p95 | 0.31m | 0.14m | **0.075m** |
+| `|Δn_end|` max | 0.76m | 0.89m* | **0.120m** (cap) |
+| violations >cap | N/A | 7.3% | **0.0%** |
+| `boundary_min_margin` p05 | — | — | **0.449m** |
+| solve_ms p95 | — | — | **41ms** |
+| hold rate (idx unchanged) | — | — | **70.5%** |
+
+\* rate constraint 단독 적용 후 (hold-snapshot 없이) 에는 planner 내부 argmin 으로 인해 오히려 max가 튐. hold+snapshot 추가 후 완전 해결.
+
+**다음 과제**:
+- Sampling 결과를 그대로 controller에 넘기는 대신 MPCC가 tracker 역할을 해 track/obstacle corridor 안에서 smooth 실행 — 사용자 언급한 canonical "sampling(decision) → MPCC(tracker)" 아키텍처.
+- hold rate 70%는 정상(로컬 최적 고수)이나, 장기간 hold가 누적되면 snapshot이 stale 해짐. 필요 시 hold 카운터 한도 추가 → 한도 초과 시 prev를 raceline 쪽으로 rate_cap 만큼 이동.
 
 ---
 

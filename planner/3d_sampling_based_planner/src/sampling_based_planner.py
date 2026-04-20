@@ -957,9 +957,48 @@ class LocalSamplingPlanner():
             # sampled n end conditions (relative to raceline)
             n_min_track = track_handler.w_tr_right_interpolator(s_end).full().squeeze()
             n_max_track = track_handler.w_tr_left_interpolator(s_end).full().squeeze()
-            n_min = n_min_track + self.vehicle_params['total_width'] / 2.0 + safety_distance
-            n_max = n_max_track - self.vehicle_params['total_width'] / 2.0 - safety_distance
-            n_end_values = np.concatenate((np.linspace(n_min, n_max, n_samples - 1), [n_rl_eval[-1]]))  # always sample raceline
+
+            # ### HJ : raceline-anchored asymmetric sampling (B-plan).
+            # Single anchor = n_rl(s_end). s_end jitter shifts all candidates uniformly
+            # → relative order stable → argmin stable → tick-to-tick wobble suppressed.
+            n_rl_end = float(n_rl_eval[-1])
+            margin = self.vehicle_params['total_width'] / 2.0 + safety_distance
+            d_left_rl  = max(float(n_max_track) - n_rl_end - margin, 0.0)
+            d_right_rl = max(n_rl_end - float(n_min_track) - margin, 0.0)
+
+            # ### HJ : velocity-aware kinematic cap — low-v ↔ corner ↔ tighter swing.
+            # Two-factor bound: (1) |n_end - n_rl_end| ≤ max_slope · s_horizon (geometry),
+            # (2) max_slope itself shrinks at low end-velocity so that in tight corners
+            #     (raceline speed profile dips) candidates can't pick large lateral n.
+            # v=1.0 → slope=0.15 (~8.5°) ; v>=4.0 → slope=0.45 (~24°).
+            s_horizon_eff = max(float(s_end) - float(s_array[i, 0]), 0.1)
+            v_end_clip = max(1.0, min(4.0, float(s_dot_end)))
+            max_slope = 0.15 + (0.45 - 0.15) * (v_end_clip - 1.0) / (4.0 - 1.0)
+            max_swing = max_slope * s_horizon_eff
+            d_left_rl  = min(d_left_rl,  max_swing)
+            d_right_rl = min(d_right_rl, max_swing)
+
+            # ### HJ : prev-anchored sampling when node has committed n_end.
+            # When prev_chosen_n_end exists, center the linspace around prev with
+            # half-span = 3·rate_cap so rate window always contains 2-3 samples
+            # (fixing fallback ping-pong from sparse grid vs tight rate constraint).
+            # When no prev, use the wide wall-limited spread for initial acquisition.
+            prev_anchor = getattr(self, 'prev_chosen_n_end', None)
+            rate_cap    = float(getattr(self, 'n_end_rate_cap', 0.12))
+            if prev_anchor is not None:
+                off_prev = float(np.clip(float(prev_anchor) - n_rl_end,
+                                          -d_right_rl, d_left_rl))
+                half_span = min(rate_cap * 3.0, max(d_left_rl, d_right_rl))
+                lo = max(off_prev - half_span, -d_right_rl)
+                hi = min(off_prev + half_span,  d_left_rl)
+                n_end_offsets = np.linspace(lo, hi, n_samples - 1)
+                n_end_values = n_rl_end + np.concatenate((n_end_offsets, [0.0]))
+            else:
+                N_right = n_samples // 2
+                N_left  = n_samples - 1 - N_right
+                right_side = np.linspace(-d_right_rl, 0.0, N_right, endpoint=False) if N_right > 0 else np.array([])
+                left_side  = np.linspace(0.0, d_left_rl, N_left) if N_left > 0 else np.array([])
+                n_end_values = n_rl_end + np.concatenate((right_side, left_side, [0.0]))
 
             # chi of track bounds at end position
             nearest_idx = (np.abs(track_handler.s - s_end)).argmin()
