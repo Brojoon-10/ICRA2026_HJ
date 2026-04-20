@@ -130,6 +130,12 @@ class FrenetKinMPC:
         self.v_max = float(params.get('v_max', 8.0))
         self.a_min = float(params.get('a_min', -4.0))
         self.a_max = float(params.get('a_max', 3.0))
+        # ### HJ : v3c — softer deceleration envelope used to ramp TRAIL
+        # vmax[k] from v0 down to the obstacle cap. Below a_min's hard
+        # limit (-4) so the solver has strictly-feasible slack; conservative
+        # enough that the ramp doesn't induce aggressive braking in the
+        # common case.
+        self.a_dec_ramp = float(params.get('a_dec_ramp', 3.0))
         self.delta_max = float(params.get('delta_max', 0.6))
         # v3: steer-rate limit (rad/s). Default 3.0 rad/s is conservative
         # for a 1:10 R/C servo; reasoned with Liniger's 2015 setup.
@@ -171,6 +177,16 @@ class FrenetKinMPC:
         self.last_iter_count = -1
         self.last_slack_max = 0.0
         self.last_cost_breakdown = {}
+        # ### HJ : v3b diagnostics — populated every solve(). `last_input` is
+        # the exact numeric state/params the NLP was fed (so failure can be
+        # replayed offline). `last_infeas_info` identifies which hard bound
+        # was violated on failure (max violation per constraint family).
+        self.last_input = {}
+        self.last_infeas_info = {}
+        # Retry-ladder bookkeeping (see solve()). 1=decider side, 2=TRAIL
+        # retry, 3=obs-off + wider slack, 0=never attempted.
+        self.last_pass = 0
+        self.last_pass_history = []
 
         self._opti = None
         self._vars = None
@@ -243,8 +259,18 @@ class FrenetKinMPC:
         opti.subject_to(opti.bounded(-self.delta_max, de, self.delta_max))
         opti.subject_to(opti.bounded(-self.mu_max, mu, self.mu_max))
         for k in range(N + 1):
+            # ### HJ : v3c — vmax hard bound skipped at k=0. v_[0] is already
+            # pinned by the equality v_[0] == P_v0 (line above), so adding
+            # v_[0] <= P_vmax[0] creates a structural conflict whenever the
+            # TRAIL cap drops below the live ego speed (e.g. sudden side-flip
+            # to TRAIL when v_obs < v_ego). IPOPT then returns
+            # Infeasible_Problem_Detected even though the physical MPC problem
+            # is solvable — the solver only needs one step to decelerate.
+            # Slack bound also skipped at k=0 for the same reason (n_[0] is
+            # pinned to P_n0 and always inside corridor after clamp).
+            if k > 0:
+                opti.subject_to(v_[k] <= P_vmax[k])
             opti.subject_to(v_[k] >= self.v_min)
-            opti.subject_to(v_[k] <= P_vmax[k])
             opti.subject_to(n_[k] >= P_nlb[k] - slk[k])
             opti.subject_to(n_[k] <= P_nub[k] + slk[k])
             opti.subject_to(slk[k] >= 0.0)
@@ -375,8 +401,15 @@ class FrenetKinMPC:
         nlb = -np.maximum(dR - margin, 1e-3)
         return nlb, nub
 
-    def _build_vmax(self, ref_v, obs_arr, side):
-        """TRAIL caps vmax so ego falls behind the lead obstacle."""
+    def _build_vmax(self, ref_v, obs_arr, side, v0=None):
+        """TRAIL caps vmax so ego falls behind the lead obstacle.
+
+        ### HJ : v3c — when side==TRAIL and v0 > cap, the cap is reached by
+        ramping vmax[k] from v0 down over |v0-cap|/a_dec_ramp seconds. This
+        keeps the NLP feasible while still enforcing the cap in the mid/late
+        horizon. Without the ramp, vmax[0]=cap < v0 conflicts with the
+        v_[0]==v0 equality and IPOPT returns Infeasible_Problem_Detected.
+        """
         vmax = np.minimum(np.asarray(ref_v, dtype=float), self.v_max)
         if side == SIDE_TRAIL and obs_arr is not None:
             cap = self.v_max
@@ -388,7 +421,20 @@ class FrenetKinMPC:
                 v_obs_s = max((sN - s0)
                               / max(self.N * self.dT, 1e-3), 0.0)
                 cap = min(cap, max(v_obs_s * 0.95, self.v_min))
-            vmax = np.minimum(vmax, cap)
+            # Ramp from max(v0, cap) down to cap using a_dec_ramp m/s².
+            # k=0 always ≥ v0 so v_[0]==v0 stays feasible; cap is reached at
+            # step k* = ceil(max(v0-cap,0)/(a_dec_ramp*dT)), from there on
+            # all stages get the tight obstacle cap.
+            a_dec_ramp = float(getattr(self, 'a_dec_ramp', 3.0))
+            if v0 is None:
+                ramp_start = cap
+            else:
+                ramp_start = max(float(v0), cap)
+            N1 = self.N + 1
+            ramp = np.empty(N1, dtype=float)
+            for k in range(N1):
+                ramp[k] = max(cap, ramp_start - a_dec_ramp * self.dT * k)
+            vmax = np.minimum(vmax, ramp)
         vmax = np.maximum(vmax, self.v_min + 0.1)
         return vmax
 
@@ -422,19 +468,57 @@ class FrenetKinMPC:
     # ------------------------------------------------------------------- solve
     def solve(self, initial_state, ref_slice,
               obstacles=None, side=SIDE_CLEAR, bias_scale=1.0):
-        """
-        initial_state: np.ndarray shape (3,) [n0, mu0, v0]
-                       (δ0 carried internally from prev solve)
-        ref_slice:    dict with 'kappa_ref'(N+1), 'd_left_arr'(N+1),
-                      'd_right_arr'(N+1), 'ref_v'(N+1), 'ref_s'(N+1)
-        obstacles:    (n_slot, N+1, 3) [s_o, n_o, w]
-        side:         SIDE_{CLEAR,LEFT,RIGHT,TRAIL}
-        bias_scale:   kept for API compatibility with node (v3 uses 1.0
-                      unconditionally — continuity cost handles smoothness).
+        """Two-pass retry ladder. See class docstring for motivation.
+
+        pass 1: decider's side, full obstacles active.
+        pass 2 (on fail): force SIDE_TRAIL → vmax caps (ramped from v0)
+                          to v_obs×0.95, giving the solver a feasible
+                          "hold behind" plan.
+
+        ### HJ : v3c — former Pass 3 (obs-off + CLEAR) removed. It masked
+        genuine infeasibility with a trajectory that drove straight through
+        the obstacle at ref_v, starving the node-level fallback ladder of
+        the failure signal it needs. Now, if both passes fail, solver
+        returns success=False and the node engages HOLD_LAST → geometric
+        quintic → convergence quintic → raceline-slice (recovery chain
+        the user explicitly asked to use).
         """
         if not self.ready:
             raise RuntimeError('FrenetKinMPC.setup() must be called first')
 
+        self.last_pass_history = []
+
+        # pass 1 — caller's side, obstacles active
+        ok, out = self._solve_single_pass(
+            initial_state, ref_slice, obstacles=obstacles,
+            side=side, bias_scale=bias_scale, pass_idx=1)
+        if ok:
+            self.last_pass = 1
+            return out
+
+        # pass 2 — force TRAIL (v_max cap ramped from v0) but keep obstacles
+        ok, out = self._solve_single_pass(
+            initial_state, ref_slice, obstacles=obstacles,
+            side=SIDE_TRAIL, bias_scale=bias_scale, pass_idx=2)
+        if ok:
+            self.last_pass = 2
+            return out
+
+        # Both passes failed. Report failure to node so the tier1/2/3
+        # recovery ladder engages instead of publishing a dangerous
+        # "obs-off straight-line" plan.
+        self.last_pass = 0
+        return out
+
+    def _solve_single_pass(self, initial_state, ref_slice,
+                           obstacles=None, side=SIDE_CLEAR, bias_scale=1.0,
+                           pass_idx=1):
+        """Single NLP solve. Returns (ok_bool, (speed0, steer0, traj, success)).
+
+        Also populates `self.last_input`, `self.last_infeas_info`,
+        `self.last_return_status`, `self.last_pass_history` so the caller
+        (node.tick_json) can explain WHY the pass failed.
+        """
         n0, mu0, v0 = (float(initial_state[0]),
                        float(initial_state[1]),
                        float(initial_state[2]))
@@ -447,13 +531,15 @@ class FrenetKinMPC:
         rs = np.asarray(ref_slice['ref_s'], dtype=float)
 
         nlb, nub = self._build_wall_bounds(dL, dR)
-        vmax = self._build_vmax(rv, obstacles, side)
+        # ### HJ : v3c — pass v0 so TRAIL vmax can be ramped from v0 down to
+        # the obstacle cap via physical deceleration (a_dec_ramp ≈ 3 m/s²)
+        # rather than snapping to the cap at k=0.
+        vmax = self._build_vmax(rv, obstacles, side, v0=v0)
 
         n0_clamped = float(np.clip(n0, nlb[0], nub[0]))
 
         obs_s_mat, obs_n_mat, obs_active = self._build_obs_params(obstacles)
 
-        # v3: bias_scale kept in signature for node API compat; solver uses 1.0.
         _ = bias_scale
         w_bias = self.w_side_bias
         if side == SIDE_LEFT:
@@ -463,9 +549,6 @@ class FrenetKinMPC:
         else:
             bL, bR = 0.0, 0.0
 
-        # v3: continuity anchor = prev solution shifted one step (receding
-        # horizon). Inactive on first solve. Value is built from _prev_n_profile
-        # (which is the shifted warm-start's n column).
         if self._have_prev and self._prev_n_profile is not None:
             n_prev = self._prev_n_profile.copy()
             cont_active = 1.0
@@ -473,7 +556,6 @@ class FrenetKinMPC:
             n_prev = np.zeros(self.N + 1)
             cont_active = 0.0
 
-        # v3: δ[0] anchor = prev solve's δ[1]. Inactive on first solve.
         de0_val = float(self._prev_de1)
         de0_active_val = 1.0 if self._have_prev else 0.0
 
@@ -503,7 +585,9 @@ class FrenetKinMPC:
         opti.set_value(P['cont_active'], cont_active)
 
         # ---- warm start ----
-        if (self._warm_X is not None
+        # Pass 2+ always re-seed (previous pass's debug values may be in
+        # an inconsistent region).
+        if (pass_idx == 1 and self._warm_X is not None
                 and self._warm_X.shape == (self.N + 1, 4)):
             Xw, Uw = self._warm_X, self._warm_U
         else:
@@ -515,6 +599,29 @@ class FrenetKinMPC:
         opti.set_initial(V['de'], Xw[:, 3])
         opti.set_initial(V['a'],  Uw[:, 0])
         opti.set_initial(V['dd'], Uw[:, 1])
+
+        # Capture input snapshot for every pass (overwritten; only the
+        # LAST pass's input survives on failure — the most revealing one).
+        self.last_input = {
+            'pass': int(pass_idx),
+            'side_effective': int(side),
+            'n0': float(n0), 'n0_clamped': float(n0_clamped),
+            'mu0': float(mu0), 'v0': float(v0),
+            'de0_locked': float(de0_val),
+            'de0_active': float(de0_active_val),
+            'nlb_min': float(np.min(nlb)),
+            'nub_max': float(np.max(nub)),
+            'nlb_0': float(nlb[0]),
+            'nub_0': float(nub[0]),
+            'nlb_min_k': int(np.argmin(np.abs(nlb - nub))),  # tightest slot
+            'corridor_min_width': float(np.min(nub - nlb)),
+            'vmax_min': float(np.min(vmax)),
+            'vmax_max': float(np.max(vmax)),
+            'kappa_abs_max': float(np.max(np.abs(kappa))),
+            'dL_min': float(np.min(dL)), 'dL_max': float(np.max(dL)),
+            'dR_min': float(np.min(dR)), 'dR_max': float(np.max(dR)),
+            'n_obs_active': int(np.sum(obs_active > 0)),
+        }
 
         success = False
         try:
@@ -534,6 +641,12 @@ class FrenetKinMPC:
                     for k, vv in self._cost_exprs.items()}
             except Exception:
                 self.last_cost_breakdown = {}
+            self.last_infeas_info = {}
+            self.last_pass_history.append({
+                'pass': int(pass_idx),
+                'status': self.last_return_status,
+                'ok': True,
+            })
             success = True
         except RuntimeError:
             self.last_return_status = opti.stats().get('return_status', 'FAIL')
@@ -547,17 +660,31 @@ class FrenetKinMPC:
                 dd_sol = np.asarray(opti.debug.value(V['dd'])).ravel()
                 slk_sol = np.asarray(opti.debug.value(V['slk'])).ravel()
                 self.last_cost_breakdown = {}
-            except Exception:
-                self.last_u_sol = None
-                self.last_slack_max = 0.0
-                self.last_cost_breakdown = {}
-                return 0.0, 0.0, None, False
+                # Probe which hard constraint family is violated most.
+                self.last_infeas_info = self._probe_infeasibility(
+                    n_sol, mu_sol, v_sol, de_sol, dd_sol, slk_sol,
+                    nlb, nub, vmax)
+            except Exception as exc:
+                self.last_infeas_info = {'probe_error': str(exc)}
+                self.last_pass_history.append({
+                    'pass': int(pass_idx),
+                    'status': self.last_return_status,
+                    'ok': False,
+                    'err': 'debug_value_failed',
+                })
+                return False, (0.0, 0.0, None, False)
+            self.last_pass_history.append({
+                'pass': int(pass_idx),
+                'status': self.last_return_status,
+                'ok': False,
+                'worst': self.last_infeas_info.get('worst'),
+            })
+            return False, (0.0, 0.0, None, False)
 
         # --- shift warm-start / continuity anchors one step ---
         N = self.N
         X_new = np.column_stack([n_sol, mu_sol, v_sol, de_sol])
         U_new = np.column_stack([a_sol, dd_sol])
-        # shift and pad last row with last known value
         X_shift = np.empty_like(X_new)
         X_shift[:-1] = X_new[1:]
         X_shift[-1] = X_new[-1]
@@ -567,8 +694,8 @@ class FrenetKinMPC:
         self._warm_X = X_shift
         self._warm_U = U_shift
         self._prev_n_profile = X_shift[:, 0].copy()
-        # prev δ[1] becomes the next-solve's δ[0] anchor
-        self._prev_de1 = float(de_sol[1]) if de_sol.shape[0] > 1 else float(de_sol[0])
+        self._prev_de1 = (float(de_sol[1]) if de_sol.shape[0] > 1
+                          else float(de_sol[0]))
         self._have_prev = True
         self.warm = True
 
@@ -576,7 +703,56 @@ class FrenetKinMPC:
         self.last_slack_max = float(np.max(np.abs(slk_sol)))
 
         traj = np.column_stack([rs[:N + 1], n_sol, mu_sol, v_sol])
-        # speed command uses v[0] + a[0]*dT (consistent with v2)
         speed0 = float(v_sol[0] + a_sol[0] * self.dT)
         steer0 = float(de_sol[0])
-        return speed0, steer0, traj, success
+        return True, (speed0, steer0, traj, success)
+
+    def _probe_infeasibility(self, n_sol, mu_sol, v_sol, de_sol, dd_sol,
+                             slk_sol, nlb, nub, vmax):
+        """Identify the most violated hard constraint family. Uses the
+        debug trajectory (IPOPT's last iterate) since the true optimum is
+        infeasible. Returns dict mapping family → (max_violation_m_or_rad,
+        k_of_max) plus 'worst' key naming the family with highest violation.
+        """
+        viol = {}
+        # corridor upper:  n[k] - nub[k] ≤ slack  →  viol = max(0, n - nub - slk)
+        corr_up = (n_sol - nub) - slk_sol
+        corr_dn = (nlb - n_sol) - slk_sol
+        viol['corridor_upper'] = (float(np.max(np.maximum(corr_up, 0.0))),
+                                  int(np.argmax(corr_up)))
+        viol['corridor_lower'] = (float(np.max(np.maximum(corr_dn, 0.0))),
+                                  int(np.argmax(corr_dn)))
+        # speed bounds
+        v_over = v_sol - vmax
+        v_under = self.v_min - v_sol
+        viol['v_over_max'] = (float(np.max(np.maximum(v_over, 0.0))),
+                              int(np.argmax(v_over)))
+        viol['v_under_min'] = (float(np.max(np.maximum(v_under, 0.0))),
+                               int(np.argmax(v_under)))
+        # heading bound
+        mu_abs = np.abs(mu_sol) - self.mu_max
+        viol['mu_abs'] = (float(np.max(np.maximum(mu_abs, 0.0))),
+                          int(np.argmax(mu_abs)))
+        # steering bound
+        de_abs = np.abs(de_sol) - self.delta_max
+        viol['delta_abs'] = (float(np.max(np.maximum(de_abs, 0.0))),
+                             int(np.argmax(de_abs)))
+        # steering-rate bound
+        dd_abs = np.abs(dd_sol) - self.delta_rate_max
+        viol['delta_rate_abs'] = (float(np.max(np.maximum(dd_abs, 0.0))),
+                                  int(np.argmax(dd_abs)))
+        # slack negativity (slk >= 0)
+        slk_neg = -slk_sol
+        viol['slack_neg'] = (float(np.max(np.maximum(slk_neg, 0.0))),
+                             int(np.argmax(slk_neg)))
+
+        # Identify worst family
+        worst_name = max(viol.keys(), key=lambda k: viol[k][0])
+        worst_val, worst_k = viol[worst_name]
+        return {
+            'worst': worst_name,
+            'worst_val': round(worst_val, 4),
+            'worst_k': worst_k,
+            'slack_peak': float(np.max(slk_sol)),
+            **{k: round(v[0], 4) for k, v in viol.items()},
+        }

@@ -253,12 +253,20 @@ class MPCPlannerStateNode:
         # streak > H 이면 tier 2 (Frenet quintic) 진입. tier 2 실패 시 tier 3.
         self._fail_streak = 0
         self._fail_tier_H = int(rospy.get_param('~fail_streak_H', 5))
-        self._last_good_traj = None    # (N+1, 3)  [x, y, psi]
+        self._last_good_traj = None    # (N+1, 5)  [x, y, psi, s, z] (lifted)
+        self._last_good_frenet_traj = None  # (N+1, 4) raw frenet [s, n, mu, v]
         self._last_good_u = None       # (N, 2)    [v, δ]
         self._last_good_s = None       # s at which it was anchored
         self._last_good_time = None    # rospy.Time
         self._quintic_delta_s = float(rospy.get_param('~quintic_delta_s', 8.0))
         self._last_status = None       # for recovery log
+        # ### HJ : v3c — track fallback tier so RViz marker colors stay in
+        # sync with solver health. _publish_debug_markers picks the colour
+        # from (_viz_tier, _viz_status, _viz_pass) set by the owning handler
+        # right before the publish path runs.
+        self._viz_tier = 0
+        self._viz_status = 'OK'
+        self._viz_pass = 1
 
         # ### HJ : Phase 5 — instance YAML for save/reset triggers. Default
         # resolves to config/state_<state>.yaml (same file the launch loaded).
@@ -1208,12 +1216,20 @@ class MPCPlannerStateNode:
         # ### HJ : frenet_kin returns trajectory in (s, n, mu, v). The rest
         # of the pipeline (_publish_outputs, _publish_debug_markers) expects
         # (x, y, psi). Lift before handing off. Also stash the original
-        # frenet trajectory for the tick_json payload (margins etc.).
-        self._last_frenet_traj = None
+        # frenet trajectory for the tick_json payload (margins etc.) AND for
+        # the downstream Wpnt filler (`fill_wpnt_from_s`, 3D-safe) — do NOT
+        # reset to None on failure. Failure paths (tier1/2/3) assign their
+        # own synthetic frenet trajectory below so `_publish_outputs` never
+        # falls back to the 2D xy→s round-trip that aliases overpass layers.
         if (self.solver_backend == 'frenet_kin' and success
                 and trajectory is not None):
             self._last_frenet_traj = np.array(trajectory, copy=True)
             trajectory = self._lift_frenet_to_xy(trajectory, ref_slice)
+        else:
+            # Keep the last successful frenet traj so tier1 can re-publish it
+            # via fill_wpnt_from_s. Tiers 2/3 overwrite this with their own
+            # synthetic (s, n) array before calling _publish_outputs.
+            pass
 
         # ### HJ : Phase 4.3 — 4-tier fallback. Even at tier 3 we still
         # publish a sane Wpnt[] so controller has zero-gap input.
@@ -1247,9 +1263,15 @@ class MPCPlannerStateNode:
             )
             return
 
-        traj_fb = self._try_quintic_fallback(s_cur)
+        # ### HJ : v3b — tier2 gets (s_cur, ego_n) from /odom_frenet directly.
+        # Previously `_try_quintic_fallback(s_cur)` re-projected (car_x, car_y)
+        # via lifter.project_xy_to_sn — 2D nearest that aliases overpass
+        # floors. The /odom_frenet s is z-aware and cannot alias.
+        traj_fb, frenet_fb = self._try_quintic_fallback(
+            s_cur, ego_n, delta_s=self._quintic_delta_s)
         if traj_fb is not None:
-            self._handle_tier2_geometric(traj_fb, status, solve_ms, obs_tag)
+            self._handle_tier2_geometric(
+                traj_fb, frenet_fb, ego_n, status, solve_ms, obs_tag)
             self._debug_log(
                 tier=2, status='GEOMETRIC_FALLBACK', ipopt_status=status,
                 iter_count=iter_count, solve_ms=solve_ms, slack_max=slack_max,
@@ -1260,11 +1282,35 @@ class MPCPlannerStateNode:
             )
             return
 
-        self._handle_tier3_raceline(s_cur, status, solve_ms, obs_tag)
+        # ### HJ : v3b — tier3 used to be a raw raceline slice (n=0 forced),
+        # which jumps the controller whenever ego_n is non-zero. Per user's
+        # recovery-style directive: tier3 is now an aggressive short-Δs
+        # quintic (ego_n → 0 convergence). If even that blows up, we fall
+        # through to the last-resort pure raceline slice.
+        traj_short, frenet_short = self._try_quintic_fallback(
+            s_cur, ego_n, delta_s=max(self._quintic_delta_s * 0.5, 3.0))
+        if traj_short is not None:
+            self._handle_tier3_convergence_quintic(
+                traj_short, frenet_short, ego_n, status, solve_ms, obs_tag)
+            self._debug_log(
+                tier=3, status='CONVERGENCE_QUINTIC', ipopt_status=status,
+                iter_count=iter_count, solve_ms=solve_ms, slack_max=slack_max,
+                trajectory=traj_short, u_sol=None, obs_arr=obs_arr,
+                obs_tag=obs_tag, ref_slice=ref_slice,
+                initial_state=initial_state, ego_s=s_cur, ego_n=ego_n,
+                warm_used=warm_used,
+            )
+            return
+
+        traj_last = self._handle_tier3_raceline(
+            s_cur, status, solve_ms, obs_tag)
+        # ### HJ : v3b — feed the raceline-slice trajectory to debug_log so
+        # the RViz marker keeps showing a trajectory line even in absolute
+        # worst-case (both quintics raised).
         self._debug_log(
             tier=3, status='RACELINE_SLICE', ipopt_status=status,
             iter_count=iter_count, solve_ms=solve_ms, slack_max=slack_max,
-            trajectory=None, u_sol=None, obs_arr=obs_arr, obs_tag=obs_tag,
+            trajectory=traj_last, u_sol=None, obs_arr=obs_arr, obs_tag=obs_tag,
             ref_slice=ref_slice, initial_state=initial_state,
             ego_s=s_cur, ego_n=ego_n, warm_used=warm_used,
         )
@@ -1451,9 +1497,17 @@ class MPCPlannerStateNode:
             rospy.loginfo('[mpc][%s] recovered after tier=%s  streak=%d',
                           rospy.get_name(), self._last_status, self._fail_streak)
         self._fail_streak = 0
+        self._viz_tier = 0
+        self._viz_status = 'OK'
+        self._viz_pass = int(getattr(self.solver, 'last_pass', 1) or 1)
 
         self._publish_outputs(trajectory)
         self._last_good_traj = np.array(trajectory, copy=True)
+        # ### HJ : v3b — cache raw frenet too so HOLD_LAST can re-publish
+        # via fill_wpnt_from_s (3D-safe) instead of fill_wpnt (2D xy lookup).
+        if self._last_frenet_traj is not None:
+            self._last_good_frenet_traj = np.array(
+                self._last_frenet_traj, copy=True)
         u_sol = getattr(self.solver, 'last_u_sol', None)
         self._last_good_u = np.array(u_sol, copy=True) if u_sol is not None else None
         self._last_good_s = s_cur
@@ -1471,6 +1525,14 @@ class MPCPlannerStateNode:
     def _handle_tier1_hold_last(self, ipopt_status, solve_ms, obs_tag):
         """Re-publish last good trajectory. No s-shift yet (Phase 4 minimal);
         controller lookahead handles small ego progress within one tick."""
+        self._viz_tier = 1
+        self._viz_status = 'HOLD_LAST'
+        # ### HJ : v3b — restore the cached raw frenet trajectory so
+        # _publish_outputs takes the s-direct path (fill_wpnt_from_s) and
+        # bypasses xy→s projection that would alias overpass floors.
+        self._last_frenet_traj = (
+            np.array(self._last_good_frenet_traj, copy=True)
+            if self._last_good_frenet_traj is not None else None)
         self._publish_outputs(self._last_good_traj,
                               u_sol_override=self._last_good_u)
         self._publish_status('HOLD_LAST streak=%d obs=%s' %
@@ -1483,74 +1545,145 @@ class MPCPlannerStateNode:
         )
 
     # ---- Tier 2 ------------------------------------------------------------
-    def _try_quintic_fallback(self, s_cur):
-        """Build (N+1, 3) Cartesian trajectory from Frenet quintic. Returns
-        None iff the underlying projection/lifter blow up."""
+    def _try_quintic_fallback(self, s_cur, ego_n, delta_s=None):
+        """### HJ : v3b — recovery-style "ego_n → 0" smooth return primitive.
+
+        Uses (s_cur, ego_n) from /odom_frenet directly so the 3D overpass
+        layer is preserved. Previous implementation called
+        `lifter.project_xy_to_sn(car_x, car_y)` which is 2D nearest and
+        aliases overpass floors at bridge entry — exactly the failure mode
+        the user is debugging (solver dies at bridge, tier2 then re-projects
+        to the wrong floor and sends the car onto the lower path).
+
+        Returns (xy_traj (N+1,5) [x, y, psi, s, z], frenet (N+1,4) [s, n, 0, v])
+        or (None, None) if the lifter blows up.
+        """
+        if delta_s is None:
+            delta_s = self._quintic_delta_s
         try:
-            s_raceline, n_raceline = self.lifter.project_xy_to_sn(
-                self.car_x, self.car_y)
-            psi_track = self.lifter._interp_psi(s_raceline)
+            psi_track = self.lifter._interp_psi(s_cur)
             psi_delta = float(np.arctan2(
                 np.sin(self.car_yaw - psi_track),
                 np.cos(self.car_yaw - psi_track)))
-            traj_fb = build_quintic_fallback(
-                self.lifter, s_raceline, n_raceline, psi_delta,
-                delta_s=self._quintic_delta_s, n_samples=self.N + 1)
-            return traj_fb
+            xy_traj, sn_traj = build_quintic_fallback(
+                self.lifter, s_cur, ego_n, psi_delta,
+                delta_s=delta_s, n_samples=self.N + 1,
+                return_frenet=True)
+            # Augment xy_traj (N+1,3) → (N+1,5) with carried [s, z] so the
+            # downstream viz/publish path uses 3D-safe z instead of the
+            # marker-time xy nearest-index lookup (which would alias floors).
+            N1 = xy_traj.shape[0]
+            aug = np.zeros((N1, 5), dtype=np.float64)
+            aug[:, :3] = xy_traj
+            for i in range(N1):
+                s_i = float(sn_traj[i, 0])
+                aug[i, 3] = s_i
+                aug[i, 4] = float(self.lifter._interp(s_i, self.lifter.g_z))
+            # Frenet companion for fill_wpnt_from_s (solver-frenet-shape
+            # compatible: (N+1, 4) [s, n, mu=0, v=ego_v_placeholder]).
+            v_fb = float(np.clip(self.car_vx, 0.5,
+                                 max(self.solver.v_max, 0.5)))
+            frenet = np.zeros((N1, 4), dtype=np.float64)
+            frenet[:, 0] = sn_traj[:, 0]
+            frenet[:, 1] = sn_traj[:, 1]
+            frenet[:, 3] = v_fb
+            return aug, frenet
         except Exception as exc:  # pragma: no cover — guarded log only
             rospy.logerr_throttle(
                 1.0, '[mpc fallback tier2][%s] quintic build raised: %s',
                 rospy.get_name(), exc)
-            return None
+            return None, None
 
-    def _handle_tier2_geometric(self, traj_fb, ipopt_status, solve_ms, obs_tag):
+    def _handle_tier2_geometric(self, traj_fb, frenet_fb, ego_n,
+                                ipopt_status, solve_ms, obs_tag):
+        self._viz_tier = 2
+        self._viz_status = 'GEOMETRIC_FALLBACK'
         # Synthetic u_sol — constant-velocity placeholder so the lifter can
         # still fill vx_mps / ax_mps2. v chosen as mean of the raceline-slice
         # local target to stay close to the velocity planner's expectation.
         v_fb = float(np.clip(self.car_vx, 0.5, max(self.solver.v_max, 0.5)))
         u_fb = np.zeros((self.N, 2), dtype=np.float64)
         u_fb[:, 0] = v_fb
+        # ### HJ : v3b — stash synthetic frenet so _publish_outputs takes
+        # the s-direct path (fill_wpnt_from_s) and does NOT re-project xy.
+        self._last_frenet_traj = frenet_fb
         self._publish_outputs(traj_fb, u_sol_override=u_fb)
-        n0 = self.lifter.project_xy_to_sn(self.car_x, self.car_y)[1]
         self._publish_status('GEOMETRIC_FALLBACK streak=%d n0=%.2f obs=%s' %
-                             (self._fail_streak, n0, obs_tag))
+                             (self._fail_streak, ego_n, obs_tag))
         self._last_status = 'GEOMETRIC_FALLBACK'
         rospy.logwarn_throttle(
             0.5,
             '[mpc fallback tier2][%s] GEOMETRIC streak=%d n0=%.2f Δs=%.1f '
             'ipopt=%s solve=%.1fms obs=%s',
-            rospy.get_name(), self._fail_streak, n0, self._quintic_delta_s,
+            rospy.get_name(), self._fail_streak, ego_n, self._quintic_delta_s,
             ipopt_status, solve_ms, obs_tag,
         )
 
-    # ---- Tier 3 ------------------------------------------------------------
+    # ---- Tier 3 (primary) -------------------------------------------------
+    def _handle_tier3_convergence_quintic(self, traj_fb, frenet_fb, ego_n,
+                                          ipopt_status, solve_ms, obs_tag):
+        """### HJ : v3b — "recovery spliner" analogue. Ego_n → 0 over a
+        shorter Δs (more aggressive than tier2). Used when tier2 quintic
+        would also be feasible but we want a snappier return-to-center
+        shape. Controller still sees continuous (s, n) from ego pose."""
+        self._viz_tier = 3
+        self._viz_status = 'CONVERGENCE_QUINTIC'
+        v_fb = float(np.clip(self.car_vx, 0.5, max(self.solver.v_max, 0.5)))
+        u_fb = np.zeros((self.N, 2), dtype=np.float64)
+        u_fb[:, 0] = v_fb
+        self._last_frenet_traj = frenet_fb
+        self._publish_outputs(traj_fb, u_sol_override=u_fb)
+        self._publish_status('CONVERGENCE_QUINTIC streak=%d n0=%.2f obs=%s' %
+                             (self._fail_streak, ego_n, obs_tag))
+        self._last_status = 'CONVERGENCE_QUINTIC'
+        rospy.logerr_throttle(
+            0.5,
+            '[mpc fallback tier3][%s] CONVERGENCE_QUINTIC streak=%d n0=%.2f '
+            'ipopt=%s solve=%.1fms obs=%s',
+            rospy.get_name(), self._fail_streak, ego_n, ipopt_status,
+            solve_ms, obs_tag,
+        )
+
+    # ---- Tier 3 (absolute last-resort) ------------------------------------
     def _handle_tier3_raceline(self, s_cur, ipopt_status, solve_ms, obs_tag):
-        """Last-resort: publish raceline slice itself as trajectory (N+1, 3).
-        Not ego-anchored — controller may jump, but output never drops."""
+        """Only reached when BOTH tier2 and tier3 quintics raised. Pure
+        raceline slice (n=0, no ego-anchor). Controller may see a one-tick
+        jump but output never drops."""
+        self._viz_tier = 3
+        self._viz_status = 'RACELINE_SLICE'
         N_total = self.N + 1
         ds_grid = np.linspace(0.0, max(self._quintic_delta_s, 4.0), N_total)
-        traj = np.zeros((N_total, 3), dtype=np.float64)
+        traj = np.zeros((N_total, 5), dtype=np.float64)
+        frenet = np.zeros((N_total, 4), dtype=np.float64)
         for i, ds in enumerate(ds_grid):
             s_i = s_cur + ds
             x, y = self.lifter.sn_to_xy(s_i, 0.0)
             psi = self.lifter._interp_psi(s_i)
+            z = float(self.lifter._interp(s_i, self.lifter.g_z))
             traj[i, 0] = x
             traj[i, 1] = y
             traj[i, 2] = psi
+            traj[i, 3] = s_i
+            traj[i, 4] = z
+            frenet[i, 0] = s_i
+            frenet[i, 1] = 0.0
 
         v_fb = float(np.clip(self.car_vx, 0.5, max(self.solver.v_max, 0.5)))
         u_fb = np.zeros((self.N, 2), dtype=np.float64)
         u_fb[:, 0] = v_fb
+        frenet[:, 3] = v_fb
+        self._last_frenet_traj = frenet
         self._publish_outputs(traj, u_sol_override=u_fb)
         self._publish_status('RACELINE_SLICE streak=%d obs=%s' %
                              (self._fail_streak, obs_tag))
         self._last_status = 'RACELINE_SLICE'
         rospy.logerr_throttle(
             0.5,
-            '[mpc fallback tier3][%s] RACELINE_SLICE streak=%d ipopt=%s '
-            'solve=%.1fms obs=%s — geometric failed or no last-good',
+            '[mpc fallback tier3-last][%s] RACELINE_SLICE streak=%d ipopt=%s '
+            'solve=%.1fms obs=%s — BOTH quintics failed',
             rospy.get_name(), self._fail_streak, ipopt_status, solve_ms, obs_tag,
         )
+        return traj
 
     def _publish_outputs(self, trajectory, u_sol_override=None):
         """trajectory: (N+1, 3) [x, y, psi]. Publish:
@@ -1667,13 +1800,29 @@ class MPCPlannerStateNode:
         line.type = Marker.LINE_STRIP
         line.action = Marker.ADD
         line.scale.x = 0.08
-        # Color by state — easy RViz disambiguation.
-        if self.state == 'overtake':
-            line.color = ColorRGBA(r=1.0, g=0.4, b=0.0, a=0.9)   # orange
-        elif self.state == 'recovery':
-            line.color = ColorRGBA(r=0.2, g=0.4, b=1.0, a=0.9)   # blue
+        # ### HJ : v3c — rainbow-graded solver health colour (best→worst):
+        #   tier0 pass1  → red     (NLP 1-pass clean, primary mode)
+        #   tier0 pass2  → orange  (NLP needed the TRAIL retry)
+        #   tier1        → yellow  (HOLD_LAST — re-use last good)
+        #   tier2        → green   (GEOMETRIC_FALLBACK quintic Δs≈8m)
+        #   tier3 conv.  → cyan    (CONVERGENCE_QUINTIC Δs≈4m)
+        #   tier3 rline  → blue    (RACELINE_SLICE — absolute last)
+        tier = int(getattr(self, '_viz_tier', 0))
+        status = str(getattr(self, '_viz_status', 'OK'))
+        vpass = int(getattr(self, '_viz_pass', 1))
+        if tier == 0 and vpass == 1:
+            rgb = (1.0, 0.05, 0.05)   # red
+        elif tier == 0:
+            rgb = (1.0, 0.55, 0.0)    # orange
+        elif tier == 1:
+            rgb = (1.0, 0.95, 0.0)    # yellow
+        elif tier == 2:
+            rgb = (0.1, 0.9, 0.2)     # green
+        elif tier == 3 and status == 'CONVERGENCE_QUINTIC':
+            rgb = (0.0, 0.85, 0.95)   # cyan
         else:
-            line.color = ColorRGBA(r=0.1, g=0.9, b=0.2, a=0.9)   # green
+            rgb = (0.1, 0.3, 1.0)     # blue (RACELINE_SLICE / unknown)
+        line.color = ColorRGBA(r=rgb[0], g=rgb[1], b=rgb[2], a=0.95)
         line.pose.orientation.w = 1.0
         for i in range(trajectory.shape[0]):
             pt = Point()
@@ -1842,6 +1991,31 @@ class MPCPlannerStateNode:
             except Exception:
                 pass
 
+        # ### HJ : v3b — solver diagnostic snapshot. Populated on every pass
+        # inside FrenetKinMPC.solve(); on failure the LAST pass's input is
+        # retained so we can see what IPOPT was choking on.
+        solver_input = getattr(self.solver, 'last_input', {}) or {}
+        solver_infeas = getattr(self.solver, 'last_infeas_info', {}) or {}
+        solver_pass = int(getattr(self.solver, 'last_pass', 0))
+        pass_hist = getattr(self.solver, 'last_pass_history', []) or []
+
+        # ### HJ : v3b — prediction freshness. Callbacks for /opponent_prediction
+        # and /tracking/obstacles live on separate rospy subscriber threads,
+        # so they keep updating even while _plan_loop wrestles with infeasible
+        # NLPs. Publishing the age here lets the user verify that (e.g. while
+        # the solver was dead for 0.87s, did prediction keep flowing?).
+        _now = rospy.Time.now()
+        def _age(t):
+            if t is None:
+                return None
+            try:
+                return float((_now - t).to_sec())
+            except Exception:
+                return None
+        predict_age_s = _age(getattr(self, '_obs_predict_t', None))
+        track_age_s = _age(getattr(self, '_obs_track_t', None))
+        opp_age_s = _age(getattr(self, '_opp_wpnts_t', None))
+
         payload = {
             'tick': tick,
             't': t_now,
@@ -1855,6 +2029,19 @@ class MPCPlannerStateNode:
             'warm_used': warm_used,
             'obs_tag': obs_tag,
             'fail_streak': int(getattr(self, '_fail_streak', 0)),
+            # Solver-level diagnostics (new in v3b).
+            'solver_pass': solver_pass,
+            'solver_pass_hist': pass_hist,
+            'solver_input': solver_input,
+            'solver_infeas': solver_infeas,
+            # Prediction freshness (independent-thread callbacks — these
+            # should keep ticking even when the solver is stuck at infeasibility).
+            'predict_age_s': (round(predict_age_s, 3)
+                              if predict_age_s is not None else None),
+            'track_age_s': (round(track_age_s, 3)
+                            if track_age_s is not None else None),
+            'opp_age_s': (round(opp_age_s, 3)
+                          if opp_age_s is not None else None),
             'ego': {
                 's': round(ego_s, 4) if ego_s == ego_s else None,
                 'n': round(ego_n, 4) if ego_n == ego_n else None,

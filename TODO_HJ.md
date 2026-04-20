@@ -54,23 +54,29 @@
 - [ ] **resample_ds_m** on/off 비교 (공간 등간격)
 - [ ] **tail-blending** 동작 확인 — `_pub_local_wpnts()` 내부 cosine ramp (end 1~2m) — observation 모드에서는 blending 없이 발행하는지 vs blend 버전 비교
 
-### 2.2 MPC 재설계 (Frenet kinematic + external side decider)
+### 2.2 MPC 재설계 (Frenet kinematic + external side decider) — **v3c live-debug 완료 (2026-04-21)**
 
 > ⚠️ **2026-04-20 비상 재설계** — 기존 n(s)-only `frenet_d_solver` 백엔드가 벽 hug/tick 진동/속도 추적 실패. 상세: `HJ_docs/mpc_redesign_frenet_kin_20260420.md`.
-> 코드 + Docker 빌드까지 완료, **live-test 및 튜닝 미완**. 다음 세션 첫 할 일.
+> **2026-04-21 v3c live-debug 세션** — structural infeasibility 근본 원인 발견 + 3-fix 적용 + 1997-tick 검증. 상세: `HJ_docs/mpc_frenet_kin_v3c_live_debugging_20260421.md`.
 
 - [x] **271-tick 진단** — `margin_L_min=-0.00`(wall_safe 미적용), `jitter_rms p95=0.24m`, `u0.v=6.7 vs ego.v=3.5` 괴리 확인
 - [x] **백업 규칙 적용** — solver/node/configs/launch `_backup_20260420` 접미사 보존 (롤백 가능)
-- [x] **FrenetKinMPC 솔버 구현** — `src/frenet_kin_solver.py`. state `[n, mu, v]`, control `[a, delta]`, Liniger 이산 동역학. hard corridor + slack, half-plane 장애물 제약, progress-maximization cost
-- [x] **SideDecider 구현** — `src/side_decider.py`. LEFT/RIGHT/TRAIL/CLEAR, hold_ticks=5 hysteresis
+- [x] **FrenetKinMPC 솔버 구현** — `src/frenet_kin_solver.py`. state `[n, mu, v, delta]`, control `[a, delta_dot]`, Liniger 이산 동역학. soft corridor + slack, Gaussian obstacle bubble + side bias, progress-maximization cost
+- [x] **SideDecider 구현** — `src/side_decider.py`. LEFT/RIGHT/TRAIL/CLEAR, hold_ticks=5 hysteresis, feasibility gate `min_pass_margin=0.10`
 - [x] **노드 와이어링** — `node/mpc_planner_state_node.py`에 `solver_backend=frenet_kin` 기본, `_decide_side`, `_lift_frenet_to_xy`(xy round-trip 없음)
 - [x] **Live debug 토픽** — `~debug/tick_json` (std_msgs/String), `~debug/markers` (MarkerArray). Claude가 rostopic echo로 실시간 모니터
 - [x] **launch 충돌 해소** — `instance_name` 기본값 `mpc_$(state)` → sampling의 `/overtake`와 분리
-- [ ] **Live smoke-test** — 3D 환경 기동 후 tick_json 합격선 (margin_L_min≥0.15, jitter_rms p95≤0.05, u0.v≈ego.v) 확인. **다음 세션 최우선**
-- [ ] **첫 solve infeasible 대응** — `_seed_warm_start` 초기 시드 품질 점검, 필요시 IPOPT iter 상한/warm-start 전략 튜닝
+- [x] **Live smoke-test 1997 tick 완료** — solve_ms p99=91ms, max=125ms, jitter_rms p95=0.025m, 0 fails (tier0 pass=1 100%)
+- [x] **v3c fix #1 — vmax hard bound k=0 skip** — `v_[0]==v0` equality와 `v_[0]≤vmax[0]` 충돌 (structural infeasibility) 해소
+- [x] **v3c fix #2 — TRAIL vmax 감속 램프** — 1-tick discontinuity 대신 `a_dec_ramp=3.0 m/s²`로 ramp-from-v0
+- [x] **v3c fix #3 — Pass 3 (obs-off) 제거** — feasibility masking 제거, 2-pass로 축소 후 노드 fallback ladder에 위임
+- [x] **RViz 마커 색 — rainbow (red→blue) by tier/pass** — tier0 pass1=빨강, tier0 pass2=주황, tier1=노랑, tier2=녹색, tier3_CQ=시안, tier3_RACELINE=파랑
+- [ ] **장애물 cost body-edge 거리 기반 재정의** — 현재 Gaussian bubble은 점-점 거리 기준, ego half_width + obs half_width 미반영. 상세: `HJ_docs/mpc_frenet_kin_v3c_live_debugging_20260421.md` §5
+- [ ] **obs_prediction 개수 (`n_obs_max=2`) 재검토** — `n_obs_raw=20` 관측 대비 2개 slot이 충분한지, 필터링 기준(시간/공간/TTC)과 함께 재정의. 상세: `HJ_docs/mpc_frenet_kin_v3c_live_debugging_20260421.md` §6
+- [ ] **🔥 장애물 실물 1개 ↔ tick_json 2개 중복 체크** — predictor / `_build_obstacle_array` 중복 주입 여부 확인, 있으면 `n_obs_max` 튜닝보다 먼저 제거. §6.3 (1) 참조
 - [ ] **state=observe/recovery 교차 검증** — 세 state 각각 한 번씩 돌려서 role output 동작 확인
 - [ ] **장애물 없을 때 SIDE_CLEAR 경로** — corridor-only 케이스 smooth 유지 (obs 주입 게이팅 확인)
-- [ ] **TRAIL per-k v cap** — 현재 `ref_v`만 의존, 장애물 가속/감속 예측은 미포함 (GP predictor 연결은 후순위)
+- [ ] **TRAIL per-k v cap 개선** — 현재 `ref_v` + 물리 deceleration ramp만 적용, 장애물 가속/감속 예측은 미포함 (GP predictor 연결은 후순위)
 - [ ] **합격 시 Phase X 진입** — `_observation` suffix 제거, state_machine 직결 (사용자 승인 필수)
 
 ### 2.3 SQP (3d_sqp_avoidance_node) — 베이스라인 유지
@@ -123,7 +129,8 @@
   - `HJ_docs/sampling_planner_state_machine_integration.md` — Sampling state-aware 통합 플랜
   - `HJ_docs/mpcc_planner_trial_v1.md` — MPCC 초기 포팅
   - `HJ_docs/mpc_planner_state_machine_integration.md` — MPCC state-aware 통합 플랜 (기존 Phase 계획, 재설계로 일부 대체됨)
-  - **`HJ_docs/mpc_redesign_frenet_kin_20260420.md` — Frenet kinematic MPC 재설계 (현행)**
+  - **`HJ_docs/mpc_redesign_frenet_kin_20260420.md` — Frenet kinematic MPC 재설계 (기반 설계)**
+  - **`HJ_docs/mpc_frenet_kin_v3c_live_debugging_20260421.md` — v3c live-debug 세션 (현행, 1997-tick validation + obs TODO)**
   - `HJ_docs/3d_dynamic_prediction_and_planner.md` — 3D prediction + SQP 포팅 (베이스라인 참고)
 - IY 작업분 (HJ는 참고만):
   - `IY_docs/rolling_horizon_overtake_planner.md`, `IY_docs/TODO_HJ.md`
