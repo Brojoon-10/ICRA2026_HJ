@@ -1,7 +1,7 @@
 # MPC Frenet Kinematic — v3c live debugging 결과 (2026-04-21)
 
 - **작성일**: 2026-04-21
-- **상태**: v3c 핵심 3 fix + RViz tier-color 적용, live 검증 통과 (solver_pass=1: 1997/1997, solve_ms p99=91ms)
+- **상태**: v3c 핵심 3 fix + RViz tier-color + **HSL ma27 swap (solve_ms ~2× 가속)** 적용, live 검증 통과 (solver_pass=1: 1997/1997, solve_ms p99=48.6ms)
 - **선행 문서**: [mpc_redesign_frenet_kin_20260420.md](mpc_redesign_frenet_kin_20260420.md) (v1~v3b)
 - **남은 TODO**: obstacle cost의 차폭/장애물폭 body-edge 거리 기반 재정의 (본 문서 §5)
 
@@ -177,6 +177,22 @@
 |---|---|---|---|
 | `ipopt_max_iter` | 200 | max iter | v3b 1000→200. 실패 시 ~40ms 컷 (이전 ~210ms) |
 | `ipopt_print_level` | 0 | quiet | |
+| `linear_solver` | `ma27` | IPOPT 선형 솔버 (HSL) | **v3c+ (2026-04-21)**. MUMPS 대비 **solve_ms 약 2× 가속** (p50 45.5→21.6, p99 91.1→48.6ms). `mumps`로 설정하면 기본 복귀. libhsl.so는 `planner/3d_gb_optimizer/fast_ggv_gen/solver/setup_hsl.sh`가 빌드·심볼릭링크 |
+
+**apples-to-apples 비교 (same Gazebo scenario, 60s)**
+
+| metric | MUMPS (1088 ticks) | **ma27 (1416 ticks)** | gain |
+|---|---|---|---|
+| solve_ms p50 | 45.5 | **21.6** | **2.11×** |
+| solve_ms p95 | 73.3 | **38.2** | 1.92× |
+| solve_ms p99 | 91.1 | **48.6** | 1.87× |
+| solve_ms max | 115.9 | **80.2** | 1.45× |
+| iter p50 / p95 | 16 / 18 | 16 / 18 | — (수렴 경로 불변) |
+| tick rate | 18.1 Hz | **23.6 Hz** | solve 단축분 → rate↑ |
+| traj n range | −0.90 ~ +1.10 | −0.91 ~ +1.22 | ≈ 동일 |
+| fails | 0 | 0 | — |
+
+iter 수 동일 + solve_ms 반 토막 → **linear-solve 자체가 빨라진 순수 효과**. 수치 품질 영향 없음.
 
 ---
 

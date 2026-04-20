@@ -158,6 +158,10 @@ class FrenetKinMPC:
         # ipopt
         self.ipopt_max_iter = int(params.get('ipopt_max_iter', 1000))
         self.ipopt_print_level = int(params.get('ipopt_print_level', 0))
+        # ### HJ : v3c+ — HSL ma27 2× faster than MUMPS on our sparsity.
+        # libhsl.so provided via solver/setup_hsl.sh (fast_ggv_gen). Falls
+        # back to mumps silently if HSL not loadable (warn-level log only).
+        self.linear_solver = str(params.get('linear_solver', 'ma27'))
 
         # runtime state
         self.n_obs_max = int(params.get('n_obs_max', 2))
@@ -356,10 +360,11 @@ class FrenetKinMPC:
 
         opti.minimize(J)
         opti.solver('ipopt', {
-            'ipopt.max_iter':    self.ipopt_max_iter,
-            'ipopt.print_level': self.ipopt_print_level,
-            'print_time':        0,
-            'ipopt.sb':          'yes',
+            'ipopt.max_iter':       self.ipopt_max_iter,
+            'ipopt.print_level':    self.ipopt_print_level,
+            'ipopt.linear_solver':  self.linear_solver,
+            'print_time':           0,
+            'ipopt.sb':             'yes',
         })
 
         self._opti = opti

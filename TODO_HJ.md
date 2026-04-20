@@ -71,6 +71,7 @@
 - [x] **v3c fix #2 — TRAIL vmax 감속 램프** — 1-tick discontinuity 대신 `a_dec_ramp=3.0 m/s²`로 ramp-from-v0
 - [x] **v3c fix #3 — Pass 3 (obs-off) 제거** — feasibility masking 제거, 2-pass로 축소 후 노드 fallback ladder에 위임
 - [x] **RViz 마커 색 — rainbow (red→blue) by tier/pass** — tier0 pass1=빨강, tier0 pass2=주황, tier1=노랑, tier2=녹색, tier3_CQ=시안, tier3_RACELINE=파랑
+- [x] **HSL ma27 swap (2026-04-21)** — IPOPT `linear_solver: ma27`. 같은 시나리오 60s 비교에서 solve_ms p50 45.5→21.6ms (2.11×), p99 91.1→48.6ms (1.87×), tick rate 18.1→23.6Hz. iter 수 동일 → 순수 linear-solve 가속. libhsl.so는 `planner/3d_gb_optimizer/fast_ggv_gen/solver/setup_hsl.sh`가 제공
 - [ ] **장애물 cost body-edge 거리 기반 재정의** — 현재 Gaussian bubble은 점-점 거리 기준, ego half_width + obs half_width 미반영. 상세: `HJ_docs/mpc_frenet_kin_v3c_live_debugging_20260421.md` §5
 - [ ] **obs_prediction 개수 (`n_obs_max=2`) 재검토** — `n_obs_raw=20` 관측 대비 2개 slot이 충분한지, 필터링 기준(시간/공간/TTC)과 함께 재정의. 상세: `HJ_docs/mpc_frenet_kin_v3c_live_debugging_20260421.md` §6
 - [ ] **🔥 장애물 실물 1개 ↔ tick_json 2개 중복 체크** — predictor / `_build_obstacle_array` 중복 주입 여부 확인, 있으면 `n_obs_max` 튜닝보다 먼저 제거. §6.3 (1) 참조
