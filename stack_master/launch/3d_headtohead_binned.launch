@@ -1,0 +1,130 @@
+<!-- 3D headtohead (binned-GP variant): controller + state machine + planners.
+
+     Same as 3d_headtohead.launch, except the GP PREDICTION block uses the
+     single bin-based learner (3d_gp_node_binned.py) in place of the legacy
+     three-node learning chain (3d_opponent_trajectory.py,
+     gaussian_process_opp_traj.py, predictor_opponent_trajectory.py).
+
+     ### HJ : multi-opponent capable via num_opponents>=2 (slot upper bound).
+     num_opponents=1 keeps the original single-opp path bit-identical.
+
+     3d_opp_prediction.py (propagation) and dynamic_prediction_server.py
+     (rqt tuner) are kept untouched because they live downstream of the
+     /opponent_trajectory topic and don't care which learner produced it. -->
+<launch>
+  <arg name="racecar_version" default="$(env CAR_NAME)" />
+  <arg name="ctrl_algo" default="PP" />
+  <arg name="LU_table" default="SRX1-0427" />
+  <arg name="MAP_mode" default="safe" />
+  <arg name="perception" default="False" />
+  <arg name="enable_planners" default="False" />
+  <arg name="enable_prediction" default="False" />
+  <arg name="dynamic_avoidance_mode" default="SQP" />
+  <arg name="use_vd_prediction" default="False" />
+
+  <!-- Binned-GP tuning knobs (exposed here so the variant launch stays the
+       single place you adjust them while testing). -->
+  <arg name="bin_spacing" default="0.1" />
+  <arg name="bin_capacity" default="2" />
+  <arg name="coverage_threshold" default="0.30" />
+  <arg name="refit_new_bins" default="5" />
+  <arg name="use_ccma_whole_lap" default="True" />
+  <arg name="ccma_coverage" default="0.95" />
+
+  <!-- ### HJ : Multi-opponent tuning knobs.
+       num_opponents=1  -> legacy single-opp mode (bit-identical to before).
+       num_opponents>=2 -> slot upper bound; actual tracked opp count is 0~N dynamic. -->
+  <arg name="num_opponents"    default="3" />
+  <arg name="recent_seen_sec"  default="0.3" />
+  <arg name="pool_size"        default="2" />
+
+  <param name="measure" value="False" />
+
+  <!-- ══════════════════ PERCEPTION (disabled until 3D ready) ══════════════════ -->
+  <!--
+  <group if="$(arg perception)">
+    <include file="$(find stack_master)/launch/perception.launch"/>
+  </group>
+  -->
+
+  <!-- ══════════════════ CONTROLLER ══════════════════ -->
+  <rosparam ns="L1_controller" command="load"
+    file="$(find stack_master)/config/$(arg racecar_version)/controller.yaml" />
+  <node pkg="controller" name="dyn_controller" type="l1_params_server.py" output="screen" />
+  <node pkg="controller" name="controller_manager" type="controller_manager.py" output="screen">
+    <param name="LU_table" value="$(arg LU_table)" />
+    <param name="ctrl_algo" value="$(arg ctrl_algo)" />
+  </node>
+
+  <!-- ══════════════════ STATE MACHINE (3D: 2.5D vel planner) ══════════════════ -->
+  <node pkg="state_machine" type="dynamic_statemachine_server.py" name="dyn_statemachine" output="screen" />
+  <node pkg="state_machine" type="3d_state_machine_node.py" name="state_machine">
+    <rosparam file="$(find stack_master)/config/state_machine_params.yaml" />
+  </node>
+
+  <!-- ══════════════════ STATE MACHINE PLANNER PARAMS ══════════════════ -->
+  <group ns="dyn_planners_statemachine">
+    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="global_tracking" /></include>
+    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="recovery_planner" /></include>
+    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="start_planner" /></include>
+    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="static_avoidance_planner" /></include>
+    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="dynamic_avoidance_planner" /></include>
+  </group>
+
+  <!-- ══════════════════ 3D PLANNERS (enable_planners:=True) ══════════════════ -->
+  <group if="$(arg enable_planners)">
+
+    <!-- Planner tuning servers (rqt: dyn_planner_tuner/) -->
+    <group ns="dyn_planner_tuner">
+      <node pkg="recovery_spliner" type="dynamic_recovery_spline_server.py" name="recovery" output="screen" />
+      <node pkg="spliner" type="dynamic_spline_server.py" name="static_avoidance" output="screen" />
+    </group>
+
+    <!-- Recovery (3D) -->
+    <node pkg="recovery_spliner" type="3d_recovery_spliner_node.py" name="recovery_planner_spline" output="screen" />
+
+    <!-- Start planner (unchanged) -->
+    <node pkg="spliner" type="start_spline_node_v2.py" name="start_planner" output="screen"/>
+
+    <!-- Static Avoidance (3D) -->
+    <node pkg="spliner" type="3d_static_avoidance_node.py" name="planner_spline" output="screen">
+      <remap from="/planner/avoidance/otwpnts" to="/planner/avoidance/static_otwpnts"/>
+    </node>
+
+  </group>
+
+  <!-- ══════════════════ DYNAMIC AVOIDANCE (3D SQP, enable_planners:=True) ══════════════════ -->
+  <group if="$(arg enable_planners)">
+    <group if="$(eval dynamic_avoidance_mode == 'SQP')">
+      <node pkg="sqp_planner" type="dynamic_sqp_server.py" name="dynamic_sqp_tuner_node" output="screen"/>
+      <node pkg="sqp_planner" type="3d_sqp_avoidance_node.py" name="planner_sqp" output="screen"/>
+      <node pkg="sqp_planner" type="update_waypoints.py" name="waypoint_updater" output="screen"/>
+    </group>
+  </group>
+
+  <!-- ══════════════════ GP PREDICTION (binned variant, enable_prediction:=True) ══════════════════ -->
+  <group if="$(arg enable_prediction)">
+    <!-- Shared: rqt tuner + real-time propagation (unchanged from 3d_headtohead.launch) -->
+    <node pkg="gp_traj_predictor" type="dynamic_prediction_server.py" name="dynamic_prediction_tuner_node" output="screen"/>
+    <node pkg="gp_traj_predictor" type="3d_opp_prediction.py" name="opponent_propagation_predictor" output="screen">
+      <param name="use_vd_prediction" value="$(arg use_vd_prediction)" />
+      <param name="obstacle_half_width" value="0.3" />
+    </node>
+
+    <!-- Replaces OpponentHalflap + GP_trajectory + Predictor_Opp with a single bin-based learner.
+         ### HJ : taskset now binds cores 1,2 to leave a core for a Pool worker when num_opponents>=2. -->
+    <node pkg="gp_traj_predictor" type="3d_gp_node_binned.py" name="gp_binned_trajectory"
+          output="screen" launch-prefix="taskset -c 1,2">
+      <param name="bin_spacing"         value="$(arg bin_spacing)" />
+      <param name="bin_capacity"        value="$(arg bin_capacity)" />
+      <param name="coverage_threshold"  value="$(arg coverage_threshold)" />
+      <param name="refit_new_bins"      value="$(arg refit_new_bins)" />
+      <param name="use_ccma_whole_lap"  value="$(arg use_ccma_whole_lap)" />
+      <param name="ccma_coverage"       value="$(arg ccma_coverage)" />
+      <param name="num_opponents"       value="$(arg num_opponents)" />
+      <param name="recent_seen_sec"     value="$(arg recent_seen_sec)" />
+      <param name="pool_size"           value="$(arg pool_size)" />
+    </node>
+  </group>
+
+</launch>
