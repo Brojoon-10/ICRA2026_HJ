@@ -280,77 +280,11 @@ class GGTunerNode:
         return True
 
     def _snapshot_latest_to_version(self, tuning_dict=None):
-        map_name = rospy.get_param('/map', '')
-        sectors = self._read_friction_sectors(map_name)
-        n_sec = len(sectors)
-
         ver = self._next_version()
-        version_prefix = f'{self.base_vehicle}_v{ver}'
-        rospy.loginfo(f"[GGTuner] ===== SAVE snapshot: {version_prefix} =====")
-        self.status_pub.publish(f"SAVING: {version_prefix}")
+        snapshot_name = f'{self.base_vehicle}_v{ver}'
+        rospy.loginfo(f"[GGTuner] ===== SAVE snapshot: {snapshot_name} =====")
+        self.status_pub.publish(f"SAVING: {snapshot_name}")
 
-        saved_frictions = set()  # dedup tracker
-
-        if n_sec > 0:
-            # Per-sector latest → v<N>_f<NNN> (unique friction dedup)
-            for i in range(min(n_sec, 5)):
-                sec_name = f'{self.base_vehicle}_latest_sec{i}'
-                sec_gg = os.path.join(
-                    self.data_path, 'gg_diagrams', sec_name)
-                sec_yml = os.path.join(
-                    self.data_path, 'vehicle_params',
-                    f'params_{sec_name}.yml')
-                if not os.path.exists(sec_gg):
-                    rospy.logwarn(
-                        f"[GGTuner] SAVE: latest_sec{i} missing → skip")
-                    continue
-                fric = float(sectors[i]['friction'])
-                fric_int = int(round(fric * 100))
-                if fric_int in saved_frictions:
-                    rospy.loginfo(
-                        f"[GGTuner] SAVE: sec{i} (f={fric:.3f}) already saved "
-                        f"as f{fric_int:03d} → skip")
-                    continue
-                snapshot_name = f'{version_prefix}_f{fric_int:03d}'
-                dst_gg = os.path.join(
-                    self.data_path, 'gg_diagrams', snapshot_name)
-                if os.path.exists(dst_gg):
-                    shutil.rmtree(dst_gg)
-                real_src = (os.path.realpath(sec_gg)
-                            if os.path.islink(sec_gg) else sec_gg)
-                shutil.copytree(real_src, dst_gg)
-                if os.path.exists(sec_yml):
-                    dst_yml = os.path.join(
-                        self.data_path, 'vehicle_params',
-                        f'params_{snapshot_name}.yml')
-                    shutil.copy2(sec_yml, dst_yml)
-                # meta
-                meta = {
-                    'vehicle_name': snapshot_name,
-                    'base_vehicle': self.base_vehicle,
-                    'friction': fric,
-                    'sector_index_source': i,
-                    'tuning': tuning_dict or {},
-                    'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                }
-                meta_path = os.path.join(dst_gg, 'params_used.json')
-                with open(meta_path, 'w') as f:
-                    json.dump(meta, f, indent=2, ensure_ascii=False)
-                saved_frictions.add(fric_int)
-                rospy.loginfo(f"[GGTuner] SAVED: {snapshot_name}")
-
-            if not saved_frictions:
-                rospy.logerr("[GGTuner] SAVE failed: no latest_sec<i> found")
-                self.status_pub.publish("SAVE_FAILED: no latest_sec")
-                return False
-
-            rospy.loginfo(
-                f"[GGTuner] SAVE done: {version_prefix} "
-                f"({len(saved_frictions)} unique frictions)")
-            self.status_pub.publish(f"SAVED: {version_prefix}")
-            return True
-
-        # Fallback: no sectors → legacy single-latest save
         latest_name = f'{self.base_vehicle}_latest'
         latest_gg = os.path.join(self.data_path, 'gg_diagrams', latest_name)
         latest_yml = os.path.join(self.data_path, 'vehicle_params',
@@ -363,7 +297,7 @@ class GGTunerNode:
             rospy.logerr(f"[GGTuner] SAVE failed: {latest_yml} missing")
             self.status_pub.publish("SAVE_FAILED: no latest yml")
             return False
-        snapshot_name = version_prefix  # no friction tag when no sectors
+
         dst_gg = os.path.join(self.data_path, 'gg_diagrams', snapshot_name)
         real_src = (os.path.realpath(latest_gg)
                     if os.path.islink(latest_gg) else latest_gg)
@@ -392,28 +326,6 @@ class GGTunerNode:
         meta_path = os.path.join(dst_gg, 'params_used.json')
         with open(meta_path, 'w') as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
-
-        ## IY(0416) : also snapshot friction-variant GGV directories
-        gg_parent = os.path.join(self.data_path, 'gg_diagrams')
-        fric_prefix = f'{latest_name}_f'
-        for name in os.listdir(gg_parent):
-            if not name.startswith(fric_prefix):
-                continue
-            fric_suffix = name[len(latest_name):]
-            src_fric_gg = os.path.join(gg_parent, name)
-            dst_fric_gg = os.path.join(gg_parent, f'{snapshot_name}{fric_suffix}')
-            if os.path.isdir(src_fric_gg) and not os.path.islink(src_fric_gg):
-                shutil.copytree(src_fric_gg, dst_fric_gg)
-                src_fric_yml = os.path.join(
-                    self.data_path, 'vehicle_params', f'params_{name}.yml')
-                if os.path.exists(src_fric_yml):
-                    dst_fric_yml = os.path.join(
-                        self.data_path, 'vehicle_params',
-                        f'params_{snapshot_name}{fric_suffix}.yml')
-                    shutil.copy2(src_fric_yml, dst_fric_yml)
-                rospy.loginfo(
-                    f"[GGTuner] SAVED friction variant: {snapshot_name}{fric_suffix}")
-        ## IY(0416) : end
 
         rospy.loginfo(f"[GGTuner] SAVED: {snapshot_name}")
         self.status_pub.publish(f"SAVED: {snapshot_name}")
@@ -599,137 +511,17 @@ class GGTunerNode:
             shutil.rmtree(dst)
         shutil.copytree(src, dst)
 
-    def _generate_sector_ggvs(self, vehicle_name, sectors, slot_overrides,
-                               full_resolution, run_ggv):
-
-        n_sec = len(sectors)
-        if n_sec == 0:
-            rospy.loginfo("[GGTuner] No sectors → skip sector-GGVs")
-            return True, "no_sectors"
-
-        # Warn about slots beyond n_sectors
-        for i in range(min(n_sec, 5), 5):
-            slot = (slot_overrides.get(i, '') or '').strip()
-            if slot:
-                rospy.logwarn(
-                    f"[GGTuner] ggv_sector{i}='{slot}' but n_sectors={n_sec} "
-                    f"→ slot ignored")
-
-        # Load base merged yml (for fresh-calc friction variants)
-        base_yml = os.path.join(
-            self.data_path, 'vehicle_params', f'params_{vehicle_name}.yml')
-        if not os.path.exists(base_yml):
-            rospy.logerr(f"[GGTuner] base yml not found: {base_yml}")
-            return False, "base_yml_missing"
-        with open(base_yml) as f:
-            base_merged = yaml.safe_load(f)
-
-        fresh_cache = {}  # friction(float) → source vehicle_name (work dir)
-        workdir_names = []  # track for cleanup
-
-        ## IY : pre-populate cache with Stage 2's base latest to avoid recomputing
-        #       the same friction (base_friction == a sector friction).
-        base_friction = float(
-            base_merged.get('tire_params', {}).get('p_Dx_1', 0.56))
-        base_latest_gg = os.path.join(
-            self.data_path, 'gg_diagrams', vehicle_name)
-        if run_ggv and os.path.exists(base_latest_gg):
-            fresh_cache[base_friction] = vehicle_name
-            rospy.loginfo(
-                f"[GGTuner] cache pre-populate: f={base_friction:.3f} "
-                f"-> {vehicle_name} (skip re-compute)")
-        ## IY : end
-
-        for i in range(min(n_sec, 5)):
-            sector = sectors[i]
-            fric = float(sector['friction'])
-            target_name = f"{self.base_vehicle}_latest_sec{i}"
-            target_gg = os.path.join(
-                self.data_path, 'gg_diagrams', target_name)
-            target_yml = os.path.join(
-                self.data_path, 'vehicle_params', f'params_{target_name}.yml')
-            slot = (slot_overrides.get(i, '') or '').strip()
-
-            if slot:
-                # Restore from snapshot (always, regardless of run_ggv)
-                src_gg = os.path.join(self.data_path, 'gg_diagrams', slot)
-                src_yml = os.path.join(
-                    self.data_path, 'vehicle_params', f'params_{slot}.yml')
-                if not os.path.exists(src_gg):
-                    rospy.logerr(
-                        f"[GGTuner] sec{i} slot '{slot}' not found → FAIL")
-                    return False, f"slot_missing:{slot}"
-                self._replace_dir(target_gg, src_gg)
-                if os.path.exists(src_yml):
-                    shutil.copy2(src_yml, target_yml)
-                rospy.loginfo(
-                    f"[GGTuner] sec{i} (f={fric:.3f}): restored from {slot}")
-                continue
-
-            # Empty slot
-            if not run_ggv:
-                if not os.path.exists(target_gg):
-                    rospy.logerr(
-                        f"[GGTuner] sec{i}: latest_sec{i} missing and "
-                        f"run_ggv=False → FAIL")
-                    return False, f"sec{i}_no_existing"
-                rospy.loginfo(
-                    f"[GGTuner] sec{i} (f={fric:.3f}): reusing existing "
-                    f"latest_sec{i}")
-                continue
-
-            # run_ggv=True → fresh calc (dedup per unique friction)
-            if fric not in fresh_cache:
-                fric_int = int(round(fric * 100))
-                work_vehicle = f"{self.base_vehicle}_workf{fric_int:03d}"
-                fric_params = copy.deepcopy(base_merged)
-                fric_params.setdefault('tire_params', {})
-                fric_params['tire_params']['p_Dx_1'] = fric
-                fric_params['tire_params']['p_Dy_1'] = fric
-                work_yml = os.path.join(
-                    self.data_path, 'vehicle_params',
-                    f'params_{work_vehicle}.yml')
-                with open(work_yml, 'w') as f:
-                    yaml.dump(fric_params, f, default_flow_style=False,
-                              allow_unicode=True)
-                rospy.loginfo(
-                    f"[GGTuner] sec{i} (f={fric:.3f}): fresh calc via "
-                    f"{work_vehicle}")
-                if not self._run_fast_ggv(work_vehicle, full_resolution):
-                    return False, f"fast_ggv_failed:{work_vehicle}"
-                if not self._copy_to_gg_diagrams(work_vehicle):
-                    return False, f"copy_failed:{work_vehicle}"
-                fresh_cache[fric] = work_vehicle
-                workdir_names.append(work_vehicle)
-            else:
-                rospy.loginfo(
-                    f"[GGTuner] sec{i} (f={fric:.3f}): reuse cached fresh "
-                    f"{fresh_cache[fric]}")
-
-            # Copy cached fresh work dir → latest_sec<i>
-            src_name = fresh_cache[fric]
-            src_gg = os.path.join(self.data_path, 'gg_diagrams', src_name)
-            src_yml = os.path.join(
-                self.data_path, 'vehicle_params', f'params_{src_name}.yml')
-            self._replace_dir(target_gg, src_gg)
-            if os.path.exists(src_yml):
-                shutil.copy2(src_yml, target_yml)
-
-        # Cleanup intermediate work dirs
-        for work_name in workdir_names:
-            for path in [
-                os.path.join(self.data_path, 'gg_diagrams', work_name),
-                os.path.join(self.data_path, 'vehicle_params',
-                             f'params_{work_name}.yml')]:
-                try:
-                    if os.path.isdir(path):
-                        shutil.rmtree(path)
-                    elif os.path.isfile(path):
-                        os.remove(path)
-                except OSError:
-                    pass
-
-        return True, "ok"
+    ## IY : publish snapshot-name selectors to rosparam (consumed by velopt/FBGA)
+    def _publish_sector_ggv_map(self, slot_overrides):
+        for i in range(5):
+            name = (slot_overrides.get(i, '') or '').strip()
+            rospy.set_param(f'/gg_tuner/sector_ggv_map/sector{i}', name)
+        set_slots = {i: slot_overrides[i] for i in range(5)
+                     if (slot_overrides.get(i, '') or '').strip()}
+        if set_slots:
+            rospy.loginfo(f"[GGTuner] sector_ggv_map published: {set_slots}")
+        else:
+            rospy.loginfo("[GGTuner] sector_ggv_map cleared (all latest)")
     ## IY : end
 
     ## IY : raceline — passes safety_distance from rqt
@@ -892,39 +684,11 @@ class GGTunerNode:
                     self.status_pub.publish(f"GGV_DONE: {vehicle_name}")
                 ## IY : end
                     
+                # Publish sector snapshot-name selectors for velopt/FBGA
                 slot_overrides = {
                     i: run_opts[f'ggv_sector{i}'] for i in range(5)
                 }
-                friction_sectors = self._read_friction_sectors(run_opts['map'])
-                ## IY : rqt sec_friction override (>0 overrides; no write-back)
-                for i, sec in enumerate(friction_sectors):
-                    if i >= 5:
-                        break
-                    rqt_fric = run_opts.get(f'sec_friction{i}', 0.0)
-                    if rqt_fric > 0.0:
-                        old_fric = sec.get('friction', 0.0)
-                        sec['friction'] = rqt_fric
-                        rospy.loginfo(
-                            f"[GGTuner] sec{i} friction override: "
-                            f"{old_fric:.3f} -> {rqt_fric:.3f} (rqt)")
-                ## IY : end
-                if friction_sectors:
-                    ok, reason = self._generate_sector_ggvs(
-                        vehicle_name, friction_sectors, slot_overrides,
-                        full_resolution=run_opts['full_resolution'],
-                        run_ggv=run_opts['run_ggv'])
-                    if not ok:
-                        rospy.logerr(
-                            f"[GGTuner] Stage 2.5 FAILED: {reason} "
-                            f"→ aborting apply")
-                        self.status_pub.publish(f"FAILED_STAGE25: {reason}")
-                        return
-                    self.status_pub.publish(
-                        f"SECTOR_GGV_DONE: {vehicle_name}")
-                else:
-                    rospy.loginfo(
-                        "[GGTuner] No sectors → single-GGV mode")
-                ## IY : end
+                self._publish_sector_ggv_map(slot_overrides)
 
                 # ---- Stage 3: raceline (optional) ----
                 if run_opts['regen_raceline']:
@@ -1003,18 +767,12 @@ class GGTunerNode:
             'run_fbga':         bool(config.run_fbga),
             'enable_mu':        bool(config.enable_mu),
             'safety_distance':  float(config.safety_distance),
-            ## IY : Y1 mode — per-sector GGV slots (max 5)
+            ## IY : per-sector snapshot selectors (empty=latest) for velopt/FBGA
             'ggv_sector0':      str(getattr(config, 'ggv_sector0', '')).strip(),
             'ggv_sector1':      str(getattr(config, 'ggv_sector1', '')).strip(),
             'ggv_sector2':      str(getattr(config, 'ggv_sector2', '')).strip(),
             'ggv_sector3':      str(getattr(config, 'ggv_sector3', '')).strip(),
             'ggv_sector4':      str(getattr(config, 'ggv_sector4', '')).strip(),
-            ## IY : per-sector friction override (0=use yaml, >0=override)
-            'sec_friction0':    float(getattr(config, 'sec_friction0', 0.0)),
-            'sec_friction1':    float(getattr(config, 'sec_friction1', 0.0)),
-            'sec_friction2':    float(getattr(config, 'sec_friction2', 0.0)),
-            'sec_friction3':    float(getattr(config, 'sec_friction3', 0.0)),
-            'sec_friction4':    float(getattr(config, 'sec_friction4', 0.0)),
             ## IY : raceline-dedicated snapshot (empty=latest)
             'raceline_ggv':     str(getattr(config, 'raceline_ggv', '')).strip(),
             ## IY : end

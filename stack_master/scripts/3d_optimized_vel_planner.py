@@ -82,13 +82,12 @@ _LINEAR_SOLVER = _select_linear_solver()
 ### HJ : end
 
 
-## IY(0416) : per-sector friction → multi-GGV support
-#   friction_scaling.yaml의 friction 값을 p_Dx_1 = p_Dy_1으로 직접 사용.
-#   각 unique friction에 대해 별도 GGManager를 로드하고,
-#   NLP 루프에서 waypoint별로 해당 sector의 GGV를 참조.
+## IY : per-sector multi-GGV support.
+#   Priority: /gg_tuner/sector_ggv_map/sector<i> (snapshot name) →
+#   fallback to friction-value lookup <base>_f{NNN}/velocity_frame/.
 def _read_friction_sectors():
-    """Read friction sector params from rosparam (set by friction_sector_server).
-    Returns list of dicts [{start, end, friction}, ...] or empty list if unavailable.
+    """Read friction sectors from rosparam (friction_sector_server).
+    Returns [{sector_idx, start, end, friction}, ...] or [].
     """
     try:
         n_sec = rospy.get_param('/friction_map_params/n_sectors', 0)
@@ -97,6 +96,7 @@ def _read_friction_sectors():
         sectors = []
         for i in range(n_sec):
             sectors.append({
+                'sector_idx': i,
                 'start': int(rospy.get_param(f'/friction_map_params/Sector{i}/start', 0)),
                 'end':   int(rospy.get_param(f'/friction_map_params/Sector{i}/end', 0)),
                 'friction': float(rospy.get_param(f'/friction_map_params/Sector{i}/friction', -1.0)),
@@ -108,78 +108,91 @@ def _read_friction_sectors():
 
 def _build_friction_gg_map(sectors, n_waypoints, gg_base_dir, gg_margin,
                            base_p_Dx_1):
-    """Build per-waypoint GGManager mapping from friction sectors.
+    """Build per-waypoint GGManager mapping.
 
-    Args:
-        sectors:      list of {start, end, friction} dicts
-        n_waypoints:  number of waypoints on the resampled grid
-        gg_base_dir:  base GGV velocity_frame directory path
-        gg_margin:    GGV margin
-        base_p_Dx_1:  p_Dx_1 from the base vehicle params (for detecting base-matching sectors)
+    Per sector source priority:
+      1) /gg_tuner/sector_ggv_map/sector<i> → load gg_diagrams/<snap>/velocity_frame/
+      2) friction value → <base>_f{NNN}/velocity_frame/  (or base dir if fric==base)
 
-    Returns:
-        gg_list:  list of GGManager instances (one per unique friction)
-        gg_idx:   np.array of shape (n_waypoints,) mapping each waypoint → index in gg_list
-                  None if no friction sectors or all sectors use base friction.
+    Returns (gg_list, gg_idx) or (None, None) if single-GGV mode suffices / fails.
     """
     if not sectors:
         return None, None
 
-    # Filter out sectors with invalid friction (< 0 means not set)
     valid = [s for s in sectors if s['friction'] > 0]
     if not valid:
         return None, None
 
-    # Collect unique friction values
-    unique_frictions = sorted(set(s['friction'] for s in valid))
+    gg_base_parent = os.path.dirname(os.path.dirname(gg_base_dir))   # gg_diagrams/
+    gg_base_name = os.path.basename(os.path.dirname(gg_base_dir))    # e.g. rc_car_10th_latest
 
-    # If all sectors have the same friction as base → no multi-GGV needed
-    if len(unique_frictions) == 1 and abs(unique_frictions[0] - base_p_Dx_1) < 1e-4:
+    def _resolve(sec_idx, fric):
+        """Return (source_key, load_dir) for a given sector index + friction."""
+        snap = ''
+        try:
+            snap = rospy.get_param(
+                f'/gg_tuner/sector_ggv_map/sector{sec_idx}', '')
+        except Exception:
+            snap = ''
+        snap = (snap or '').strip()
+        if snap:
+            snap_dir = os.path.join(gg_base_parent, snap, 'velocity_frame')
+            if os.path.exists(snap_dir):
+                return (f'snap:{snap}', snap_dir)
+            rospy.logwarn(
+                f'[velopt] sector{sec_idx} snapshot not found: {snap_dir} '
+                f'→ fallback to friction lookup')
+        if abs(fric - base_p_Dx_1) < 1e-4:
+            return ('base', gg_base_dir)
+        fric_int = int(round(fric * 100))
+        fric_dir = os.path.join(
+            gg_base_parent, f'{gg_base_name}_f{fric_int:03d}', 'velocity_frame')
+        return (f'fric:{fric:.3f}', fric_dir)
+
+    # Resolve each valid sector to a source, dedupe by key
+    sector_keys = []  # parallel to valid
+    key_to_dir = {}
+    for sec in valid:
+        key, load_dir = _resolve(sec['sector_idx'], sec['friction'])
+        sector_keys.append(key)
+        key_to_dir.setdefault(key, load_dir)
+
+    unique_keys = list(dict.fromkeys(sector_keys))  # preserve order
+
+    # Single source matching base → no multi-GGV
+    if len(unique_keys) == 1 and unique_keys[0] == 'base':
         return None, None
 
-    # Build GGManager per unique friction
-    gg_base_parent = os.path.dirname(os.path.dirname(gg_base_dir))  # gg_diagrams/
-    gg_base_name = os.path.basename(os.path.dirname(gg_base_dir))   # e.g. rc_car_10th_latest
-    gg_dict = {}
-    for fric in unique_frictions:
-        fric_int = int(round(fric * 100))
-        fric_dir = os.path.join(gg_base_parent,
-                                f'{gg_base_name}_f{fric_int:03d}',
-                                'velocity_frame')
-        if abs(fric - base_p_Dx_1) < 1e-4:
-            # Base friction — use the base GGV directory
-            fric_dir = gg_base_dir
-        if not os.path.exists(fric_dir):
-            rospy.logwarn(f'[velopt] friction GGV not found: {fric_dir} '
-                          f'(friction={fric:.3f}) → skipping multi-GGV')
+    gg_list = []
+    key_to_idx = {}
+    for key in unique_keys:
+        load_dir = key_to_dir[key]
+        if not os.path.exists(load_dir):
+            rospy.logwarn(
+                f'[velopt] GGV not found for {key}: {load_dir} '
+                f'→ skipping multi-GGV')
             return None, None
-        gg_dict[fric] = GGManager(gg_path=fric_dir, gg_margin=gg_margin)
-        rospy.loginfo(f'[velopt] loaded GGV for friction={fric:.3f}: {fric_dir}')
+        key_to_idx[key] = len(gg_list)
+        gg_list.append(GGManager(gg_path=load_dir, gg_margin=gg_margin))
+        rospy.loginfo(f'[velopt] loaded GGV [{key}]: {load_dir}')
 
-    # Build ordered gg_list and friction→index map
-    fric_to_idx = {f: i for i, f in enumerate(unique_frictions)}
-    gg_list = [gg_dict[f] for f in unique_frictions]
+    # Default fallback: base source if present, else first source
+    default_idx = key_to_idx.get('base', 0)
+    gg_idx = np.full(n_waypoints, default_idx, dtype=int)
 
-    # Build per-waypoint index (waypoint index → sector → friction → gg_list index)
-    default_fric = min(unique_frictions, key=lambda f: abs(f - base_p_Dx_1))
-    gg_idx = np.full(n_waypoints, fric_to_idx[default_fric], dtype=int)
-
-    for sec in valid:
-        fric = sec['friction']
-        idx = fric_to_idx[fric]
-        wpnt_start = sec['start']
-        wpnt_end = sec['end']
-        total_original = max(s['end'] for s in valid) + 1
-        grid_start = int(round(wpnt_start / total_original * n_waypoints))
-        grid_end = int(round((wpnt_end + 1) / total_original * n_waypoints))
+    total_original = max(s['end'] for s in valid) + 1
+    for sec, key in zip(valid, sector_keys):
+        idx = key_to_idx[key]
+        grid_start = int(round(sec['start'] / total_original * n_waypoints))
+        grid_end = int(round((sec['end'] + 1) / total_original * n_waypoints))
         grid_start = max(0, min(grid_start, n_waypoints - 1))
         grid_end = max(0, min(grid_end, n_waypoints))
         gg_idx[grid_start:grid_end] = idx
 
-    rospy.loginfo(f'[velopt] friction multi-GGV: {len(gg_list)} GGVs, '
-                  f'unique frictions={unique_frictions}')
+    rospy.loginfo(
+        f'[velopt] multi-GGV: {len(gg_list)} sources, keys={unique_keys}')
     return gg_list, gg_idx
-## IY(0416) : end
+## IY : end
 
 
 # --- (기존 build_and_solve 시그니처, 보존용 주석) ---
