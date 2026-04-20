@@ -176,7 +176,11 @@ class LocalSamplingPlanner():
             raceline_tendency=raceline_tendency_s,
         )
 
-        # generate lateral jerk-optimal curves
+        # ### HJ : pure shifted-raceline sampling — all candidates = n_rl(s) + d_i.
+        # No connector variants → factor=1 (candidate count = n_samples * v_samples).
+        # `relative_generation` param is no longer meaningful (absolute vs raceline-
+        # relative was the old distinction; now ALL candidates are raceline-relative
+        # by construction). Kept in signature for API compat.
         raceline_tendency_n = False
         n_array, n_dot_array, n_ddot_array = self.generate_lateral_curves(
             track_handler=self.track_handler,
@@ -196,39 +200,6 @@ class LocalSamplingPlanner():
             endpoint_chi_raceline_only=endpoint_chi_raceline_only,
         )
 
-        # generate lateral curves relative to racing line
-        if relative_generation:
-            raceline_tendency_n = True
-            n_array2, n_dot_array2, n_ddot_array2 = self.generate_lateral_curves(
-                track_handler=self.track_handler,
-                s_array=s_array,
-                s_dot_array=s_dot_array,
-                s_ddot_array=s_ddot_array,
-                s_end_values=s_end_values,
-                s_dot_end_values=s_dot_end_values,
-                n_start=n_start,
-                n_dot_start=n_dot_start,
-                n_ddot_start=n_ddot_start,
-                t_array=t_array,
-                n_samples=n_samples,
-                postprocessed_raceline=postprocessed_raceline,
-                safety_distance=safety_distance,
-                raceline_tendency=raceline_tendency_n,
-                endpoint_chi_raceline_only=endpoint_chi_raceline_only,
-            )
-
-            t_array = np.vstack((t_array, t_array))
-
-            n_array = np.vstack((n_array, n_array2))
-            n_dot_array = np.vstack((n_dot_array, n_dot_array2))
-            n_ddot_array = np.vstack((n_ddot_array, n_ddot_array2))
-
-            s_array = np.vstack((s_array, s_array))
-            s_dot_array = np.vstack((s_dot_array, s_dot_array))
-            s_ddot_array = np.vstack((s_ddot_array, s_ddot_array))
-            s_end_values = np.hstack((s_end_values, s_end_values))
-            s_dot_end_values = np.hstack((s_dot_end_values, s_dot_end_values))
-
         # transform frenet curves to velocity frame
         V_array, chi_array, ax_vf_array, ay_vf_array, kappa_array = \
             self.transform_to_velocity_frame(
@@ -242,7 +213,9 @@ class LocalSamplingPlanner():
             )
 
         # valid_array specifies which trajectories are valid in terms of feasibility. Initially all valid.
-        factor = 2 if relative_generation else 1
+        # ### HJ : factor=1 always — shifted-raceline refactor removed the
+        # absolute-vs-raceline-relative split (all candidates are now raceline-relative).
+        factor = 1
         valid_array = np.ones(factor * n_samples * v_samples, dtype=bool)
 
         # ### HJ : invalid-reason counters — snapshot valid count before each check so the
@@ -916,8 +889,17 @@ class LocalSamplingPlanner():
             safety_distance: float,
             raceline_tendency: bool,
             endpoint_chi_raceline_only: bool = False,
+            L_connector: float = 4.0,
     ):
-
+        # ### HJ : two-step lateral curves (recovery in-place, d_i-independent α).
+        #   Step 1 (ego-agnostic): n_sample_i(s) = n_rl(s) + d_i for all i.
+        #   Step 2 (recovery, α-blend, same α for all candidates):
+        #       n_ego(s)  = n_start + m0·(s − s0), m0 = n_dot_start/s_dot_start
+        #       α(s): cubic Hermite on [s0, s0+L_connector], (1,0)→(0,0) in (α,α').
+        #       n_final_i = (1−α)·n_sample_i + α·n_ego
+        # Every candidate starts at ego (n_start, m0); tail is pure shifted raceline.
+        # Walls remain FILTERING-ONLY (check_path_collision).
+        # `raceline_tendency`/`endpoint_chi_raceline_only` kept for API compat.
         n_array = np.zeros_like(t_array)
         n_dot_array = np.zeros_like(t_array)
         n_ddot_array = np.zeros_like(t_array)
@@ -954,23 +936,15 @@ class LocalSamplingPlanner():
                              - n_dot_rl / (s_dot_rl ** 3) * s_ddot_rl * (s_dot_array[i] ** 2) \
                              + n_dot_rl / s_dot_rl * s_ddot_array[i]
 
-            # sampled n end conditions (relative to raceline)
-            n_min_track = track_handler.w_tr_right_interpolator(s_end).full().squeeze()
-            n_max_track = track_handler.w_tr_left_interpolator(s_end).full().squeeze()
-
-            # ### HJ : raceline-anchored asymmetric sampling (B-plan).
-            # Single anchor = n_rl(s_end). s_end jitter shifts all candidates uniformly
-            # → relative order stable → argmin stable → tick-to-tick wobble suppressed.
+            # ### HJ : Step 1 sampling + Step 2 in-place recovery (α-blend).
             n_rl_end = float(n_rl_eval[-1])
-            margin = self.vehicle_params['total_width'] / 2.0 + safety_distance
-            d_left_rl  = max(float(n_max_track) - n_rl_end - margin, 0.0)
-            d_right_rl = max(n_rl_end - float(n_min_track) - margin, 0.0)
 
-            # ### HJ : velocity-aware kinematic cap — low-v ↔ corner ↔ tighter swing.
-            # Two-factor bound: (1) |n_end - n_rl_end| ≤ max_slope · s_horizon (geometry),
-            # (2) max_slope itself shrinks at low end-velocity so that in tight corners
-            #     (raceline speed profile dips) candidates can't pick large lateral n.
-            # v=1.0 → slope=0.15 (~8.5°) ; v>=4.0 → slope=0.45 (~24°).
+            # raceline-relative shift range — wall-independent.
+            d_nominal = float(getattr(self, 'n_shift_nominal', 0.6))
+            d_left_rl  = d_nominal
+            d_right_rl = d_nominal
+
+            # velocity-aware kinematic cap — smoothness gate (not wall-based).
             s_horizon_eff = max(float(s_end) - float(s_array[i, 0]), 0.1)
             v_end_clip = max(1.0, min(4.0, float(s_dot_end)))
             max_slope = 0.15 + (0.45 - 0.15) * (v_end_clip - 1.0) / (4.0 - 1.0)
@@ -978,11 +952,7 @@ class LocalSamplingPlanner():
             d_left_rl  = min(d_left_rl,  max_swing)
             d_right_rl = min(d_right_rl, max_swing)
 
-            # ### HJ : prev-anchored sampling when node has committed n_end.
-            # When prev_chosen_n_end exists, center the linspace around prev with
-            # half-span = 3·rate_cap so rate window always contains 2-3 samples
-            # (fixing fallback ping-pong from sparse grid vs tight rate constraint).
-            # When no prev, use the wide wall-limited spread for initial acquisition.
+            # prev-anchored + rate-cap preserved B-plan (wall-independent).
             prev_anchor = getattr(self, 'prev_chosen_n_end', None)
             rate_cap    = float(getattr(self, 'n_end_rate_cap', 0.12))
             if prev_anchor is not None:
@@ -1000,82 +970,58 @@ class LocalSamplingPlanner():
                 left_side  = np.linspace(0.0, d_left_rl, N_left) if N_left > 0 else np.array([])
                 n_end_values = n_rl_end + np.concatenate((right_side, left_side, [0.0]))
 
-            # chi of track bounds at end position
-            nearest_idx = (np.abs(track_handler.s - s_end)).argmin()
-            next_idx = nearest_idx+1 if nearest_idx+1 < self.track_handler.s.size else 1  # not since start point and end point are the same
+            # Precomputed terms for Step 2 (α-blend, d_i-independent).
+            s_dot_rl_safe = np.maximum(s_dot_rl, 1e-6)
+            dn_rl_ds      = n_dot_rl  / s_dot_rl_safe
+            d2n_rl_ds2    = n_ddot_rl / (s_dot_rl_safe ** 2) \
+                            - (n_dot_rl / (s_dot_rl_safe ** 3)) * s_ddot_rl
 
-            left_bound_change_end = self.left_track_bounds[:, next_idx] - self.left_track_bounds[:, nearest_idx]
-            right_bound_change_end = self.right_track_bounds[:, next_idx] - self.right_track_bounds[:, nearest_idx]
-            referenceline_change_end = np.array([self.track_handler.x[next_idx] - self.track_handler.x[nearest_idx],
-                                                 self.track_handler.y[next_idx] - self.track_handler.y[nearest_idx],
-                                                 self.track_handler.z[next_idx] - self.track_handler.z[nearest_idx]])
-            
-            left_bound_change_end_normed = left_bound_change_end / np.linalg.norm(left_bound_change_end)
-            right_bound_change_end_normed = right_bound_change_end / np.linalg.norm(right_bound_change_end)
-            referenceline_change_end_normed = referenceline_change_end / np.linalg.norm(referenceline_change_end)
+            s0_q    = float(s_q[0])
+            s_end_q = float(s_q[-1])
+            L_rec_eff = float(min(float(L_connector),
+                                  max(s_end_q - s0_q, 0.1) * 0.95))
+            L_safe    = max(L_rec_eff, 1e-6)
 
-            chi_end_left_bound = np.arccos(np.dot(referenceline_change_end_normed, left_bound_change_end_normed))
-            chi_end_right_bound = np.arccos(np.dot(referenceline_change_end_normed, right_bound_change_end_normed))
-            
-            cross_left = np.cross(referenceline_change_end_normed, left_bound_change_end_normed)
-            cross_right = np.cross(referenceline_change_end_normed, right_bound_change_end_normed)
-            normal_vector = track_handler.get_rotation_matrix_numpy(track_handler.theta[nearest_idx], track_handler.mu[nearest_idx], track_handler.phi[nearest_idx])[2]
-            if np.dot(normal_vector, cross_left) < 0:
-                chi_end_left_bound = -chi_end_left_bound
-            if np.dot(normal_vector, cross_right) < 0:
-                chi_end_right_bound = -chi_end_right_bound
+            sdot0 = float(s_dot_array[i, 0])
+            m0    = float(n_dot_start) / sdot0 if sdot0 > 1e-6 else 0.0
+            ds_q      = s_q - s0_q
+            n_ego     = n_start + m0 * ds_q
+            dn_ego_ds = np.full_like(s_q, m0)
 
-            # chi of raceline at end position
-            chi_end_rl = np.interp(s_end, postprocessed_raceline['s'], postprocessed_raceline['chi'], period=track_handler.s[-1])
+            u = np.clip(ds_q / L_safe, 0.0, 1.0)
+            inside      = ds_q < L_rec_eff
+            # ### HJ : C2 smootherstep (Perlin) — zero 1st AND 2nd derivatives at
+            # both endpoints, so n̈(s) is continuous across the blend boundary.
+            # Previous C1 smoothstep 2u³-3u²+1 leaked a d²α/ds² jump of 6/L²,
+            # which kicked κ (via n̈) and caused V to drop to near-zero locally.
+            u2 = u * u
+            u3 = u2 * u
+            u4 = u2 * u2
+            u5 = u3 * u2
+            alpha       = np.where(inside, 1.0 - 10.0*u3 + 15.0*u4 - 6.0*u5, 0.0)
+            dalpha_ds   = np.where(inside, (-30.0*u2 + 60.0*u3 - 30.0*u4) / L_safe, 0.0)
+            d2alpha_ds2 = np.where(inside, (-60.0*u + 180.0*u2 - 120.0*u3) / (L_safe**2), 0.0)
+            one_minus_alpha = 1.0 - alpha
 
-            for n_end, t_end in zip(n_end_values, t_array[:, -1]):
+            sdot_cand  = s_dot_array[i, :]
+            sddot_cand = s_ddot_array[i, :]
 
-                # ### HJ : endpoint heading + curvature interpolation.
-                # default (False): boundary chi/0 ↔ raceline chi/n_ddot_rl 보간 — boundary
-                #   모양에 따라 후보 끝이 휘어짐. boundary 가 noisy 한 3D 트랙에서 jitter 원인.
-                # raceline_only (True): 모든 후보가 raceline 의 endpoint chi/n_ddot 와 일치.
-                #   candidate 끝이 raceline tangent 와 평행 → boundary 노이즈 면역.
-                if endpoint_chi_raceline_only:
-                    chi_end = chi_end_rl
-                    n_ddot_end = n_ddot_rl_eval[-1]
-                else:
-                    chi_end = np.interp(n_end, [n_min_track, n_rl_eval[-1], n_max_track], [chi_end_right_bound, chi_end_rl, chi_end_left_bound])
-                    n_ddot_end = np.interp(n_end, [n_min_track, n_rl_eval[-1], n_max_track], [0.0, n_ddot_rl_eval[-1], 0.0])
-                n_dot_end = s_dot_end * np.tan(chi_end) * (1 - float(track_handler.Omega_z_interpolator(s_end))*n_end)
-                
-                # formulate linear system of equations
-                a = np.array([[1, 0, 0, 0, 0, 0],
-                              [0, 1, 0, 0, 0, 0],
-                              [0, 0, 2, 0, 0, 0],
-                              [1, t_end, t_end ** 2, t_end ** 3, t_end ** 4, t_end ** 5],
-                              [0, 1, 2 * t_end, 3 * t_end ** 2, 4 * t_end ** 3, 5 * t_end ** 4],
-                              [0, 0, 2, 6 * t_end, 12 * t_end ** 2, 20 * t_end ** 3]])
-                if raceline_tendency:  # sample curves relative to raceline
-                    b = np.array([n_start-n_rl_eval[0], n_dot_start-n_dot_rl_eval[0], n_ddot_start-n_ddot_rl_eval[0], n_end-n_rl_eval[-1], n_dot_end-n_dot_rl_eval[-1], n_ddot_end-n_ddot_rl_eval[-1]])
-                else:  # sample curves absolute
-                    b = np.array([n_start, n_dot_start, n_ddot_start, n_end, n_dot_end, n_ddot_end])
+            for n_end in n_end_values:
+                d_i          = float(n_end) - n_rl_end
+                n_samp       = n_rl_eval + d_i
+                dn_samp_ds   = dn_rl_ds
+                d2n_samp_ds2 = d2n_rl_ds2
 
-                # calculate coefficients of quintic polynomial
-                c = np.linalg.solve(a=a, b=b)
+                n_final    = one_minus_alpha * n_samp       + alpha * n_ego
+                dn_final   = one_minus_alpha * dn_samp_ds   + alpha * dn_ego_ds \
+                             + dalpha_ds * (n_ego - n_samp)
+                d2n_final  = one_minus_alpha * d2n_samp_ds2 \
+                             + 2.0 * dalpha_ds * (dn_ego_ds - dn_samp_ds) \
+                             + d2alpha_ds2 * (n_ego - n_samp)
 
-                # sampled n curve
-                n_sample  = c[0] + c[1] * t_array[i] + c[2] * t_array[i] ** 2 + c[3] * t_array[i] ** 3 + c[4] * t_array[i] ** 4 + c[5] * t_array[i] ** 5
-                n_dot_sample  = c[1] + 2 * c[2] * t_array[i] + 3 * c[3] * t_array[i] ** 2 + 4 * c[4] * t_array[i] ** 3 + 5 * c[5] * t_array[i] ** 4
-                n_ddot_sample  = 2 * c[2] + 6 * c[3] * t_array[i] + 12 * c[4] * t_array[i] ** 2 + 20 * c[5] * t_array[i] ** 3
-
-                if raceline_tendency:
-                    # add raceline n data to sampled relative n curve
-                    n = n_sample + n_rl_eval
-                    n_dot = n_dot_sample + n_dot_rl_eval
-                    n_ddot = n_ddot_sample + n_ddot_rl_eval
-                else:
-                    n = n_sample
-                    n_dot = n_dot_sample
-                    n_ddot = n_ddot_sample
-
-                n_array[i, :] = n
-                n_dot_array[i, :] = n_dot
-                n_ddot_array[i, :] = n_ddot
+                n_array[i, :]      = n_final
+                n_dot_array[i, :]  = dn_final  * sdot_cand
+                n_ddot_array[i, :] = d2n_final * (sdot_cand ** 2) + dn_final * sddot_cand
                 i += 1
 
         return n_array, n_dot_array, n_ddot_array
