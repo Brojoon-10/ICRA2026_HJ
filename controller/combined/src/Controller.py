@@ -418,19 +418,22 @@ class Controller:
  
         steering_angle = self.steer_scaling_for_lat_err(steering_angle, self.future_lat_err)
 
-        ### HJ : yaw rate feedback — compensate oversteer/understeer
-        if self.K_yr > 0 and abs(self.speed_now) > 0.5:
+        ### HJ : yaw rate feedback — compute always (for observation),
+        ### apply only if K_yr > 0. Lets K_us be tuned safely with K_yr=0.
+        if abs(self.speed_now) > 0.5:
             v = self.speed_now
             # Dynamic bicycle (K_us=0 → kinematic): yr = v·tan(δ) / (L + K_us·v²)
             wb_eff = self.wheelbase + self.K_us * v * v
             expected_yr = v * np.tan(steering_angle) / wb_eff
             yr_error = expected_yr - self.yaw_rate  # >0: understeer, <0: oversteer
             corr_raw = self.K_yr * yr_error
-            corr = np.clip(corr_raw, -self.K_yr_sat, self.K_yr_sat)  ### HJ : saturation
-            steering_angle += corr
+            corr = np.clip(corr_raw, -self.K_yr_sat, self.K_yr_sat)
+            if self.K_yr > 0:
+                steering_angle += corr
+            applied = "ON " if self.K_yr > 0 else "obs"
             rospy.loginfo_throttle(0.3,
-                f"[YawFB] v={self.speed_now:.2f} δ={steering_angle-corr:+.4f} "
-                f"exp_yr={expected_yr:+.3f} act_yr={self.yaw_rate:+.3f} "
+                f"[YawFB {applied}] v={v:.2f} δ={steering_angle - (corr if self.K_yr > 0 else 0.0):+.4f} "
+                f"K_us={self.K_us:.3f} exp_yr={expected_yr:+.3f} act_yr={self.yaw_rate:+.3f} "
                 f"err={yr_error:+.3f} corr_raw={corr_raw:+.4f} corr={corr:+.4f}")
         ### HJ : end
 
