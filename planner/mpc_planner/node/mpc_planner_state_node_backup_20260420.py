@@ -55,9 +55,6 @@ if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 from mpcc_solver import MPCCSolver  # noqa: E402
 from frenet_d_solver import FrenetDSolver  # noqa: E402 — Frenet-d perturbation backend
-from frenet_kin_solver import (FrenetKinMPC,  # noqa: E402 — new frenet-kin backend
-                               SIDE_CLEAR, SIDE_LEFT, SIDE_RIGHT, SIDE_TRAIL)
-from side_decider import SideDecider  # noqa: E402 — rule-based side selection
 from mpc_raceline_lifter import MPCRacelineLifter  # noqa: E402
 from geometric_fallback import build_quintic_fallback  # noqa: E402
 
@@ -117,38 +114,14 @@ class MPCPlannerStateNode:
         self.dT = float(params['dT'])  # ### HJ : Phase 2 — needed for ax from u_sol
 
         # ### HJ : solver backend switch.
-        # `frenet_kin` (default): Frenet kinematic bicycle MPC. State
-        #                [n,mu,v], 4-term cost, obstacle as hard half-plane
-        #                via external SideDecider, corridor box with
-        #                wall_safe baked in. See src/frenet_kin_solver.py.
-        # `frenet_d`  : legacy n(s)-perturbation on fixed s-grid (backup).
-        # `xy`        : legacy Cartesian MPCC (backup).
+        # `frenet_d`  : perturb n(s) on a fixed s-grid. Hard corridor box via
+        #               inequality constraints → trajectory never leaves
+        #               d_left/d_right by construction.
+        # `xy`        : original kinematic bicycle MPCC (had structural bug
+        #               where slack=0 didn't guarantee Wpnt.d_m stayed inside).
         self.solver_backend = str(
-            rospy.get_param('~solver_backend', 'frenet_kin')).lower()
-        if self.solver_backend == 'frenet_kin':
-            params['q_n']           = float(rospy.get_param('~q_n', 3.0))
-            params['gamma_progress']= float(rospy.get_param('~gamma_progress', 10.0))
-            params['r_a']           = float(rospy.get_param('~r_a', 0.5))
-            params['r_delta']       = float(rospy.get_param('~r_delta', 5.0))
-            params['r_steer_reg']   = float(rospy.get_param('~r_steer_reg', 0.1))
-            params['v_min']         = float(rospy.get_param('~min_speed', 0.5))
-            params['v_max']         = float(rospy.get_param('~max_speed', 8.0))
-            params['a_min']         = float(rospy.get_param('~a_min', -4.0))
-            params['a_max']         = float(rospy.get_param('~a_max', 3.0))
-            params['delta_max']     = float(rospy.get_param('~max_steering', 0.6))
-            params['mu_max']        = float(rospy.get_param('~mu_max', 0.9))
-            params['inflation']     = float(rospy.get_param('~boundary_inflation', 0.05))
-            params['wall_safe']     = float(rospy.get_param('~wall_safe', 0.15))
-            params['gap_lat']       = float(rospy.get_param('~gap_lat', 0.25))
-            params['gap_long']      = float(rospy.get_param('~gap_long', 0.8))
-            params['w_slack']       = float(rospy.get_param('~w_slack', 2000.0))
-            params['n_obs_max']     = int(rospy.get_param('~n_obs_max', 2))
-            params['ipopt_max_iter']= int(rospy.get_param('~ipopt_max_iter', 200))
-            self.solver = FrenetKinMPC(**params)
-            self.n_obs_max = params['n_obs_max']
-            self.wall_safe = params['wall_safe']
-            self.w_wall = 0.0
-        elif self.solver_backend == 'frenet_d':
+            rospy.get_param('~solver_backend', 'frenet_d')).lower()
+        if self.solver_backend == 'frenet_d':
             params['obstacle_sigma'] = float(rospy.get_param(
                 '~obstacle_sigma', 0.5))
             params['n_obs_max'] = int(rospy.get_param('~n_obs_max', 2))
@@ -159,24 +132,17 @@ class MPCPlannerStateNode:
             self.solver = MPCCSolver(params)
         else:
             rospy.logwarn(
-                '[mpc][%s] unknown ~solver_backend=%r — using frenet_kin',
+                '[mpc][%s] unknown ~solver_backend=%r — using frenet_d',
                 rospy.get_name(), self.solver_backend)
-            self.solver_backend = 'frenet_kin'
-            self.solver = FrenetKinMPC(**params)
+            self.solver_backend = 'frenet_d'
+            params['obstacle_sigma'] = float(rospy.get_param(
+                '~obstacle_sigma', 0.5))
+            params['n_obs_max'] = int(rospy.get_param('~n_obs_max', 2))
+            params['w_wall'] = float(rospy.get_param('~w_wall', 0.0))
+            params['wall_safe'] = float(rospy.get_param('~wall_safe', 0.15))
+            self.solver = FrenetDSolver(params)
         rospy.loginfo('[mpc][%s] solver_backend=%s',
                       rospy.get_name(), self.solver_backend)
-
-        # ### HJ : External side decider (rule-based, with hysteresis). Only
-        # meaningful for frenet_kin backend — legacy backends ignore side.
-        self.side_decider = SideDecider(
-            ego_half_width=float(rospy.get_param('~ego_half_width', 0.15)),
-            gap_lat=float(rospy.get_param('~gap_lat', 0.25)),
-            trail_dv_thresh=float(rospy.get_param('~trail_dv_thresh', 0.5)),
-            hold_ticks=int(rospy.get_param('~side_hold_ticks', 5)),
-        )
-        self._last_side_int = SIDE_CLEAR
-        self._last_side_str = 'clear'
-        self._last_side_scores = {}
 
         # ### HJ : Phase 3 — obstacle cost params (read; honored by solver in
         # Phase 3.5). Kept on the node side so dynamic_reconfigure (Phase 5)
@@ -900,71 +866,6 @@ class MPCPlannerStateNode:
               + (self.g_z - z) ** 2)
         return int(np.argmin(d2))
 
-    # ---------------------------------------------------------------- side
-    def _decide_side(self, obs_arr, ref_slice):
-        """Rule-based side-of-passing decision (LEFT / RIGHT / TRAIL / CLEAR).
-        Kept external to the NLP so the MPC enforces one-sided hard
-        constraints without ambiguity. See src/side_decider.py."""
-        if obs_arr is None:
-            return SIDE_CLEAR, 'clear', {'reason': 'no_obs_arr'}
-
-        rs = np.asarray(ref_slice['ref_s'])
-        dL_ref = np.asarray(ref_slice['d_left_arr'])
-        dR_ref = np.asarray(ref_slice['d_right_arr'])
-        N_plus_1 = rs.shape[0]
-
-        obs_list = []
-        for o in range(obs_arr.shape[0]):
-            w_ts = obs_arr[o, :, 2]
-            if float(np.max(w_ts)) <= 0.0:
-                continue
-            s0 = float(obs_arr[o, 0, 0])
-            n0 = float(obs_arr[o, 0, 1])
-            sN = float(obs_arr[o, -1, 0])
-            nN = float(obs_arr[o, -1, 1])
-            v_s_obs = (sN - s0) / max(self.N * self.dT, 1e-3)
-            # d_L, d_R at the obstacle's s (use nearest ref_slice index)
-            k_near = int(np.argmin(np.abs(rs - s0)))
-            k_near = int(np.clip(k_near, 0, N_plus_1 - 1))
-            obs_list.append({
-                's0': s0, 'n0': n0, 'v_s_obs': v_s_obs,
-                'half_width': 0.15,      # conservative ego-like half width
-                'd_L': float(dL_ref[k_near]),
-                'd_R': float(dR_ref[k_near]),
-                'ref_v': float(ref_slice['ref_v'][k_near]),
-            })
-        # sort by forward distance (smallest s0 first assuming ref_s is
-        # monotone forward from ego — which _slice_local_ref guarantees)
-        obs_list.sort(key=lambda d: d['s0'])
-
-        ego_v = float(getattr(self, 'car_vx', 0.0))
-        return self.side_decider.decide(ego_v, obs_list)
-
-    # ---------------------------------------------------------------- lift
-    def _lift_frenet_to_xy(self, traj_frenet, ref_slice):
-        """Convert solver (s, n, mu, v) trajectory into the (x, y, psi) tuple
-        the rest of the pipeline expects. Uses ref_slice center_points +
-        tangent (ref_dx, ref_dy) so no xy→frenet round-trip is needed.
-        (CLAUDE.md: 3D 트랙에서 Frenet xy round-trip 금지.)"""
-        N1 = traj_frenet.shape[0]
-        rc = ref_slice['center_points']          # (N+1, 2)
-        rdx = ref_slice['ref_dx']                # cos(psi_ref)
-        rdy = ref_slice['ref_dy']                # sin(psi_ref)
-        M = int(min(N1, rc.shape[0]))
-        # Left (+n) normal in xy = (-sin(psi_ref), cos(psi_ref)) = (-rdy, rdx)
-        lnx = -rdy[:M]
-        lny = rdx[:M]
-        xy_psi = np.zeros((M, 3), dtype=np.float64)
-        for k in range(M):
-            n_k = float(traj_frenet[k, 1])
-            mu_k = float(traj_frenet[k, 2])
-            xy_psi[k, 0] = float(rc[k, 0] + n_k * lnx[k])
-            xy_psi[k, 1] = float(rc[k, 1] + n_k * lny[k])
-            # Ego heading = ref_psi + mu_k
-            psi_ref = float(np.arctan2(rdy[k], rdx[k]))
-            xy_psi[k, 2] = psi_ref + mu_k
-        return xy_psi
-
     def _slice_local_ref(self, s_cur):
         """Build N+1 local reference from /global_waypoints around s_cur.
         Port of the original mpc_planner_node._slice_local_ref — unchanged."""
@@ -975,7 +876,7 @@ class MPCPlannerStateNode:
 
         center_pts, left_pts, right_pts = [], [], []
         d_left_arr, d_right_arr = [], []
-        ref_v, ref_s, ref_dx, ref_dy, ref_psi, ref_kappa = [], [], [], [], [], []
+        ref_v, ref_s, ref_dx, ref_dy = [], [], [], []
         s_offset = 0.0
         prev_s = None
 
@@ -989,7 +890,6 @@ class MPCPlannerStateNode:
             psi = self.g_psi[idx]
             dl = self.g_dleft[idx]
             dr = self.g_dright[idx]
-            kappa = self.g_kappa[idx]
 
             normal = np.array([-np.sin(psi), np.cos(psi)])
             center = np.array([x, y])
@@ -1001,8 +901,6 @@ class MPCPlannerStateNode:
             ref_v.append(float(self.g_vx[idx]))
             ref_dx.append(np.cos(psi))
             ref_dy.append(np.sin(psi))
-            ref_psi.append(float(psi))
-            ref_kappa.append(float(kappa))
 
             s_val = float(self.g_s[idx])
             if prev_s is not None and s_val + s_offset < prev_s - 1.0:
@@ -1024,8 +922,6 @@ class MPCPlannerStateNode:
             'ref_s': np.array(ref_s),
             'ref_dx': np.array(ref_dx),
             'ref_dy': np.array(ref_dy),
-            'ref_psi': np.array(ref_psi),
-            'kappa_ref': np.array(ref_kappa),
         }
 
     # ---------------------------------------------------------------- main loop
@@ -1046,37 +942,16 @@ class MPCPlannerStateNode:
         # ### HJ : FrenetDSolver needs current lateral offset as the fixed
         # initial constraint n_0 = n_ego. Harmless for xy backend (ignored).
         ref_slice['n_ego'] = float(ego_n)
+        initial_state = np.array([self.car_x, self.car_y, self.car_yaw])
 
         # ### HJ : Phase 3.5 — fuse obstacle inputs and hand to solver.
         obs_arr, obs_tag = self._build_obstacle_array(s_cur)
 
-        # ### HJ : Build initial_state + side decision per backend.
-        if self.solver_backend == 'frenet_kin':
-            # ψ_ref at s_cur (ref_psi[0]).
-            psi_ref0 = float(ref_slice['ref_psi'][0])
-            mu0 = float(self.car_yaw - psi_ref0)
-            # wrap to [-pi, pi]
-            mu0 = (mu0 + np.pi) % (2.0 * np.pi) - np.pi
-            v0 = float(getattr(self, 'car_vx', 0.5))
-            initial_state = np.array([float(ego_n), mu0, v0])
-            # side decision (rule-based, external)
-            side_int, side_str, side_scores = self._decide_side(obs_arr, ref_slice)
-            self._last_side_int = side_int
-            self._last_side_str = side_str
-            self._last_side_scores = side_scores
-        else:
-            initial_state = np.array([self.car_x, self.car_y, self.car_yaw])
-            side_int = SIDE_CLEAR; side_str = 'n/a'; side_scores = {}
-
         warm_used = int(bool(getattr(self.solver, 'warm', False)))
 
         t0 = time.time()
-        if self.solver_backend == 'frenet_kin':
-            speed, steering, trajectory, success = self.solver.solve(
-                initial_state, ref_slice, obstacles=obs_arr, side=side_int)
-        else:
-            speed, steering, trajectory, success = self.solver.solve(
-                initial_state, ref_slice, obstacles=obs_arr)
+        speed, steering, trajectory, success = self.solver.solve(
+            initial_state, ref_slice, obstacles=obs_arr)
         solve_ms = (time.time() - t0) * 1000.0
         self.pub_timing.publish(Float32(data=solve_ms))
 
@@ -1084,16 +959,6 @@ class MPCPlannerStateNode:
         ipopt_status = getattr(self.solver, 'last_return_status', '-')
         iter_count = getattr(self.solver, 'last_iter_count', -1)
         slack_max = float(getattr(self.solver, 'last_slack_max', 0.0))
-
-        # ### HJ : frenet_kin returns trajectory in (s, n, mu, v). The rest
-        # of the pipeline (_publish_outputs, _publish_debug_markers) expects
-        # (x, y, psi). Lift before handing off. Also stash the original
-        # frenet trajectory for the tick_json payload (margins etc.).
-        self._last_frenet_traj = None
-        if (self.solver_backend == 'frenet_kin' and success
-                and trajectory is not None):
-            self._last_frenet_traj = np.array(trajectory, copy=True)
-            trajectory = self._lift_frenet_to_xy(trajectory, ref_slice)
 
         # ### HJ : Phase 4.3 — 4-tier fallback. Even at tier 3 we still
         # publish a sane Wpnt[] so controller has zero-gap input.
