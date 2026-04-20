@@ -245,19 +245,12 @@ class LocalSamplingPlanner():
         factor = 2 if relative_generation else 1
         valid_array = np.ones(factor * n_samples * v_samples, dtype=bool)
 
-        # ### HJ : invalid-reason counters — snapshot valid count before each check so the
-        # node can report (total, killed_curv, killed_path, killed_fric, valid_after_all).
-        # Each check's soft-fallback (re-enable one candidate when all would die) is counted
-        # as "not killed" by design — we want the count of candidates that would have been
-        # killed by that predicate if no fallback were active.
         # checks modify the valid array. The order of the checks can have influence on the calculation time
-        n_before_any = int(valid_array.sum())
         self.check_curvature(
             valid_array=valid_array,
             kappa=kappa_array,
             kappa_thr=kappa_thr,
         )
-        n_after_curv = int(valid_array.sum())
 
         self.check_path_collision(
             track_handler=self.track_handler,
@@ -266,7 +259,6 @@ class LocalSamplingPlanner():
             n_array=n_array,
             safety_distance=safety_distance
         )
-        n_after_path = int(valid_array.sum())
 
         self.check_friction_limits(
             valid_array=valid_array,
@@ -280,19 +272,6 @@ class LocalSamplingPlanner():
             friction_check_2d=friction_check_2d,
             gg_abs_margin=gg_abs_margin
         )
-        n_after_fric = int(valid_array.sum())
-
-        # ### HJ : expose counts for ~debug/tick_json. "killed_*" is the net drop at each
-        # stage (may be 0 if soft-fallback rescued one). "valid_after_all" = candidates that
-        # survived every hard check. Useful to see which stage is the bottleneck per-tick.
-        self.check_stats = {
-            'total':             int(valid_array.size),
-            'valid_before_any':  n_before_any,
-            'killed_curvature':  max(0, n_before_any - n_after_curv),
-            'killed_path':       max(0, n_after_curv - n_after_path),
-            'killed_friction':   max(0, n_after_path - n_after_fric),
-            'valid_after_all':   n_after_fric,
-        }
 
         # ### HJ : expose all candidate arrays (and the valid mask) so the ROS node
         # can visualise every sample — upstream only kept the chosen best internally.

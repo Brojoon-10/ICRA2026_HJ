@@ -204,8 +204,12 @@ class ServoCalibrationRecorder:
         # ### HJ : validate recorded bag — if odom samples or duration is too low,
         # the data is unusable (corruption, bad timing, etc). Treat as failed so
         # the run loop retries this point instead of silently skipping it.
+        # Duration threshold is relative to record_sec with a small tolerance:
+        # first/last odom bag timestamps never span the full record window
+        # (subscribe latency + rate.sleep gap), so a hard 5.0s threshold rejected
+        # every bag when record_sec itself was 5.0.
         MIN_VALID_ODOM  = 200   # at ~90 Hz odom, 200 ≈ 2.2s — well above trim margins
-        MIN_VALID_SECS  = 5.0   # need at least 5s of stable recording
+        MIN_VALID_SECS  = max(1.0, self.record_sec - 0.5)
         n_odom = 0
         t_first, t_last = None, None
         try:

@@ -25,8 +25,6 @@ import os
 import sys
 import time
 import copy
-import json
-import math
 import threading
 import yaml
 import numpy as np
@@ -219,7 +217,6 @@ class SamplingPlannerStateNode:
         self._cur_y = None
         self._cur_z = None
         self._cur_vs = None
-        self._cur_yaw = None   # ### HJ : filled in _cb_odom, used only by ~debug/tick_json
         self._prev_s_cent = None
         self._prev_xyz    = None
         self._prev_stamp  = None
@@ -247,11 +244,6 @@ class SamplingPlannerStateNode:
         # ### HJ : Phase 2 debug topics — observable mode lock state for tuning.
         self.pub_active_mode  = rospy.Publisher('~active_mode', String, queue_size=1, latch=True)
         self.pub_mode_costs   = rospy.Publisher('~mode_costs',  Float32MultiArray, queue_size=1)
-        # ### HJ : single-stream tick diagnostics as JSON-in-String. Consumed by
-        # `rostopic echo -n 1 ~/debug/tick_json` (CLI or offline Claude analysis).
-        # Contains per-tick cost stats, invalid-reason counts, best-candidate metrics,
-        # opp/mode/timing. Schema: see _build_tick_json.
-        self.pub_tick_json    = rospy.Publisher('~debug/tick_json', String, queue_size=1)
 
         # -- Publishers (role-specific) ---------------------------------------------------------
         if self.state == 'overtake':
@@ -696,13 +688,6 @@ class SamplingPlannerStateNode:
         self._cur_y  = float(msg.pose.pose.position.y)
         self._cur_z  = float(msg.pose.pose.position.z)
         self._cur_vs = float(msg.twist.twist.linear.x)
-        # ### HJ : yaw from quaternion — used only for ~debug/tick_json's chi_raceline_rel.
-        # Not feeding back into planner boundary conditions (Fix-2 does that separately).
-        q = msg.pose.pose.orientation
-        # quaternion → yaw (z-axis rotation)
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self._cur_yaw = math.atan2(siny_cosp, cosy_cosp)
 
     def _cb_opp_pred(self, msg):
         """### HJ : Cache one PredictionArray per opponent id. The publisher
@@ -1485,202 +1470,6 @@ class SamplingPlannerStateNode:
         return fields
 
     # =============================================================================================
-    # ~debug/tick_json — single-stream JSON diagnostics
-    # =============================================================================================
-    @staticmethod
-    def _jnum(x):
-        """### HJ : JSON-safe number — NaN/Inf → None (null), float → float, int → int.
-        json.dumps rejects NaN/Inf without allow_nan=False-equivalent handling,
-        and downstream parsers (jq, python json.loads) vary on extended-JSON allowance."""
-        try:
-            xf = float(x)
-        except (TypeError, ValueError):
-            return None
-        if math.isnan(xf) or math.isinf(xf):
-            return None
-        return xf
-
-    def _compute_cost_stats(self, cost_array, valid_array, best_idx):
-        """### HJ : Summary statistics over cost_array[valid]. spread_ratio indicates
-        how *peaked* the distribution is: 1.0 → best is far below everything else
-        (clear winner); close to 0 → best is barely better than max (flat cost,
-        selection basically random). min/q25/med/q75/max gives the full shape."""
-        if cost_array is None or valid_array is None:
-            return None
-        mask = np.asarray(valid_array, dtype=bool)
-        if not mask.any():
-            return None
-        c = np.asarray(cost_array, dtype=np.float64)[mask]
-        if c.size == 0:
-            return None
-        c_min  = float(c.min())
-        c_max  = float(c.max())
-        c_mean = float(c.mean())
-        c_std  = float(c.std())
-        q25, q50, q75 = [float(v) for v in np.quantile(c, [0.25, 0.50, 0.75])]
-        rng = c_max - c_min
-        if best_idx is not None and 0 <= best_idx < cost_array.shape[0] and mask[best_idx]:
-            c_best = float(cost_array[best_idx])
-        else:
-            c_best = c_min
-        spread = float((c_max - c_best) / rng) if rng > 1e-12 else 0.0
-        return {
-            'n':            int(c.size),
-            'min':          self._jnum(c_min),
-            'q25':          self._jnum(q25),
-            'median':       self._jnum(q50),
-            'q75':          self._jnum(q75),
-            'max':          self._jnum(c_max),
-            'mean':         self._jnum(c_mean),
-            'std':          self._jnum(c_std),
-            'best':         self._jnum(c_best),
-            'spread_ratio': self._jnum(spread),
-        }
-
-    def _build_tick_json(self, fields, ego_chi=None):
-        """### HJ : Consolidate per-tick diagnostics into a single JSON object.
-
-        Schema (stable; fields may be None/empty but keys stay):
-          tick, t_ros, state, status
-          ego{s,n,v,chi_raceline_rel}      — chi_raceline_rel = ego heading vs raceline tangent
-          candidates{total, valid, killed_curvature, killed_path, killed_friction}
-          cost_stats{n,min,q25,median,q75,max,mean,std,best,spread_ratio}
-          best{idx, n_end, v_end, total_progress_m, kappa_max, kappa_dot_max,
-               n_swing, boundary_min_margin, pred_min_dist}
-          mode{chosen, prev, changed, lock_remain_s,
-               cost_follow, cost_ot_left, cost_ot_right,
-               best_idx_follow, best_idx_ot_left, best_idx_ot_right}
-          opp{count, lead_id, lead_s, lead_n, lead_vs, lead_age_s}
-          mppi{eff_n, top1_w, T_used, n_blend}
-          timing_ms{calc, post_add, total}
-          params{...hot-reconfigurable subset...}
-        """
-        # Upstream check_stats (set in sampling_based_planner.calc_trajectory).
-        cs = getattr(self.planner, 'check_stats', None) or {}
-        cands_section = {
-            'total':            int(cs.get('total',            fields.get('n_total_candidates', 0))),
-            'valid_before_any': int(cs.get('valid_before_any', 0)),
-            'killed_curvature': int(cs.get('killed_curvature', 0)),
-            'killed_path':      int(cs.get('killed_path',      0)),
-            'killed_friction':  int(cs.get('killed_friction',  0)),
-            'valid_after_all':  int(cs.get('valid_after_all',  fields.get('n_valid_candidates', 0))),
-        }
-
-        # Cost distribution over valid candidates (using the FINAL cost_array that the
-        # selector used — overtake state uses the chosen mode's mode_cost_arrays entry).
-        cost_arr = getattr(self.planner, 'cost_array', None)
-        cands    = getattr(self.planner, 'candidates', None)
-        if cands is not None and cost_arr is not None:
-            stats = self._compute_cost_stats(
-                cost_array=np.asarray(cost_arr, dtype=np.float64),
-                valid_array=np.asarray(cands['valid'], dtype=bool),
-                best_idx=int(self.planner.trajectory.get('optimal_idx', -1))
-                          if self.planner.trajectory else -1,
-            )
-        else:
-            stats = None
-
-        out = {
-            'tick':    int(fields.get('tick_idx', 0)),
-            't_ros':   self._jnum(fields.get('t_ros')),
-            'state':   str(fields.get('state', '')),
-            'status':  str(fields.get('status', '')),
-            'ego': {
-                's':                  self._jnum(fields.get('ego_s')),
-                'n':                  self._jnum(fields.get('ego_n')),
-                'v':                  self._jnum(fields.get('ego_v')),
-                'chi_raceline_rel':   self._jnum(ego_chi),
-            },
-            'candidates': cands_section,
-            'cost_stats': stats,
-            'best': {
-                'idx':                 int(self.planner.trajectory.get('optimal_idx', -1))
-                                       if self.planner.trajectory else -1,
-                'n_end':               self._jnum(fields.get('n_endpoint_chosen')),
-                'v_end':               self._jnum(fields.get('v_endpoint_chosen')),
-                'total_progress_m':    self._jnum(fields.get('total_progress_m')),
-                'kappa_max':           self._jnum(fields.get('kappa_max_chosen')),
-                'kappa_dot_max':       self._jnum(fields.get('kappa_dot_max_chosen')),
-                'n_swing':             self._jnum(fields.get('n_swing_chosen')),
-                'boundary_min_margin': self._jnum(fields.get('boundary_min_margin_chosen')),
-                'pred_min_dist':       self._jnum(fields.get('prediction_min_dist_chosen')),
-            },
-            'mode': {
-                'chosen':              str(fields.get('chosen_mode', '')),
-                'prev':                str(fields.get('prev_mode', '')),
-                'changed':             int(fields.get('mode_changed', 0)),
-                'lock_remain_s':       self._jnum(fields.get('lock_remain_s')),
-                'cost_follow':         self._jnum(fields.get('cost_follow')),
-                'cost_ot_left':        self._jnum(fields.get('cost_ot_left')),
-                'cost_ot_right':       self._jnum(fields.get('cost_ot_right')),
-                'best_idx_follow':     int(fields.get('best_idx_follow',   -1)),
-                'best_idx_ot_left':    int(fields.get('best_idx_ot_left',  -1)),
-                'best_idx_ot_right':   int(fields.get('best_idx_ot_right', -1)),
-            },
-            'opp': {
-                'count':     int(fields.get('opp_count', 0)),
-                'lead_id':   int(fields.get('opp_id_lead', -1)),
-                'lead_s':    self._jnum(fields.get('opp_s_lead')),
-                'lead_n':    self._jnum(fields.get('opp_n_lead')),
-                'lead_vs':   self._jnum(fields.get('opp_vs_lead')),
-                'lead_age_s':self._jnum(fields.get('opp_pred_age_lead')),
-            },
-            'mppi': {
-                'eff_n':    self._jnum(fields.get('mppi_eff_n')),
-                'top1_w':   self._jnum(fields.get('mppi_top1_w')),
-                'T_used':   self._jnum(fields.get('mppi_T_used')),
-                'n_blend':  int(fields.get('mppi_n_blend', 0)),
-            },
-            'timing_ms': {
-                'calc':     self._jnum(fields.get('calc_traj_ms')),
-                'post_add': self._jnum(fields.get('post_add_ms')),
-                'total':    self._jnum(fields.get('total_tick_ms')),
-            },
-            # ### HJ : hot-reconfigurable params subset — enough to correlate cost shape
-            # with a weight change without replaying the YAML snapshot.
-            'params': {
-                'w_race':       self._jnum(self.w_raceline),
-                'w_vel':        self._jnum(self.w_velocity),
-                'w_pred':       self._jnum(self.w_prediction),
-                'w_cont':       self._jnum(self.w_continuity),
-                'w_bound':      self._jnum(self.w_boundary),
-                'w_side':       self._jnum(self.w_side),
-                'w_progress':   self._jnum(self.w_progress),
-                'w_detour':     self._jnum(self.w_detour),
-                'safety_m':     self._jnum(self.safety_margin_m),
-                'safety_dist':  self._jnum(self.safety_distance),
-                'filter_alpha': self._jnum(self.filter_alpha),
-                'mppi_enable':  bool(self.mppi_enable),
-                'horizon':      self._jnum(self.horizon),
-                'num_samples':  int(self.num_samples),
-                'n_samples':    int(self.n_samples),
-                'v_samples':    int(self.v_samples),
-                'endpoint_chi_raceline_only': bool(self.endpoint_chi_raceline_only),
-                'relative_generation':        bool(self.relative_generation),
-            },
-        }
-        return out
-
-    def _ego_chi_vs_raceline(self, s_cent):
-        """### HJ : ego's current heading minus raceline tangent at current s.
-        Uses the latest odom (not a Frenet-derived chi) so the diagnostic reflects the
-        real car's yaw. If odom yaw is missing (self._cur_yaw None), return None.
-        Value is *signed* — positive = ego pointing left of raceline."""
-        yaw = getattr(self, '_cur_yaw', None)
-        if yaw is None or s_cent is None:
-            return None
-        try:
-            theta = float(np.interp(float(s_cent), np.asarray(self.track.s),
-                                    np.asarray(self.track.theta)))
-        except Exception:
-            return None
-        # wrap to [-pi, pi]
-        d = float(yaw) - theta
-        while d >  math.pi: d -= 2.0 * math.pi
-        while d < -math.pi: d += 2.0 * math.pi
-        return d
-
-    # =============================================================================================
     # Main loop
     # =============================================================================================
     def spin(self):
@@ -1863,45 +1652,21 @@ class SamplingPlannerStateNode:
                     'type': type(e).__name__, 'msg': str(e),
                 })
 
-            # ### HJ : per-tick fields dict — used by both CSV logger and ~debug/tick_json.
-            # Built unconditionally (cheap) so tick_json publishes even when debug logger
-            # is disabled (~debug/enable=false) — the JSON stream is the Claude-facing
-            # real-time feed, separate from the persistent CSV trace.
-            tick_fields = None
-            try:
-                total_tick_ms = (time.time() - tick_t0_wall) * 1000.0
-                tick_fields = self._collect_tick_fields(
-                    ego_s=s_cent, ego_n=n_cent, ego_v=v_cur,
-                    prediction=prediction, status=tick_status,
-                    chosen_mode=self._active_mode, prev_mode=prev_mode_for_log,
-                    cost_per_mode=tick_cost_per_mode,
-                    best_idx_per_mode=tick_best_idx_per_mode,
-                    n_valid=tick_n_valid, n_total=tick_n_total,
-                    calc_traj_ms=tick_calc_ms, post_add_ms=tick_post_add_ms,
-                    total_tick_ms=total_tick_ms,
-                )
-            except Exception as _e:
-                rospy.logwarn_throttle(5.0,
-                    '[sampling][%s] tick_fields build failed: %s', rospy.get_name(), _e)
-
-            # ### HJ : publish JSON diagnostic (Claude/offline consumer) even when CSV
-            # logger is off — separate sink, same fields.
-            if tick_fields is not None:
+            # ### HJ : per-tick CSV row — 매 spin 끝에 한 줄 (성공/실패 무관).
+            if self._logger is not None:
                 try:
-                    chi_rel = self._ego_chi_vs_raceline(s_cent)
-                    payload = self._build_tick_json(tick_fields, ego_chi=chi_rel)
-                    self.pub_tick_json.publish(String(
-                        data=json.dumps(payload, separators=(',', ':'))
-                    ))
-                except Exception as _e:
-                    rospy.logwarn_throttle(5.0,
-                        '[sampling][%s] tick_json publish failed: %s',
-                        rospy.get_name(), _e)
-
-            # Persistent CSV trace (ungated by tick_json).
-            if self._logger is not None and tick_fields is not None:
-                try:
-                    self._logger.log_tick(tick_fields)
+                    total_tick_ms = (time.time() - tick_t0_wall) * 1000.0
+                    fields = self._collect_tick_fields(
+                        ego_s=s_cent, ego_n=n_cent, ego_v=v_cur,
+                        prediction=prediction, status=tick_status,
+                        chosen_mode=self._active_mode, prev_mode=prev_mode_for_log,
+                        cost_per_mode=tick_cost_per_mode,
+                        best_idx_per_mode=tick_best_idx_per_mode,
+                        n_valid=tick_n_valid, n_total=tick_n_total,
+                        calc_traj_ms=tick_calc_ms, post_add_ms=tick_post_add_ms,
+                        total_tick_ms=total_tick_ms,
+                    )
+                    self._logger.log_tick(fields)
                     if self._logger.snapshot_every_n > 0:
                         cands = getattr(self.planner, 'candidates', None)
                         if cands is not None:
