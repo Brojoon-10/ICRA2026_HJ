@@ -49,13 +49,14 @@ w_lag: 0.8
 w_velocity: 0.1
 v_bias_max: 3.0
 
-# ### HJ : v3 — stage ramps OFF (1.0 = flat). v2c's 0.4/0.6 made near-car
-# contour weight ~0.8 vs late-horizon ~2.0 → U-shape pull → "only trajectory
-# end leaves the wall" with straight-line kinks mid-horizon. v3 uses uniform
-# q_n over the horizon + terminal q_n_term (see below) to shape return to
-# raceline; legacy MPCC still honours the ramp knobs.
-contour_ramp_start: 1.0
-lag_ramp_start: 1.0
+# ### HJ : stage-wise contour/lag ramp. 0.05/0.30 was too aggressive —
+# near-car anchor dropped to w_contour*0.05 = 0.1 AND w_velocity was 0.1,
+# so nothing kept the trajectory progressing forward and the NLP found
+# that drawing a small circle was cheaper (seen as looping 15-point
+# trajectory in echo). 0.4/0.6 keeps enough forward pull while still
+# letting obstacle repulsive cost bend the near-car shape.
+contour_ramp_start: 0.4
+lag_ramp_start: 0.6
 
 # Smoothness
 w_dv: 9.5
@@ -67,13 +68,6 @@ w_dsteering: 20.0    # ↑ (smooth lane change)
 # avoidance (cost_obs=500-663) because cost_slack=450-556 was cheaper.
 # Raising w_slack ×2.5 makes corridor violation strictly more expensive
 # than even max obstacle pushback.
-# ### HJ : v3b — wall_safe is a BODY-EDGE safety requirement, NOT a
-# centroid one. Solver.wall_safe + inflation + ego_half_width together
-# form the hard corridor for the centroid; the body edge is guaranteed
-# to stay ≥ wall_safe + inflation = 0.20 m from the wall regardless of
-# solver tricks. If corridor is too narrow to pass a side, side_decider
-# MUST force SIDE_TRAIL instead of relaxing this margin — the v_max cap
-# in _build_vmax then produces a safe trailing trajectory.
 boundary_inflation: 0.05
 w_slack: 5000.0
 
@@ -98,13 +92,8 @@ n_obs_max: 2
 # hinge, so solver stays convex locally (unlike the elliptical hinge that
 # caused warm-start local-min lockups).
 w_wall: 150.0         # legacy MPCC only — FrenetKin uses w_wall_buf below
-# ### HJ : v3c — wall_safe is BODY-EDGE hard-survival margin.
-# Hard solver bound: |n| ≤ d_wall - ego_half(0.15) - wall_safe - inflation.
-# 0.08 → body-edge ≥ 0.13 m hard. Tight but feasible even on 0.8 m-wide
-# sections. Real safety goal (0.20 m body-edge) is enforced by the soft
-# wall_buf cushion below, which has w_wall_buf=2500 to dominate obstacle
-# pushback in normal conditions.
-wall_safe: 0.08
+wall_safe: 0.10       # hard corridor inset (NLP bound). thin — soft cushion
+                      # (w_wall_buf, wall_buf below) does the real work.
 
 # ============================================================
 # ### HJ : FrenetKinMPC (solver_backend=frenet_kin) params
@@ -143,54 +132,25 @@ gap_lat: 0.25         # lateral clearance to obstacle for bias zero-line
 gap_long: 0.8         # (legacy knob; no longer gates any constraint in v2)
 
 # Soft wall cushion — quadratic hinge fires `wall_buf` inside the raw wall.
-# ### HJ : v3 — w_wall_buf 400→2500 (×6). The "boundary-layer glue" that
-# caused straight-line kinks near the wall came from the hard corridor
-# constraint becoming active when the cushion pressure was insufficient.
-# At 2500, hitting the cushion is ~35× more expensive than the obstacle
-# bubble peak, so the solver NEVER approaches the hard bound → trajectory
-# stays smooth all the way to the wall edge.
-w_wall_buf: 2500.0
+# Prevents the solver from riding the hard corridor edge during overtakes.
+# ### HJ : v2c — w_wall_buf 150→400, wall_buf 0.25→0.30. With w_obs lowered
+# to 180, wall cushion becomes the dominant lateral force near the edge.
+# Widening the cushion (0.30m) gives the solver more distance over which
+# to react, and the heavier weight (400) makes edge-hugging ~5× more
+# costly than obstacle proximity — guarantees "no wall touch" rule.
+w_wall_buf: 400.0
 wall_buf: 0.30        # > wall_safe(0.10) so soft cushion kicks in first
 
-# ### HJ : v3 — C^1 curvature (δ as state, δ̇ as input). Solver-level
-# smoothness guarantee. r_dd penalises steering-rate, r_dd_rate penalises
-# steering-jerk. Combined → κ(s) continuous AND differentiable.
-r_dd: 5.0
-r_dd_rate: 1.0
-delta_rate_max: 3.0   # rad/s steer-rate limit (hard input bound)
-
-# ### HJ : v3 — tick-to-tick solution continuity. On each tick the solver
-# pulls n_k toward prev solve's n_{k+1} (shifted). Makes the trajectory
-# morph continuously instead of snapping to a new optimum.
-# ### HJ : v3b — 20→200 (×10). 41-tick capture showed jitter_rms_m p95=0.281
-# (target <0.10). cost.cont was 0.14 mean, way below contour(1.33)/term(0.48),
-# so the solver happily let each step drift ~4cm/tick → √21 × 4cm ≈ 18cm
-# trajectory jitter. Raising w_cont to 200 makes continuity the dominant
-# cost, locking tick-to-tick shape unless a real obstacle/wall forces a move.
-w_cont: 200.0
-
-# ### HJ : v3 — terminal stability cost. Replaces the "only end leaves
-# wall" stage-ramp hack. q_n_term pulls n[N]→0 (raceline), q_v_term
-# pulls v[N]→ref_v.
-q_n_term: 10.0
-q_v_term: 0.5
-
-# Side decider hysteresis + feasibility gate (v3).
+# Side decider hysteresis (external to NLP). 10 ticks × 0.033s ≈ 0.33s.
+# Still relevant in v2 to damp rapid flips — side bias is soft but frequent
+# reweighting still costs warm-start quality.
 side_hold_ticks: 10
-# ### HJ : v3 — feasibility-aware side decision. d_free side slot must
-# clear (ego_half + gap_lat + min_pass_margin) before SideDecider picks it;
-# otherwise forces TRAIL. Prevents "squeeze into 5cm slot" failures.
-min_pass_margin: 0.10
-trail_entry_ticks: 3  # TRAIL fires fast (~0.1s) — "못 갈 것 같으면 바로 감속"
 
-# ### HJ : v3 — obstacle s/n EMA filter. Opponent predictor jitter was
-# shaking the bubble centre tick-to-tick and rattling the cost landscape.
-# α=0.30 gives ~3-tick time constant — filtered fast enough that real
-# obstacle motion still tracks.
-obs_ema_alpha: 0.30
-
-# ### HJ : v3 — TRAIL velocity ramp. On TRAIL commit, v_max cap is ramped
-# in over 8 ticks (~0.27s) rather than snapping. Node-side param.
-trail_vel_ramp_ticks: 8
-
+# ### HJ : v2c — bias_scale ramp after a side flip. On tick 0 of a new side
+# bias_scale=0 (no lateral bias), then +1/8 per tick up to 1.0 at tick 8.
+# 8 ticks × 0.033s ≈ 0.26s morph time. Combined with side_hold_ticks=10,
+# each side commitment lasts ≥ 0.33s and the cost landscape transitions
+# smoothly — trajectory deforms continuously across flips instead of the
+# "discrete" snap user reported in v2b.
+side_ramp_ticks: 8
 # (ipopt_max_iter already set to 1000 above; iter=15 typical, not a bottleneck)
