@@ -28,12 +28,6 @@
   <param name="racecar_version" value="$(arg racecar_version)" />
   <param name="sim"             value="$(arg sim)" />
 
-  <!-- ### HJ : during calibration, force nonlinear mapping OFF so the algebraic trick
-       delta_cmd = (target_servo - offset)/gain produces deterministic raw servo values.
-       Must be set BEFORE middle_level.launch starts the vesc/ackermann_to_vesc node. -->
-  <param if="$(arg calibration)"
-         name="/vesc/enable_nonlinear_servo_gain" value="false" />
-
   <!-- ══════════════════ REAL CAR ══════════════════ -->
   <group unless="$(arg sim)">
     <!-- Low level + State Estimation + Frenet -->
@@ -43,6 +37,13 @@
       <arg name="SE" value="$(arg SE)" />
       <arg name="use_vesc_imu" value="$(arg use_vesc_imu)" />
     </include>
+    <!-- ### HJ : during calibration, force nonlinear mapping OFF so the algebraic trick
+         delta_cmd = (target_servo - offset)/gain produces deterministic raw servo values.
+         Placed AFTER the middle_level include so this <param> is processed after
+         vesc.launch's rosparam load of vesc.yaml (roslaunch: later-in-document wins).
+         Sim path is excluded on purpose: middle_level / vesc are not launched there. -->
+    <param if="$(arg calibration)"
+           name="/vesc/enable_nonlinear_servo_gain" value="false" />
   </group>
 
   <!-- ══════════════════ SIM (Gazebo on remote) ══════════════════ -->

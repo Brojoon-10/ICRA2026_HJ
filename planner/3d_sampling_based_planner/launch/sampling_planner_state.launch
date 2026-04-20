@@ -20,8 +20,9 @@
        doc="overtake | recovery | observe"/>
   <!-- ### HJ : When launched via sampling_planner_multi.launch this is set to "overtake"/"recovery"
        inside <group ns="sampling_planner">, producing node names /sampling_planner/overtake etc.
-       Kept the short form as default so standalone invocation also stays clean. -->
-  <arg name="instance_name"  default="$(arg state)"/>
+       Standalone default uses "sampling_$(state)" to avoid colliding with other backend
+       standalone launches (e.g. mpc_planner_state.launch → /mpc_overtake). -->
+  <arg name="instance_name"  default="sampling_$(arg state)"/>
   <arg name="config_file"    default="$(find sampling_based_planner_3d)/config/state_$(arg state).yaml"/>
   <arg name="output_topic"   default=""
        doc="When non-empty, remaps the role-specific topic (~out/otwpnts or ~out/wpnts) here."/>
