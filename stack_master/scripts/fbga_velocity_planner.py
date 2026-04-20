@@ -20,11 +20,13 @@ from f110_msgs.msg import WpntArray, Wpnt
 import trajectory_planning_helpers as tph
 
 
-## IY(0416) : per-sector friction support for FBGA
-#   FBGA C++ binary only accepts a single gg.bin, so multi-GGV is handled
-#   by running FBGA once per unique friction and selecting per-waypoint results.
+## IY : per-sector GGV support for FBGA.
+#   FBGA C++ binary takes a single gg.bin, so multi-GGV is emulated by running
+#   FBGA once per unique source bin and picking per-waypoint results.
+#   Source priority per sector_idx: /gg_tuner/sector_ggv_map/sector<i> snapshot
+#   → legacy <base>_sec<i>/velocity_frame/gg.bin → default gg.bin.
 def _read_friction_sectors_from_yaml(maps_dir, map_name):
-    """Read friction sectors from friction_scaling.yaml. Returns [] if unavailable."""
+    """Read friction sectors from friction_scaling.yaml. Returns [] on failure."""
     yaml_path = os.path.join(maps_dir, map_name, 'friction_scaling.yaml')
     if not os.path.exists(yaml_path):
         return []
@@ -36,7 +38,8 @@ def _read_friction_sectors_from_yaml(maps_dir, map_name):
             sec = data.get(f'Sector{i}', {})
             fric = sec.get('friction', -1.0)
             if fric > 0:
-                sectors.append({'start': sec.get('start', 0),
+                sectors.append({'sector_idx': i,
+                                'start': sec.get('start', 0),
                                 'end': sec.get('end', 0),
                                 'friction': float(fric)})
         return sectors
@@ -44,21 +47,18 @@ def _read_friction_sectors_from_yaml(maps_dir, map_name):
         return []
 
 
-def _build_wpnt_sector_map(sectors, n_waypoints, base_p_Dx_1):
-    """Build per-waypoint friction value array.
-    Returns friction_per_wpnt (np.array) or None if single-GGV is sufficient.
-    """
+def _build_wpnt_sector_idx_map(sectors, n_waypoints):
+    """Per-waypoint sector_idx int array (-1 = no sector). Returns None if empty."""
     if not sectors:
         return None
-    unique = set(s['friction'] for s in sectors)
-    if len(unique) == 1 and abs(list(unique)[0] - base_p_Dx_1) < 1e-4:
-        return None
-    fric_arr = np.full(n_waypoints, base_p_Dx_1)
+    arr = np.full(n_waypoints, -1, dtype=int)
     for sec in sectors:
-        s, e = sec['start'], min(sec['end'] + 1, n_waypoints)
-        fric_arr[s:e] = sec['friction']
-    return fric_arr
-## IY(0416) : end
+        s = max(0, int(sec['start']))
+        e = min(int(sec['end']) + 1, n_waypoints)
+        if e > s:
+            arr[s:e] = int(sec['sector_idx'])
+    return arr
+## IY : end
 
 
 class FBGAVelocityPlanner:
@@ -132,12 +132,12 @@ class FBGAVelocityPlanner:
         self.reload_srv = rospy.Service('/fbga/reload', Trigger, self.reload_cb)
         ## IY : end
 
-        ## IY(0416) : per-sector friction — load friction sectors + build gg.bin map
+        ## IY : per-sector GGV — map sector_idx → gg.bin path
         self.race_stack = race_stack
-        self.gg_base_dir = os.path.dirname(os.path.dirname(self.gg_bin))  # e.g. gg_diagrams/rc_car_10th_latest
-        self.friction_gg_bins = {}  # friction_value → gg.bin path
+        self.gg_base_dir = os.path.dirname(os.path.dirname(self.gg_bin))  # gg_diagrams/rc_car_10th_latest
+        self.sector_gg_bins = {}  # sector_idx(int) → gg.bin path
         self._load_friction_sectors()
-        ## IY(0416) : end
+        ## IY : end
 
         rospy.loginfo(f"[FBGA] Ready. bin={self.fbga_bin}")
         rospy.loginfo(f"[FBGA] gg.bin={self.gg_bin}")
@@ -177,14 +177,13 @@ class FBGAVelocityPlanner:
             f.write(f"v_max={vp['v_max']}\n")
         rospy.loginfo(f"[FBGA] params.txt saved: m={vp['m']}, P_max={vp['P_max']}, v_max={vp['v_max']}")
 
-    ## IY(0416) : load friction sectors and map gg.bin paths per friction
+    ## IY : resolve per-sector gg.bin (rosparam snapshot → legacy _sec<i> → default)
     def _load_friction_sectors(self):
-        """Read friction sectors and locate per-friction gg.bin files."""
+        """Build sector_idx → gg.bin map using rosparam snapshot names first."""
         map_name = rospy.get_param('/map', '')
         maps_dir = os.path.join(self.race_stack, 'stack_master', 'maps')
         sectors = _read_friction_sectors_from_yaml(maps_dir, map_name)
 
-        # read base p_Dx_1 from params
         try:
             with open(rospy.get_param('~params_yml',
                       os.path.join(self.race_stack, 'planner', '3d_gb_optimizer',
@@ -195,8 +194,7 @@ class FBGAVelocityPlanner:
         except Exception:
             self.base_p_Dx_1 = 0.56
 
-        self.friction_per_wpnt = None
-        self.friction_gg_bins = {}
+        self.sector_gg_bins = {}
 
         if not sectors:
             rospy.loginfo("[FBGA] No friction sectors → single GGV mode")
@@ -204,40 +202,54 @@ class FBGAVelocityPlanner:
 
         self._friction_sectors_raw = sectors
 
-        ## IY : sector-based lookup — gg_tuner 가 <base>_latest_sec<i>/ 로 저장.
-        #       old: per-friction-value lookup (<base>_fNNN/). preserved below.
-        # --- (original friction-value lookup, preserved) ---
-        # gg_parent = dirname(self.gg_base_dir); base_name = basename(...)
-        # unique_frics = sorted(set(s['friction'] for s in sectors))
-        # for fric in unique_frics: fric_bin = f"{base_name}_f{NNN}/.../gg.bin"
-        # --- (end) ---
         gg_parent = os.path.dirname(self.gg_base_dir)
         base_name = os.path.basename(self.gg_base_dir)
-        all_found = True
-        for i, sec in enumerate(sectors):
-            fric = sec['friction']
-            if fric in self.friction_gg_bins:
-                continue  # same friction already mapped (sectors sharing fric)
-            sec_bin = os.path.join(
-                gg_parent, f'{base_name}_sec{i}',
-                'velocity_frame', 'gg.bin')
-            if not os.path.exists(sec_bin):
-                rospy.logwarn(
-                    f"[FBGA] sector GGV not found: {sec_bin}")
-                all_found = False
-                break
-            self.friction_gg_bins[fric] = sec_bin
 
-        if not all_found or len(self.friction_gg_bins) <= 1:
-            self.friction_gg_bins = {}
-            rospy.loginfo("[FBGA] Sector GGVs incomplete → single GGV mode")
+        for sec in sectors:
+            sidx = int(sec['sector_idx'])
+            sec_bin = None
+
+            # 1) rosparam snapshot selector
+            snap = ''
+            try:
+                snap = rospy.get_param(
+                    f'/gg_tuner/sector_ggv_map/sector{sidx}', '')
+            except Exception:
+                snap = ''
+            snap = (snap or '').strip()
+            if snap:
+                snap_bin = os.path.join(
+                    gg_parent, snap, 'velocity_frame', 'gg.bin')
+                if os.path.exists(snap_bin):
+                    sec_bin = snap_bin
+                    rospy.loginfo(
+                        f"[FBGA] sector{sidx}: snapshot '{snap}' → {snap_bin}")
+                else:
+                    rospy.logwarn(
+                        f"[FBGA] sector{sidx} snapshot missing: {snap_bin} "
+                        f"→ fallback")
+
+            # 2) legacy <base>_sec<i>
+            if sec_bin is None:
+                legacy_bin = os.path.join(
+                    gg_parent, f'{base_name}_sec{sidx}',
+                    'velocity_frame', 'gg.bin')
+                if os.path.exists(legacy_bin):
+                    sec_bin = legacy_bin
+                    rospy.loginfo(
+                        f"[FBGA] sector{sidx}: legacy dir → {legacy_bin}")
+
+            # 3) no override → uses default self.gg_bin (not stored)
+            if sec_bin is not None and sec_bin != self.gg_bin:
+                self.sector_gg_bins[sidx] = sec_bin
+
+        if not self.sector_gg_bins:
+            rospy.loginfo("[FBGA] No per-sector overrides → single GGV mode")
         else:
             rospy.loginfo(
-                f"[FBGA] Multi-GGV (sector-based): "
-                f"{len(self.friction_gg_bins)} unique frictions across "
-                f"{len(sectors)} sectors")
-        ## IY : end
-    ## IY(0416) : end
+                f"[FBGA] Per-sector GGVs: {len(self.sector_gg_bins)} override(s) "
+                f"across {len(sectors)} sectors")
+    ## IY : end
 
     def _read_g_range(self):
         """gg.bin에서 g_list 범위 읽기"""
@@ -450,12 +462,12 @@ class FBGAVelocityPlanner:
             v_prev = self._initial_speed_estimate(kappa, mu, dmu_ds)
             rospy.loginfo("[FBGA] Using curvature+slope initial speed estimate")
 
-        ## IY(0416) : build per-waypoint friction map (resize to actual wpnt count)
-        friction_per_wpnt = None
-        if self.friction_gg_bins and hasattr(self, '_friction_sectors_raw'):
-            friction_per_wpnt = _build_wpnt_sector_map(
-                self._friction_sectors_raw, n, self.base_p_Dx_1)
-        ## IY(0416) : end
+        ## IY : per-waypoint sector_idx map (only built when overrides exist)
+        sector_idx_per_wpnt = None
+        if self.sector_gg_bins and hasattr(self, '_friction_sectors_raw'):
+            sector_idx_per_wpnt = _build_wpnt_sector_idx_map(
+                self._friction_sectors_raw, n)
+        ## IY : end
 
         # === Fixed-point iteration ===
         for it in range(self.max_iter):
@@ -476,39 +488,53 @@ class FBGAVelocityPlanner:
             # v_new, ax_new = self._extract_middle_lap(v_full, ax_full, n_pts)
             # --- (end) ---
 
-            ## IY(0416) : multi-friction FBGA
-            #   Run FBGA once per unique friction (full track each time).
-            #   Each friction run's BW pass naturally creates braking zones
-            #   before low-grip sections. Per-waypoint, pick the result from
-            #   the run matching that waypoint's sector friction.
-            if friction_per_wpnt is not None and len(self.friction_gg_bins) > 1:
-                # run FBGA per unique friction
-                fric_results = {}  # friction → (v_1lap, ax_1lap)
-                for fric, gg_bin in self.friction_gg_bins.items():
+            ## IY : multi-GGV FBGA
+            #   Run FBGA per unique source bin (sector overrides + default).
+            #   Per waypoint: pick the run matching that waypoint's sector_idx,
+            #   falling back to the default run for unmapped indices.
+            if sector_idx_per_wpnt is not None and self.sector_gg_bins:
+                unique_sidx = set(int(x) for x in np.unique(sector_idx_per_wpnt))
+                sidx_results = {}   # sector_idx (or -1 for default) → (v_1lap, ax_1lap)
+
+                # Build runs set: default plus each sector override in use
+                need_default = (-1 in unique_sidx) or any(
+                    s not in self.sector_gg_bins for s in unique_sidx if s != -1)
+
+                if need_default:
+                    res = self._run_fbga(s_stack, k_stack, g_stack,
+                                         mu_stack, dmu_stack, v0)
+                    if res is not None:
+                        v_f, ax_f = res
+                        sidx_results[-1] = self._extract_middle_lap(
+                            v_f, ax_f, n_pts)
+                    else:
+                        rospy.logwarn("[FBGA] default run failed")
+
+                for sidx, gg_bin in self.sector_gg_bins.items():
+                    if sidx not in unique_sidx:
+                        continue
                     res = self._run_fbga(s_stack, k_stack, g_stack,
                                          mu_stack, dmu_stack, v0,
                                          gg_bin_override=gg_bin)
                     if res is None:
-                        rospy.logwarn(f"[FBGA] friction={fric:.3f} run failed")
+                        rospy.logwarn(f"[FBGA] sector{sidx} run failed")
                         continue
                     v_f, ax_f = res
-                    v_1, ax_1 = self._extract_middle_lap(v_f, ax_f, n_pts)
-                    fric_results[fric] = (v_1, ax_1)
+                    sidx_results[sidx] = self._extract_middle_lap(
+                        v_f, ax_f, n_pts)
 
-                if not fric_results:
-                    rospy.logwarn("[FBGA] All friction runs failed")
+                if not sidx_results:
+                    rospy.logwarn("[FBGA] All multi-GGV runs failed")
                     return
 
-                # per-waypoint: select from matching friction run
                 v_new = np.zeros(n)
                 ax_new = np.zeros(n)
+                fallback_key = -1 if -1 in sidx_results else next(iter(sidx_results))
                 for i in range(n):
-                    fric_i = friction_per_wpnt[i]
-                    # find closest available friction
-                    best_fric = min(fric_results.keys(),
-                                    key=lambda f: abs(f - fric_i))
-                    v_new[i] = fric_results[best_fric][0][i]
-                    ax_new[i] = fric_results[best_fric][1][i]
+                    sidx_i = int(sector_idx_per_wpnt[i])
+                    key = sidx_i if sidx_i in sidx_results else fallback_key
+                    v_new[i] = sidx_results[key][0][i]
+                    ax_new[i] = sidx_results[key][1][i]
             else:
                 # single GGV (original path)
                 result = self._run_fbga(s_stack, k_stack, g_stack,
