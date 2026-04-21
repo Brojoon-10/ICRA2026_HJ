@@ -9,7 +9,7 @@
 
 import rospy
 import numpy as np
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from f110_msgs.msg import ObstacleArray, Obstacle, WpntArray, Wpnt, OpponentTrajectory, OppWpnt
 from visualization_msgs.msg import Marker, MarkerArray
 from frenet_conversion.srv import Glob2FrenetArr, Frenet2GlobArr
@@ -55,8 +55,30 @@ class ObstaclePublisher3D:
             )
 
         self.starting_s = rospy.get_param("/obstacle_publisher/start_s", 0)
+
+        ### HJ : d-oscillation (mechanism ported from obstacle_publisher_grid.py)
+        # Mode "temporal": phase advances by 2π·f·dt → constant time period
+        # Mode "spatial":  phase locked to s → constant spatial wavelength (λ=max_s/n)
+        # Use long temporal periods OR spatial mode to get a "uniform overshoot line"
+        self.d_oscillate = rospy.get_param("/obstacle_publisher/d_oscillate", False)
+        self.osc_mode = rospy.get_param("/obstacle_publisher/osc_mode", "spatial")
+        self.osc_n_waves_per_lap = rospy.get_param("/obstacle_publisher/osc_n_waves_per_lap", 1.0)
+        self.osc_frequency = rospy.get_param("/obstacle_publisher/osc_frequency", 0.1)
+        self.osc_amplitude = rospy.get_param("/obstacle_publisher/osc_amplitude", 0.4)
+        self.osc_phase0 = rospy.get_param("/obstacle_publisher/osc_phase0", 0.0)
+        # temporal-mode state
+        self._osc_phase = self.osc_phase0
+        ### HJ : end
+
         rospy.Subscriber("/car_state/odom_frenet", Odometry, self.odom_cb)
         self.car_odom = Odometry()
+
+        ### HJ : RViz "2D Nav Goal" → respawn obstacle at nearest s on opponent line
+        # 이 스택의 RViz config는 Nav Goal을 "/goal" 로 publish (obstacle_spawner와 공유).
+        # 클릭 좌표를 glob2frenet으로 변환한 뒤 dynamic_obstacle.s_center 로 점프.
+        self._pending_respawn_s = None
+        rospy.Subscriber("/goal", PoseStamped, self.nav_goal_cb, queue_size=1)
+        ### HJ : end
 
         self.obstacle_pub = rospy.Publisher("/tracking/obstacles", ObstacleArray, queue_size=10)
         self.obstacle_mrk_pub = rospy.Publisher("/dummy_obstacle_markers", MarkerArray, queue_size=10)
@@ -91,6 +113,21 @@ class ObstaclePublisher3D:
 
     def odom_cb(self, data: Odometry):
         self.car_odom = data
+
+    ### HJ : nav-goal respawn callback
+    def nav_goal_cb(self, data: PoseStamped):
+        """RViz 2D Nav Goal → 가장 가까운 opponent line의 s로 장애물을 재배치."""
+        try:
+            # Glob2FrenetArr expects (x, y, z) for 3D service
+            z = data.pose.position.z
+            resp = self.glob2frenet([data.pose.position.x], [data.pose.position.y], [z])
+            s_new = float(resp.s[0])
+            self._pending_respawn_s = s_new
+            rospy.loginfo(f"[3d_obstacle_publisher] Respawn requested at s={s_new:.2f}m "
+                          f"(clicked xy=({data.pose.position.x:.2f}, {data.pose.position.y:.2f}))")
+        except Exception as e:
+            rospy.logwarn(f"[3d_obstacle_publisher] nav_goal conversion failed: {e}")
+    ### HJ : end
 
     ### HELPERS ###
     def publish_obstacle_cartesian(self, obstacles):
@@ -182,6 +219,13 @@ class ObstaclePublisher3D:
             obstacle_msg.header.stamp = rospy.Time.now()
             obstacle_msg.header.frame_id = "frenet"
 
+            ### HJ : apply pending nav-goal respawn before advancing s
+            if self._pending_respawn_s is not None:
+                self.dynamic_obstacle.s_center = self._pending_respawn_s % max_s
+                self._osc_phase = self.osc_phase0  # temporal 모드 위상 리셋
+                self._pending_respawn_s = None
+            ### HJ : end
+
             s = self.dynamic_obstacle.s_center
             approx_idx = np.abs(opponent_s_array - s).argmin()
 
@@ -190,6 +234,16 @@ class ObstaclePublisher3D:
             self.dynamic_obstacle.s_start = (self.dynamic_obstacle.s_center - self.obj_len/2) % max_s
             self.dynamic_obstacle.s_end = (self.dynamic_obstacle.s_center + self.obj_len/2) % max_s
             self.dynamic_obstacle.d_center = self.opponent_wpnts.oppwpnts[approx_idx].d_m
+
+            ### HJ : add oscillation on top of baseline d
+            if self.d_oscillate:
+                if self.osc_mode == "spatial":
+                    phase = 2.0 * np.pi * self.osc_n_waves_per_lap * (s / max_s) + self.osc_phase0
+                else:  # temporal
+                    self._osc_phase += 2.0 * np.pi * self.osc_frequency * self.looptime
+                    phase = self._osc_phase
+                self.dynamic_obstacle.d_center += self.osc_amplitude * np.sin(phase)
+            ### HJ : end
 
             size = 0.4
             self.dynamic_obstacle.size = size

@@ -29,8 +29,7 @@ from std_srvs.srv import Trigger
 
 class GGTunerNode:
 
-    ### IY(0410) : 튜닝 대상 파라미터 키 분류
-    TIRE_KEYS = ['lambda_mu_x', 'lambda_mu_y', 'p_Dx_2', 'p_Dy_2']
+    TIRE_KEYS = ['lambda_mu_x', 'lambda_mu_y', 'p_Dx_2', 'p_Dy_2', 'friction']
     ## IY : VEHICLE_KEYS 에 cap 포함, POST_KEYS + RACELINE_KEYS 신규
     VEHICLE_KEYS = ['P_max', 'v_max', 'epsilon',
                     'P_brake_max', 'ax_max_cap', 'ax_min_cap', 'ay_max_cap']
@@ -182,6 +181,11 @@ class GGTunerNode:
         # NLP: tire
         for key in self.TIRE_KEYS:
             if key in tuning_dict:
+                if key == 'friction':
+                    fric_val = float(tuning_dict[key])
+                    merged['tire_params']['p_Dx_1'] = fric_val
+                    merged['tire_params']['p_Dy_1'] = fric_val
+                    continue
                 merged['tire_params'][key] = tuning_dict[key]
         # NLP: vehicle (caps: 0.0 → None)
         for key in self.VEHICLE_KEYS:
@@ -241,6 +245,57 @@ class GGTunerNode:
         rospy.loginfo(f"[GGTuner] latest yml written: {latest_yml}")
         return latest_yml
 
+    ## IY : overlay rqt RACELINE_KEYS onto existing latest yml in-place
+    def _update_raceline_keys_in_yml(self, vehicle_name, tuning):
+        yml_path = os.path.join(
+            self.data_path, 'vehicle_params',
+            'params_' + vehicle_name + '.yml')
+        if not os.path.exists(yml_path):
+            rospy.logerr(f"[GGTuner] raceline-keys overlay: yml missing: {yml_path}")
+            return False
+        try:
+            with open(yml_path, 'r') as f:
+                data = yaml.safe_load(f) or {}
+        except (yaml.YAMLError, OSError) as e:
+            rospy.logerr(f"[GGTuner] raceline-keys overlay: yml load failed: {e}")
+            return False
+        overlaid = {}
+        for k in self.RACELINE_KEYS:
+            if k in tuning:
+                data[k] = float(tuning[k])
+                overlaid[k] = data[k]
+        try:
+            with open(yml_path, 'w') as f:
+                yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+        except OSError as e:
+            rospy.logerr(f"[GGTuner] raceline-keys overlay: yml write failed: {e}")
+            return False
+        rospy.loginfo(f"[GGTuner] raceline keys merged into {os.path.basename(yml_path)}: {overlaid}")
+        return True
+    ## IY : end
+
+    ## IY : copy snapshot GGV+yml into _latest slot (snapshot remains unchanged)
+    def _activate_snapshot_as_latest(self, snapshot_name):
+        latest_name = f'{self.base_vehicle}_latest'
+        src_gg = os.path.join(self.data_path, 'gg_diagrams', snapshot_name)
+        dst_gg = os.path.join(self.data_path, 'gg_diagrams', latest_name)
+        src_yml = os.path.join(self.data_path, 'vehicle_params',
+                               f'params_{snapshot_name}.yml')
+        dst_yml = os.path.join(self.data_path, 'vehicle_params',
+                               f'params_{latest_name}.yml')
+        if not os.path.isdir(src_gg):
+            rospy.logerr(f"[GGTuner] snapshot gg_diagrams missing: {src_gg}")
+            return False
+        if not os.path.exists(src_yml):
+            rospy.logerr(f"[GGTuner] snapshot yml missing: {src_yml}")
+            return False
+        self._replace_dir(dst_gg, src_gg)
+        shutil.copy2(src_yml, dst_yml)
+        rospy.loginfo(f"[GGTuner] activated snapshot '{snapshot_name}' as _latest")
+        self.status_pub.publish(f"RACELINE_GGV_ACTIVATED: {snapshot_name}")
+        return True
+    ## IY : end
+
     def _restore_to_latest(self, cached_name):
         """저장된 v<N> 스냅샷을 latest 로 복사 (cache hit 시).
         gg_diagrams/<cached_name>/ → gg_diagrams/<base>_latest/,
@@ -269,39 +324,32 @@ class GGTunerNode:
         return True
 
     def _snapshot_latest_to_version(self, tuning_dict=None):
-        """현재 latest 를 v<N+1> 로 영구 저장 (save_now 체크 시 호출).
-        tuning_dict 가 None 이면 latest 의 params_used.json 에서 읽어서 사용.
-        """
-        latest_name = f'{self.base_vehicle}_latest'
-        latest_gg = os.path.join(self.data_path, 'gg_diagrams', latest_name)
-        latest_yml = os.path.join(self.data_path, 'vehicle_params',
-                                  f'params_{latest_name}.yml')
-        if not os.path.exists(latest_gg):
-            rospy.logerr(f"[GGTuner] SAVE failed: latest gg_diagrams missing: {latest_gg}")
-            self.status_pub.publish("SAVE_FAILED: no latest gg")
-            return False
-        if not os.path.exists(latest_yml):
-            rospy.logerr(f"[GGTuner] SAVE failed: latest yml missing: {latest_yml}")
-            self.status_pub.publish("SAVE_FAILED: no latest yml")
-            return False
-
         ver = self._next_version()
         snapshot_name = f'{self.base_vehicle}_v{ver}'
         rospy.loginfo(f"[GGTuner] ===== SAVE snapshot: {snapshot_name} =====")
         self.status_pub.publish(f"SAVING: {snapshot_name}")
 
-        # 1) gg_diagrams 복사 (심볼릭이면 실제 타겟까지 따라감)
-        dst_gg = os.path.join(self.data_path, 'gg_diagrams', snapshot_name)
-        real_src = os.path.realpath(latest_gg) if os.path.islink(latest_gg) else latest_gg
-        shutil.copytree(real_src, dst_gg)
+        latest_name = f'{self.base_vehicle}_latest'
+        latest_gg = os.path.join(self.data_path, 'gg_diagrams', latest_name)
+        latest_yml = os.path.join(self.data_path, 'vehicle_params',
+                                  f'params_{latest_name}.yml')
+        if not os.path.exists(latest_gg):
+            rospy.logerr(f"[GGTuner] SAVE failed: {latest_gg} missing")
+            self.status_pub.publish("SAVE_FAILED: no latest gg")
+            return False
+        if not os.path.exists(latest_yml):
+            rospy.logerr(f"[GGTuner] SAVE failed: {latest_yml} missing")
+            self.status_pub.publish("SAVE_FAILED: no latest yml")
+            return False
 
-        # 2) yml 복사
+        dst_gg = os.path.join(self.data_path, 'gg_diagrams', snapshot_name)
+        real_src = (os.path.realpath(latest_gg)
+                    if os.path.islink(latest_gg) else latest_gg)
+        shutil.copytree(real_src, dst_gg)
         dst_yml = os.path.join(self.data_path, 'vehicle_params',
                                f'params_{snapshot_name}.yml')
         shutil.copy2(latest_yml, dst_yml)
 
-        # 3) meta: latest 의 params_used.json 에서 tuning 을 가져와 vehicle_name 갱신,
-        #    없으면 인자로 받은 tuning_dict 로 새로 작성.
         latest_meta_path = os.path.join(latest_gg, 'params_used.json')
         meta = None
         if os.path.exists(latest_meta_path):
@@ -322,30 +370,6 @@ class GGTunerNode:
         meta_path = os.path.join(dst_gg, 'params_used.json')
         with open(meta_path, 'w') as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
-
-        ## IY(0416) : also snapshot friction-variant GGV directories
-        #   latest_f{NNN}/ → v{ver}_f{NNN}/  (+ corresponding yml)
-        gg_parent = os.path.join(self.data_path, 'gg_diagrams')
-        fric_prefix = f'{latest_name}_f'
-        for name in os.listdir(gg_parent):
-            if not name.startswith(fric_prefix):
-                continue
-            fric_suffix = name[len(latest_name):]          # e.g. "_f045"
-            src_fric_gg = os.path.join(gg_parent, name)
-            dst_fric_gg = os.path.join(gg_parent, f'{snapshot_name}{fric_suffix}')
-            if os.path.isdir(src_fric_gg) and not os.path.islink(src_fric_gg):
-                shutil.copytree(src_fric_gg, dst_fric_gg)
-                # copy friction yml if exists
-                src_fric_yml = os.path.join(
-                    self.data_path, 'vehicle_params', f'params_{name}.yml')
-                if os.path.exists(src_fric_yml):
-                    dst_fric_yml = os.path.join(
-                        self.data_path, 'vehicle_params',
-                        f'params_{snapshot_name}{fric_suffix}.yml')
-                    shutil.copy2(src_fric_yml, dst_fric_yml)
-                rospy.loginfo(
-                    f"[GGTuner] SAVED friction variant: {snapshot_name}{fric_suffix}")
-        ## IY(0416) : end
 
         rospy.loginfo(f"[GGTuner] SAVED: {snapshot_name}")
         self.status_pub.publish(f"SAVED: {snapshot_name}")
@@ -545,87 +569,28 @@ class GGTunerNode:
             rospy.logwarn(f"[GGTuner] friction_scaling.yaml parse error: {e}")
             return []
 
-    def _generate_friction_ggvs(self, vehicle_name, sectors, full_resolution=False):
-        """friction sector별 GGV 병렬 생성.
+    def _replace_dir(self, dst, src):
+        if os.path.islink(dst):
+            os.unlink(dst)
+        elif os.path.exists(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
 
-        각 unique friction에 대해:
-        1) base params yml 복사 → p_Dx_1, p_Dy_1을 friction 값으로 교체
-        2) fast_ggv_gen 실행 → {vehicle_name}_f{NNN}/ 에 저장
-        3) gg_diagrams로 복사
-
-        base p_Dx_1과 동일한 friction은 skip (이미 생성됨).
-        """
-        if not sectors:
-            return True
-
-        # base params에서 p_Dx_1 읽기
-        base_yml = os.path.join(
-            self.data_path, 'vehicle_params', f'params_{vehicle_name}.yml')
-        if not os.path.exists(base_yml):
-            rospy.logwarn(f"[GGTuner] base yml not found: {base_yml}")
-            return False
-        with open(base_yml) as f:
-            base_params = yaml.safe_load(f)
-        base_p_Dx_1 = base_params.get('tire_params', {}).get('p_Dx_1', 0.56)
-
-        # unique friction 추출 (base와 동일한 건 제외)
-        unique_frictions = sorted(set(s['friction'] for s in sectors))
-        to_generate = [f for f in unique_frictions
-                       if abs(f - base_p_Dx_1) > 1e-4]
-
-        if not to_generate:
-            rospy.loginfo("[GGTuner] All friction sectors match base p_Dx_1 "
-                          "→ no extra GGVs needed")
-            return True
-
-        rospy.loginfo(f"[GGTuner] Generating friction GGVs: {to_generate} "
-                      f"(base p_Dx_1={base_p_Dx_1:.3f})")
-        self.status_pub.publish(
-            f"FRICTION_GGV: {len(to_generate)} variants")
-
-        # 각 friction에 대해 params yml 생성 + fast_ggv_gen 실행
-        threads = []
-        results = {}
-        for fric in to_generate:
-            fric_int = int(round(fric * 100))
-            fric_vehicle = f"{vehicle_name}_f{fric_int:03d}"
-
-            # params yml 복사 + p_Dx_1, p_Dy_1 교체
-            fric_params = copy.deepcopy(base_params)
-            fric_params['tire_params']['p_Dx_1'] = fric
-            fric_params['tire_params']['p_Dy_1'] = fric
-            fric_yml = os.path.join(
-                self.data_path, 'vehicle_params',
-                f'params_{fric_vehicle}.yml')
-            with open(fric_yml, 'w') as f:
-                yaml.dump(fric_params, f, default_flow_style=False,
-                          allow_unicode=True)
-            rospy.loginfo(f"[GGTuner] friction yml: {fric_yml} "
-                          f"(p_Dx_1={fric}, p_Dy_1={fric})")
-
-            # 병렬 실행
-            def _run_one(vname, fval, res_dict):
-                ok = self._run_fast_ggv(vname, full_resolution)
-                if ok:
-                    ok = self._copy_to_gg_diagrams(vname)
-                res_dict[fval] = ok
-
-            t = threading.Thread(target=_run_one,
-                                 args=(fric_vehicle, fric, results))
-            t.start()
-            threads.append(t)
-
-        for t in threads:
-            t.join()
-
-        failed = [f for f, ok in results.items() if not ok]
-        if failed:
-            rospy.logerr(f"[GGTuner] Friction GGV failed for: {failed}")
-            return False
-
-        rospy.loginfo(f"[GGTuner] All friction GGVs generated: {to_generate}")
-        return True
-    ## IY(0416) : end
+    ## IY : publish per-sector GGV snapshot names to rosparam for velopt/FBGA.
+    #       Empty string = use latest. Consumer looks up
+    #       /gg_tuner/sector_ggv_map/sector<i>.
+    def _publish_sector_ggv_map(self, slot_overrides):
+        for i in range(5):
+            name = (slot_overrides.get(i, '') or '').strip()
+            rospy.set_param(f'/gg_tuner/sector_ggv_map/sector{i}', name)
+        set_slots = {i: slot_overrides[i] for i in range(5)
+                     if (slot_overrides.get(i, '') or '').strip()}
+        if set_slots:
+            rospy.loginfo(
+                f"[GGTuner] sector_ggv_map published: {set_slots}")
+        else:
+            rospy.loginfo("[GGTuner] sector_ggv_map cleared (all latest)")
+    ## IY : end
 
     ## IY : raceline — passes safety_distance from rqt
     def _run_raceline(self, vehicle_name, map_name, safety_distance=0.20):
@@ -836,139 +801,59 @@ class GGTunerNode:
                 rospy.loginfo(f"[GGTuner] options: {run_opts}")
                 self.status_pub.publish(f"STARTED: {self.base_vehicle}")
 
-                ## IY : 파이프라인은 항상 latest 에 덮어쓰기 (중간 v<N> 파일 생성 X).
-                #       v<N> 저장은 save_now 체크박스로만 수동 트리거됨 → _snapshot_latest_to_version.
-                # --- (기존 Stage 1/2 원본, 보존용 주석) ---
-                # if not run_opts['run_ggv']:
-                #     latest_link = os.path.join(
-                #         self.data_path, 'gg_diagrams',
-                #         f'{self.base_vehicle}_latest')
-                #     if os.path.exists(latest_link):
-                #         vehicle_name = os.path.basename(os.readlink(latest_link)) \
-                #             if os.path.islink(latest_link) else f'{self.base_vehicle}_latest'
-                #     else:
-                #         vehicle_name = self.base_vehicle
-                #     self.status_pub.publish(f"GGV_SKIP: {vehicle_name}")
-                # else:
-                #     cached_name = self._find_cached(tuning)
-                #     if cached_name is not None:
-                #         vehicle_name = cached_name
-                #         self.status_pub.publish(f"CACHED: {vehicle_name}")
-                #         self._save_params_yml(vehicle_name,
-                #                               self._merge_all_params(tuning))
-                #         self._update_dir_symlinks(vehicle_name)
-                #     else:
-                #         ver = self._next_version()
-                #         vehicle_name = f"{self.base_vehicle}_v{ver}"
-                #         merged = self._merge_all_params(tuning)
-                #         self._save_params_yml(vehicle_name, merged)
-                #         ok = self._run_fast_ggv(vehicle_name,
-                #                                 full_resolution=run_opts['full_resolution'])
-                #         if not ok: ... return
-                #         if not self._copy_to_gg_diagrams(vehicle_name): ... return
-                #         self._save_meta(vehicle_name, tuning)
-                #         self._update_dir_symlinks(vehicle_name)
-                #         self.status_pub.publish(f"GGV_DONE: {vehicle_name}")
-                # --- (원본 끝) ---
                 vehicle_name = f"{self.base_vehicle}_latest"
 
-                ### HJ : 사용자 지정 GGV 이름 처리.
-                #   비어있으면 latest 그대로 사용 (기본 동작 유지).
-                #   이름이 주어지면 gg_diagrams/<name>/ 존재 확인 후
-                #     - 존재: 해당 스냅샷을 latest 로 복원 (params yml 포함)
-                #             → Stage 2 (GGV 생성) SKIP 하고 Stage 3/4 로 진행.
-                #     - 부재: warning 출력 + 파이프라인은 기존 흐름대로 계속.
-                user_ggv = run_opts.get('ggv_name', '')
-                ggv_override_applied = False
-                if user_ggv:
-                    src_gg = os.path.join(
-                        self.data_path, 'gg_diagrams', user_ggv)
-                    if os.path.exists(src_gg):
-                        rospy.loginfo(
-                            f"[GGTuner] ggv_name='{user_ggv}' → restore to latest")
-                        if self._restore_to_latest(user_ggv):
-                            self.status_pub.publish(f"GGV_USER: {user_ggv}")
-                            ggv_override_applied = True
-                        else:
-                            rospy.logwarn(
-                                f"[GGTuner] ggv_name='{user_ggv}' restore failed "
-                                f"→ 기본 파이프라인 진행")
-                    else:
-                        rospy.logwarn(
-                            f"[GGTuner] ggv_name='{user_ggv}' not found at "
-                            f"{src_gg} → 기본 파이프라인 진행 (latest 사용)")
-
-                if ggv_override_applied:
-                    rospy.loginfo(
-                        f"[GGTuner] GGV override: skip Stage 2 "
-                        f"(using restored latest from '{user_ggv}')")
-                elif not run_opts['run_ggv']:
-                    # GGV skip — 기존 latest 그대로 사용
+                if not run_opts['run_ggv']:
+                    ## IY : raceline_ggv override — activate snapshot into _latest
+                    if run_opts['raceline_ggv']:
+                        if not self._activate_snapshot_as_latest(
+                                run_opts['raceline_ggv']):
+                            self.status_pub.publish(
+                                f"FAILED: snapshot_missing:{run_opts['raceline_ggv']}")
+                            return
+                    ## IY : end
                     latest_gg = os.path.join(
                         self.data_path, 'gg_diagrams', vehicle_name)
                     if not os.path.exists(latest_gg):
                         rospy.logerr(
-                            f"[GGTuner] latest gg_diagrams missing: {latest_gg}")
+                            f"[GGTuner] latest gg_diagrams missing: {latest_gg} "
+                            f"(run_ggv=False)")
                         self.status_pub.publish("FAILED: no latest")
                         return
                     rospy.loginfo(
-                        f"[GGTuner] GGV skip (run_ggv=False), using latest")
+                        f"[GGTuner] Stage 2 SKIP (run_ggv=False), reusing latest")
                     self.status_pub.publish(f"GGV_SKIP: {vehicle_name}")
                 else:
-                    # ---- Cache check: 저장된 v<N> 중 같은 tuning 있으면 latest 로 복사 ----
-                    cached_name = self._find_cached(tuning)
-                    if cached_name is not None:
-                        rospy.loginfo(
-                            f"[GGTuner] cache hit: {cached_name} → restore to latest")
-                        self.status_pub.publish(f"CACHED: {cached_name}")
-                        if not self._restore_to_latest(cached_name):
-                            self.status_pub.publish("FAILED: restore")
-                            return
-                        # params.yml latest 도 현재 tuning 으로 재기록 (merged 기준)
-                        self._write_latest_params_yml(self._merge_all_params(tuning))
-                    else:
-                        # ---- Cache miss: latest 에 직접 계산/저장 ----
-                        rospy.loginfo(
-                            f"[GGTuner] cache miss → compute fresh into latest")
-                        merged = self._merge_all_params(tuning)
-                        # 1) latest yml 먼저 기록 (fast_ggv 가 이걸 읽음)
-                        self._write_latest_params_yml(merged)
-                        # 2) fast_ggv 실행 (output/<latest_name>/ 에 생성)
-                        ok = self._run_fast_ggv(
-                            vehicle_name,
-                            full_resolution=run_opts['full_resolution'])
-                        if not ok:
-                            self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
-                            return
-                        # 3) fast_ggv output → gg_diagrams/latest/ 복사
-                        if not self._copy_to_gg_diagrams(vehicle_name):
-                            self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
-                            return
-                        # 4) meta 저장 (tuning 기록 — save 시 v<N> 로 복사됨)
-                        self._save_meta(vehicle_name, tuning)
-                        self.status_pub.publish(f"GGV_DONE: {vehicle_name}")
+                    rospy.loginfo(
+                        f"[GGTuner] Stage 2: compute fresh into latest "
+                        f"(friction={tuning.get('friction', '?')})")
+                    merged = self._merge_all_params(tuning)
+                    self._write_latest_params_yml(merged)
+                    ok = self._run_fast_ggv(
+                        vehicle_name,
+                        full_resolution=run_opts['full_resolution'])
+                    if not ok:
+                        self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
+                        return
+                    if not self._copy_to_gg_diagrams(vehicle_name):
+                        self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
+                        return
+                    self._save_meta(vehicle_name, tuning)
+                    self.status_pub.publish(f"GGV_DONE: {vehicle_name}")
                 ## IY : end
 
-                ## IY(0416) : Stage 2.5 — friction sector별 GGV 병렬 생성
-                #   base GGV 생성/복원 후, friction_scaling.yaml의 sector별 friction으로
-                #   추가 GGV를 생성. velopt NLP가 per-waypoint로 참조.
-                if run_opts['run_ggv'] or ggv_override_applied:
-                    friction_sectors = self._read_friction_sectors(run_opts['map'])
-                    if friction_sectors:
-                        ok = self._generate_friction_ggvs(
-                            vehicle_name, friction_sectors,
-                            full_resolution=run_opts['full_resolution'])
-                        if ok:
-                            self.status_pub.publish(
-                                f"FRICTION_GGV_DONE: {vehicle_name}")
-                        else:
-                            rospy.logwarn(
-                                "[GGTuner] Friction GGV generation failed "
-                                "→ velopt will use single GGV fallback")
-                ## IY(0416) : end
+                ## IY : publish per-sector snapshot names for velopt (no fresh calc)
+                slot_overrides = {
+                    i: run_opts[f'ggv_sector{i}'] for i in range(5)
+                }
+                self._publish_sector_ggv_map(slot_overrides)
+                ## IY : end
 
                 # ---- Stage 3: raceline (optional) ----
                 if run_opts['regen_raceline']:
+                    ## IY : overlay rqt RACELINE_KEYS onto latest yml (idempotent)
+                    self._update_raceline_keys_in_yml(vehicle_name, tuning)
+                    ## IY : end
                     ok = self._run_raceline(
                         vehicle_name, run_opts['map'],
                         safety_distance=run_opts['safety_distance'])
@@ -1083,7 +968,15 @@ class GGTunerNode:
             'velopt_w_jx':       float(config.velopt_w_jx),
             ## IY : end
             'safety_distance':   float(config.safety_distance),
-            'ggv_name':          str(getattr(config, 'ggv_name', '')).strip(),
+            ## IY : per-sector snapshot selector (velopt only; empty=latest)
+            'ggv_sector0':       str(getattr(config, 'ggv_sector0', '')).strip(),
+            'ggv_sector1':       str(getattr(config, 'ggv_sector1', '')).strip(),
+            'ggv_sector2':       str(getattr(config, 'ggv_sector2', '')).strip(),
+            'ggv_sector3':       str(getattr(config, 'ggv_sector3', '')).strip(),
+            'ggv_sector4':       str(getattr(config, 'ggv_sector4', '')).strip(),
+            ## IY : raceline-dedicated snapshot (empty=latest)
+            'raceline_ggv':      str(getattr(config, 'raceline_ggv', '')).strip(),
+            ## IY : end
         }
         ## IY : end
 

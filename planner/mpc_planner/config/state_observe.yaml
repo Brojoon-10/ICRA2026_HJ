@@ -1,0 +1,66 @@
+# ============================================================
+# ### HJ : state_observe.yaml
+# MPC planner — `~state:=observe` tuning preset.
+#
+# Purpose:
+#   Debug-only mode. Publishes to ~best_trajectory_observation only; never
+#   feeds state_machine. Use this preset as the baseline raceline-follow
+#   tuning, or override `config_file` at launch to run an OT preset in a
+#   safe, debug-only topic:
+#
+#     roslaunch mpc_planner mpc_planner_state.launch \
+#         state:=observe \
+#         config_file:=$(rospack find mpc_planner)/config/state_overtake.yaml
+#
+# Values below are the original mpcc_params.yaml tuning — raceline-follow
+# baseline, no obstacle injection.
+# ============================================================
+
+planner_freq: 30
+
+# Horizon
+N: 20
+dT: 0.05
+
+# Vehicle
+vehicle_L: 0.33
+
+# Limits
+max_speed: 12.0
+min_speed: 0.5
+max_steering: 0.6
+
+# Cost weights
+w_contour: 3.9
+w_lag: 2.0
+w_velocity: 3.0
+v_bias_max: 1.0
+
+# ### HJ : stage-wise contour/lag ramp. 1.0 = flat (legacy). <1.0 weakens
+# near-car raceline pull; makes sense for overtake (obstacle cost needs
+# lateral freedom) but NOT for observe — tested at 0.15/0.50 and it
+# worsened near-car wriggle because near stages lost their anchor and
+# smoothness-only shape wandered with the sliding reference. Kept at 1.0
+# here intentionally. See state_overtake.yaml for the other direction.
+contour_ramp_start: 1.0
+lag_ramp_start: 1.0
+
+# Smoothness
+w_dv: 9.5
+w_dsteering: 14.0
+
+# Boundary
+boundary_inflation: 0.1
+w_slack: 1000.0
+
+# IPOPT
+ipopt_max_iter: 500
+ipopt_print_level: 0
+
+# Obstacle cost (Phase 3.5 Stage-1; ignored until solver honors it)
+collision_mode: none
+w_obstacle: 0.0
+obstacle_sigma: 0.35
+n_obs_max: 2
+w_wall: 0.0
+wall_safe: 0.15

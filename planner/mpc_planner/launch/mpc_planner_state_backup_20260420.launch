@@ -1,0 +1,92 @@
+<?xml version="1.0"?>
+<!--
+  ### HJ : State-aware MPC planner (single-instance template).
+
+  One instance = one (state, output_topic) pair.
+    state:=overtake  → publishes OTWpntArray on <output_topic or ~out/otwpnts>
+    state:=recovery  → publishes   WpntArray on <output_topic or ~out/wpnts>
+    state:=observe   → no role output, debug-only (Path + WpntArray mirror)
+
+  Observation-first (Phase 1~6):
+    attach_to_statemachine:=false (default)
+      → role outputs remap to the *_observation topics, state_machine keeps
+        consuming the legacy spliner/recovery_spliner. MPC is listen-only.
+    attach_to_statemachine:=true (Phase X gate — after metrics pass)
+      → role outputs remap to the real /planner/avoidance/otwpnts or
+        /planner/recovery/wpnts, and 3d_headtohead.launch is adjusted to stop
+        launching the legacy spliner counterparts.
+
+  Solver params come from config/mpcc_params.yaml (Phase 1 placeholder). Phase
+  3 will branch config per state (state_{observe,overtake,recovery}.yaml).
+-->
+<launch>
+  <arg name="state"                 default="observe"
+       doc="overtake | recovery | observe"/>
+  <!-- ### HJ : Default includes an `mpc_` prefix so standalone launch does
+       NOT collide with other backends (sampling_planner_state.launch uses
+       /overtake as well — same default would kick each other off the master
+       with "new node registered with same name"). multi.launch overrides
+       instance_name explicitly inside <group ns="mpc_planner"> so node
+       names there still become /mpc_planner/overtake etc. -->
+  <arg name="instance_name"         default="mpc_$(arg state)"/>
+  <arg name="config_file"           default="$(find mpc_planner)/config/state_$(arg state).yaml"
+       doc="Default resolves to state_{overtake,recovery,observe}.yaml. Override with an absolute path to run, e.g., the overtake preset in observe-mode for safe tuning:
+            config_file:=$(find mpc_planner)/config/state_overtake.yaml state:=observe"/>
+  <arg name="attach_to_statemachine" default="false"
+       doc="Phase X gate. false (default) → role output remapped to *_observation; true → real topic."/>
+  <arg name="output_topic"          default=""
+       doc="When non-empty, overrides the role-specific topic remap entirely."/>
+
+  <!-- ### HJ : debug_log — per-tick CSV + on-anomaly NPZ. Leave enable=false
+       for normal runs; flip true when diagnosing trajectory quality issues.
+       Output lands in $(find mpc_planner)/debug_log/runs/<timestamp>_.../
+       (gitignored). -->
+  <!-- ### HJ : solver backend. `frenet_d` (default) perturbs n(s) on a fixed
+       s-grid with a hard corridor box → trajectory never leaves d_left/d_right
+       by construction. `xy` keeps the original kinematic bicycle MPCC (for
+       A/B comparison or rollback). -->
+  <arg name="solver_backend"              default="frenet_d"
+       doc="frenet_d | xy"/>
+
+  <arg name="debug_log_enable"            default="false"/>
+  <arg name="debug_log_dir"               default="$(find mpc_planner)/debug_log/runs"/>
+  <arg name="debug_log_tier_b"            default="on_anomaly"
+       doc="never | every_n | on_anomaly | always"/>
+  <arg name="debug_log_every_n"           default="10"/>
+  <arg name="debug_log_anomaly_kappa_max" default="3.0"/>
+
+  <node pkg="mpc_planner"
+        type="mpc_planner_state_node.py"
+        name="$(arg instance_name)"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)"/>
+    <param name="state" value="$(arg state)"/>
+    <param name="solver_backend" value="$(arg solver_backend)"/>
+    <param name="debug_log_enable"            value="$(arg debug_log_enable)"/>
+    <param name="debug_log_dir"               value="$(arg debug_log_dir)"/>
+    <param name="debug_log_tier_b"            value="$(arg debug_log_tier_b)"/>
+    <param name="debug_log_every_n"           value="$(arg debug_log_every_n)"/>
+    <param name="debug_log_anomaly_kappa_max" value="$(arg debug_log_anomaly_kappa_max)"/>
+
+    <!-- Role-specific topic remap.
+         Priority: explicit output_topic > attach_to_statemachine flag > *_observation default. -->
+
+    <!-- Explicit override (highest priority) -->
+    <remap from="~out/otwpnts" to="$(arg output_topic)"
+           if="$(eval arg('output_topic') != '' and arg('state') == 'overtake')"/>
+    <remap from="~out/wpnts"   to="$(arg output_topic)"
+           if="$(eval arg('output_topic') != '' and arg('state') == 'recovery')"/>
+
+    <!-- attach_to_statemachine:=true → real state_machine topic -->
+    <remap from="~out/otwpnts" to="/planner/avoidance/otwpnts"
+           if="$(eval arg('output_topic') == '' and arg('state') == 'overtake' and arg('attach_to_statemachine'))"/>
+    <remap from="~out/wpnts"   to="/planner/recovery/wpnts"
+           if="$(eval arg('output_topic') == '' and arg('state') == 'recovery' and arg('attach_to_statemachine'))"/>
+
+    <!-- Default (attach_to_statemachine:=false) → _observation suffix -->
+    <remap from="~out/otwpnts" to="/planner/avoidance/otwpnts_observation"
+           if="$(eval arg('output_topic') == '' and arg('state') == 'overtake' and not arg('attach_to_statemachine'))"/>
+    <remap from="~out/wpnts"   to="/planner/recovery/wpnts_observation"
+           if="$(eval arg('output_topic') == '' and arg('state') == 'recovery' and not arg('attach_to_statemachine'))"/>
+  </node>
+</launch>

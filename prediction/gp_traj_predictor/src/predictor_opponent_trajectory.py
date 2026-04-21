@@ -124,6 +124,7 @@ class GaussianProcessOppTraj(object):
             new_oppwpnts = OppWpnt()
             new_oppwpnts.x_m = oppwpnts_list[i].x_m
             new_oppwpnts.y_m = oppwpnts_list[i].y_m
+            new_oppwpnts.z_m = oppwpnts_list[i].z_m  ### HJ : carry z into doublelap copy
             new_oppwpnts.s_m = oppwpnts_list[i].s_m+self.track_length
             new_oppwpnts.d_m = oppwpnts_list[i].d_m
             new_oppwpnts.proj_vs_mps = oppwpnts_list[i].proj_vs_mps
@@ -195,7 +196,10 @@ class GaussianProcessOppTraj(object):
     
         
         resampled_wpnts_xy = self.converter.get_cartesian(ego_s , resampled_opponent_d.tolist())
-        
+        ### HJ : z_m도 같은 3D converter의 spline_z(s)로 계산해 x,y,z 동일 소스 유지.
+        resampled_wpnts_z = np.asarray(self.converter.spline_z(np.asarray(ego_s))).flatten()
+        ### HJ : end
+
         # replace all the entries where i have a corresponding ego_s with the predicted values
         i=0
 
@@ -204,6 +208,7 @@ class GaussianProcessOppTraj(object):
                     if abs(ego_s[j]-oppwpnts_list[i].s_m) < 1e-8:
                         oppwpnts_list[i].x_m = resampled_wpnts_xy[0][j]
                         oppwpnts_list[i].y_m = resampled_wpnts_xy[1][j]
+                        oppwpnts_list[i].z_m = float(resampled_wpnts_z[j])  ### HJ
                         oppwpnts_list[i].d_m = resampled_opponent_d[j]
                         #oppwpnts_list[i].proj_vs_mps = resampled_opponent_vs[j] 
                         oppwpnts_list[i].vd_mps = resampled_opponent_vd[j]
@@ -246,7 +251,10 @@ class GaussianProcessOppTraj(object):
             marker = Marker(header=rospy.Header(frame_id="map"), id = i, type = Marker.CYLINDER)
             marker.pose.position.x = oppwpnts_list[i].x_m
             marker.pose.position.y = oppwpnts_list[i].y_m
-            marker.pose.position.z = marker_height/2
+            ### HJ : use OppWpnt.z_m (set from spline_z(s)) so markers sit on the 3D
+            # track surface. 기존에는 z=marker_height/2로 z=0 평면에 찍혀 교차 구간 꼬임.
+            marker.pose.position.z = oppwpnts_list[i].z_m + marker_height/2
+            ### HJ : end
             marker.pose.orientation.w = 1.0
             marker.scale.x = min(max(5 * oppwpnts_list[i].d_var, 0.07),0.7)
             marker.scale.y = min(max(5 * oppwpnts_list[i].d_var, 0.07),0.7)

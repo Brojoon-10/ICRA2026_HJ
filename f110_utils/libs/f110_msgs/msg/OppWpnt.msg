@@ -7,6 +7,8 @@ float64 d_m
 # map coordinates
 float64 x_m
 float64 y_m
+### HJ : add z_m for 3D track-surface elevation. Set by publishers from spline_z(s_m).
+float64 z_m
 
 # track information
 float64 proj_vs_mps

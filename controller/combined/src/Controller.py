@@ -174,10 +174,14 @@ class Controller:
         self.accel_limiter_enabled = rospy.get_param('L1_controller/accel_limiter_enabled', True)
         self.accel_lim_ax_max = rospy.get_param('L1_controller/accel_lim_ax_max', 5.0)
         self.accel_lim_ay_max = rospy.get_param('L1_controller/accel_lim_ay_max', 4.5)
+        self.accel_lim_horizon = rospy.get_param('L1_controller/accel_lim_horizon', 0.3)
+        self.accel_lim_lookahead = rospy.get_param('L1_controller/accel_lim_lookahead', 0.3)
         ### HJ : end
 
         ### HJ : yaw rate feedback (oversteer/understeer compensation)
         self.K_yr = rospy.get_param('L1_controller/K_yr', 0.0)
+        self.K_yr_sat = rospy.get_param('L1_controller/K_yr_sat', 0.05)  ### HJ : corr clip [rad]
+        self.K_us = rospy.get_param('L1_controller/K_us', 0.0)  ### HJ : understeer gradient [s^2/m] (0=kinematic)
         ### HJ : end
 
         ### HJ : GP steering correction
@@ -414,11 +418,23 @@ class Controller:
  
         steering_angle = self.steer_scaling_for_lat_err(steering_angle, self.future_lat_err)
 
-        ### HJ : yaw rate feedback — compensate oversteer/understeer
-        if self.K_yr > 0 and abs(self.speed_now) > 0.5:
-            expected_yr = self.speed_now * np.tan(steering_angle) / self.wheelbase
+        ### HJ : yaw rate feedback — compute always (for observation),
+        ### apply only if K_yr > 0. Lets K_us be tuned safely with K_yr=0.
+        if abs(self.speed_now) > 0.5:
+            v = self.speed_now
+            # Dynamic bicycle (K_us=0 → kinematic): yr = v·tan(δ) / (L + K_us·v²)
+            wb_eff = self.wheelbase + self.K_us * v * v
+            expected_yr = v * np.tan(steering_angle) / wb_eff
             yr_error = expected_yr - self.yaw_rate  # >0: understeer, <0: oversteer
-            steering_angle += self.K_yr * yr_error
+            corr_raw = self.K_yr * yr_error
+            corr = np.clip(corr_raw, -self.K_yr_sat, self.K_yr_sat)
+            if self.K_yr > 0:
+                steering_angle += corr
+            applied = "ON " if self.K_yr > 0 else "obs"
+            rospy.loginfo_throttle(0.3,
+                f"[YawFB {applied}] v={v:.2f} δ={steering_angle - (corr if self.K_yr > 0 else 0.0):+.4f} "
+                f"K_us={self.K_us:.3f} exp_yr={expected_yr:+.3f} act_yr={self.yaw_rate:+.3f} "
+                f"err={yr_error:+.3f} corr_raw={corr_raw:+.4f} corr={corr:+.4f}")
         ### HJ : end
 
         ### HJ : GP steering correction
@@ -572,21 +588,42 @@ class Controller:
 
         ### HJ : friction-ellipse based accel limiter
         # Only active when accelerating (speed_command > cur_speed).
-        # Uses MEASURED current speed (odom) to compute current lateral load,
-        # then limits the next-step target to what the remaining grip allows.
+        # Two caps applied together:
+        #   (1) v_max_lat   — pure cornering limit at lookahead waypoint
+        #                     (ay_max = v^2 * kappa)
+        #   (2) v_max_long  — reference headroom over current speed, sized by
+        #                     remaining longitudinal grip and a control horizon
+        #                     T_ref (accel_lim_horizon). Using T_ref instead of
+        #                     the loop dt leaves VESC's inner loop enough
+        #                     headroom to chase at full throttle.
         # Friction ellipse: (ay/ay_max)^2 + (ax/ax_max)^2 <= 1
         if self.accel_limiter_enabled and speed_command > cur_speed:
-            kappa = abs(self.curvature_waypoints)
-            ay = cur_speed ** 2 * kappa  # lateral accel at current speed
-            ay_ratio = min(ay / self.accel_lim_ay_max, 1.0)
+            kappa_now = abs(self.waypoint_array_in_map[self.idx_nearest_waypoint, 6])
+
+            # accel_lim_lookahead > 0: find waypoint at (position + v * T) for kappa_ref
+            # == 0: use nearest (kappa_ref == kappa_now, no preview)
+            if self.accel_lim_lookahead > 0:
+                la_lim = [self.position_in_map[0, 0] + v[0]*self.accel_lim_lookahead,
+                          self.position_in_map[0, 1] + v[1]*self.accel_lim_lookahead]
+                idx_lim = self.nearest_waypoint(la_lim, self.waypoint_array_in_map[:, :2])
+                idx_lim = np.clip(idx_lim + offset, 0, len(self.waypoint_array_in_map) - 1)
+            else:
+                idx_lim = self.idx_nearest_waypoint
+            kappa_ref = abs(self.waypoint_array_in_map[idx_lim, 6])
+
+            v_max_lat = np.sqrt(self.accel_lim_ay_max / max(kappa_ref, 1e-4))
+
+            ay_now = cur_speed ** 2 * kappa_now
+            ay_ratio = min(ay_now / self.accel_lim_ay_max, 1.0)
             ax_available = self.accel_lim_ax_max * np.sqrt(max(0.0, 1.0 - ay_ratio ** 2))
-            dt = 1.0 / self.loop_rate
-            v_max_next = cur_speed + ax_available * dt
+            v_max_long = cur_speed + ax_available * self.accel_lim_horizon
+
             speed_before = speed_command
-            speed_command = min(speed_command, v_max_next)
+            speed_command = min(speed_command, v_max_lat, v_max_long)
             rospy.loginfo_throttle(0.5,
                 f"[AccelLim] v={cur_speed:.2f} cmd={speed_before:.2f}->{speed_command:.2f} "
-                f"kappa={kappa:.3f} ay={ay:.2f} ax_av={ax_available:.2f}")
+                f"k_now={kappa_now:.3f} k_ref={kappa_ref:.3f} "
+                f"v_lat={v_max_lat:.2f} v_long={v_max_long:.2f} ax_av={ax_available:.2f}")
         ### HJ : end
 
         return speed_command
@@ -679,11 +716,16 @@ class Controller:
     def apply_lateral_correction(self, steering_angle, signed_d, yaw):
         """Apply lateral error correction based on selected mode."""
         if self.lat_correction_mode == 'stanley':
-            return self._stanley_correction(steering_angle, signed_d, yaw)
+            out = self._stanley_correction(steering_angle, signed_d, yaw)
         elif self.lat_correction_mode == 'predictive':
-            return self._predictive_correction(steering_angle, signed_d, yaw)
+            out = self._predictive_correction(steering_angle, signed_d, yaw)
         else:
-            return steering_angle  # 'none' — no correction
+            out = steering_angle  # 'none' — no correction
+        rospy.loginfo_throttle(0.5,
+            f"[LatCorr] mode={self.lat_correction_mode} "
+            f"d={signed_d:+.3f} v={self.speed_now:.2f} "
+            f"δ_in={steering_angle:+.4f} δ_out={out:+.4f} Δ={out-steering_angle:+.4f}")
+        return out
 
     def _stanley_correction(self, steering_angle, signed_d, yaw):
         """Stanley crosstrack correction at front axle (current position).
@@ -713,9 +755,10 @@ class Controller:
 
     def _predictive_correction(self, steering_angle, signed_d, yaw):
         """Model-predictive lateral correction using bicycle model.
-        1. Predict d_future with current steering (PP + heading corr applied)
-        2. Compute delta_optimal that makes d_future = 0
-        3. Blend: delta = delta + alpha * (delta_optimal - delta)
+        ### HJ : additive correction (NOT blend) — delta_correction represents
+        the extra steering needed to zero d in the frenet-relative frame
+        (raceline assumed straight within horizon T). Adding it to PP keeps
+        PP's curve-following intact; blending would steal from the curve term.
         """
         v = max(self.speed_now, 0.5)
         T = self.lat_pred_horizon
@@ -728,24 +771,17 @@ class Controller:
         heading_err = yaw - wpnt_psi
         heading_err = (heading_err + np.pi) % (2 * np.pi) - np.pi
 
-        # Predict d_future with current steering
-        delta_clipped = np.clip(steering_angle, -1.0, 1.0)
-        yaw_rate_pred = v * np.tan(delta_clipped) / L
-        heading_err_future = heading_err + yaw_rate_pred * T
-        d_future = signed_d + v * (np.sin(heading_err) + np.sin(heading_err_future)) / 2.0 * T
-
-        # Solve for delta_optimal: d_future = 0
-        # Linearized: d + v*sin(he)*T + 0.5*v^2*cos(he)*tan(delta)/L*T^2 = 0
+        # Linearized bicycle in frenet-relative frame (straight raceline within T):
+        # d_future = d + v*sin(he)*T + 0.5*v^2*cos(he)*tan(delta_corr)/L*T^2 = 0
         denom = 0.5 * v**2 * np.cos(heading_err) * T**2
         if abs(denom) < 1e-6:
             return steering_angle
 
-        tan_delta_opt = -(signed_d + v * np.sin(heading_err) * T) * L / denom
-        tan_delta_opt = np.clip(tan_delta_opt, -2.0, 2.0)
-        delta_optimal = np.arctan(tan_delta_opt)
+        tan_delta_corr = -(signed_d + v * np.sin(heading_err) * T) * L / denom
+        tan_delta_corr = np.clip(tan_delta_corr, -0.3, 0.3)   ### HJ : tighter clip for additive gain
+        delta_correction = np.arctan(tan_delta_corr)
 
-        # Blend PP result with model prediction
-        return steering_angle + alpha * (delta_optimal - steering_angle)
+        return steering_angle + alpha * delta_correction
 
     ### HJ : end lateral error correction ====================================
 

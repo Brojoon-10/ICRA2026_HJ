@@ -1,0 +1,51 @@
+# ### HJ : sampling_planner_state_node — RECOVERY preset.
+# Loaded by sampling_planner_state.launch (state:=recovery) and mirrored as the
+# live target of rqt_reconfigure save_params / reset_params.
+
+rate_hz: 30.0
+frame_id: map
+
+# Horizon & sampling grid — longer horizon, fewer velocity choices (just re-join the raceline).
+horizon:      2.0
+num_samples:  40
+n_samples:    11
+v_samples:    3
+
+# Safety / physics — tighter clearance, lower minimum speed, slightly softer kappa bound.
+safety_distance: 0.30
+gg_abs_margin:   0.0
+gg_margin_rel:   0.0
+friction_check_2d: false
+s_dot_min:       1.5
+kappa_thr:       1.2
+relative_generation: true
+
+# Recovery: re-join raceline is priority, speed is optional, continuity strongest.
+# ### HJ : Recovery state ignores the Phase-2 mode loop / hysteresis — single-mode
+# "recover toward raceline". side / progress / hysteresis fields are kept here for
+# YAML-symmetry with overtake but stay at neutral defaults.
+cost:
+  raceline_weight:   10.0
+  velocity_weight:   20.0
+  prediction_weight: 1000.0
+  continuity_weight: 100.0
+  boundary_weight:   10.0
+  safety_margin_m:   0.20
+  side_weight:       0.0       # disabled in recovery
+  progress_weight:   0.0       # disabled in recovery
+  opp_pred_ttl_s:    0.5
+
+hysteresis:
+  ttl_s:       0.0     # disabled in recovery
+  margin:      0.0
+  kappa_dot_max: 5.0
+
+filter_alpha: 0.5
+
+mppi:
+  enable:          true
+  temperature_rel: 0.30
+  temporal_weight: 200.0
+
+resample_enable: true
+resample_ds_m:   0.1

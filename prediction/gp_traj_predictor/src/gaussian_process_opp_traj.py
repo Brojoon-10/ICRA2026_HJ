@@ -237,15 +237,22 @@ class GaussianProcessOppTraj(object):
             opp_s_copy.append(opp_s_copy[1])
             opp_d_copy.append(opp_d_copy[1])
 
-            #convert to cartesian
-            noisy_xy_points=self.converter.get_cartesian(opp_s_copy, opp_d_copy)
-            noisy_xy_points = noisy_xy_points.transpose()
-            #smooth the trajectory with CCMA
+            ### HJ : 3D CCMA round-trip — 2D get_cartesian/get_frenet은 오버패스 교차
+            # 구간에서 xy가 겹치는 두 s를 구분 못 해 s 순서가 엉키고 d_pred_CCMA가 튐.
+            # z를 포함한 xyz 공간에서 필터링 + get_frenet_3d(height filter+3D nearest)로
+            # 층을 구분하도록 변경.
+            noisy_xyz_points = self.converter.get_cartesian_3d(opp_s_copy, opp_d_copy)
+            noisy_xyz_points = noisy_xyz_points.transpose()  # (N, 3)
+            #smooth the trajectory with CCMA (supports nx3)
             ccma = CCMA(w_ma=5, w_cc=3)
-            smoothed_xy_points = ccma.filter(noisy_xy_points)
+            smoothed_xyz_points = ccma.filter(noisy_xyz_points)
 
-            #convert back to frenet
-            smoothed_sd_points = self.converter.get_frenet(smoothed_xy_points[:, 0], smoothed_xy_points[:, 1])
+            #convert back to frenet using 3D nearest search
+            smoothed_sd_points = self.converter.get_frenet_3d(
+                smoothed_xyz_points[:, 0],
+                smoothed_xyz_points[:, 1],
+                smoothed_xyz_points[:, 2])
+            ### HJ : end
             #sort the points based on s
             smoothed_s_points = smoothed_sd_points[0]
             smoothed_d_points = smoothed_sd_points[1]
@@ -373,7 +380,16 @@ class GaussianProcessOppTraj(object):
 
         
         resampled_wpnts_xy = self.converter.get_cartesian(ego_s , resampled_opponent_d.tolist())
-        
+        ### HJ : z_m은 get_cartesian이 제공하지 않아 같은 converter의 spline_z(s)로 별도 계산.
+        # CubicSpline은 기본 extrapolate=True라 ego_s가 [0, track_length) 범위를 벗어나면
+        # (whole_lap=False이고 arond_origin=False인 케이스) 엉뚱한 z를 돌려줌.
+        # 여기서 % track_length로 wrap해 항상 주기적 구간 안의 z를 사용하도록 함.
+        # (x,y는 d*perp 방향으로만 shift라 wrap 여부와 무관하지만, z는 spline_z(s)만으로
+        # 결정되어 extrapolate 민감도가 높음)
+        ego_s_wrapped = np.asarray(ego_s) % self.track_length
+        resampled_wpnts_z = np.asarray(self.converter.spline_z(ego_s_wrapped)).flatten()
+        ### HJ : end
+
         # replace all the entries where there is a corresponding ego_s with the interpolated values
         i=0
 
@@ -382,6 +398,7 @@ class GaussianProcessOppTraj(object):
                     if abs(ego_s[j]-oppwpnts_list[i].s_m) < 1e-8:
                         oppwpnts_list[i].x_m = resampled_wpnts_xy[0][j]
                         oppwpnts_list[i].y_m = resampled_wpnts_xy[1][j]
+                        oppwpnts_list[i].z_m = float(resampled_wpnts_z[j])  ### HJ
                         oppwpnts_list[i].d_m = resampled_opponent_d[j]
                         oppwpnts_list[i].proj_vs_mps = resampled_opponent_vs[j]
                         oppwpnts_list[i].vd_mps = resampled_opponent_vd[j]
@@ -407,6 +424,9 @@ class GaussianProcessOppTraj(object):
         # OppWpnt.is_observed flag, which get_opponnent_wpnts() flips to
         # True once GP posterior values land in a segment.
         resampled_wpnts_xy_original = self.converter.get_cartesian(ego_s_original , np.zeros(len(ego_s_original)).tolist())
+        ### HJ : 3D track-surface z for sentinel wpnts (d=0 이므로 spline_z가 곧 트랙 표면 z).
+        resampled_wpnts_z_original = np.asarray(self.converter.spline_z(np.asarray(ego_s_original))).flatten()
+        ### HJ : end
         oppwpnts_list = []
         i=0
 
@@ -414,6 +434,7 @@ class GaussianProcessOppTraj(object):
             oppwpnts = OppWpnt()
             oppwpnts.x_m = resampled_wpnts_xy_original[0][i]
             oppwpnts.y_m = resampled_wpnts_xy_original[1][i]
+            oppwpnts.z_m = float(resampled_wpnts_z_original[i])  ### HJ
             oppwpnts.s_m = ego_s_original[i]
             oppwpnts.d_m = 0
             oppwpnts.proj_vs_mps = self.global_wpnts.wpnts[i].vx_mps * 0.9
@@ -455,7 +476,10 @@ class GaussianProcessOppTraj(object):
             marker = Marker(header=rospy.Header(frame_id="map"), id = i, type = Marker.CYLINDER)
             marker.pose.position.x = oppwpnts_list[i].x_m
             marker.pose.position.y = oppwpnts_list[i].y_m
-            marker.pose.position.z = marker_height/2
+            ### HJ : use OppWpnt.z_m (set from spline_z(s)) so markers sit on the 3D
+            # track surface. 기존에는 z=marker_height/2로 z=0 평면에 찍혀 교차 구간 꼬임.
+            marker.pose.position.z = oppwpnts_list[i].z_m + marker_height/2
+            ### HJ : end
             marker.pose.orientation.w = 1.0
             marker.scale.x = min(max(5 * oppwpnts_list[i].d_var, 0.07),0.7)
             marker.scale.y = min(max(5 * oppwpnts_list[i].d_var, 0.07),0.7)

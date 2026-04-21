@@ -1,0 +1,43 @@
+# Rolling-horizon overtake planner params
+# See IY_docs/rolling_horizon_overtake_planner.md §6.3
+
+rate_hz: 60.0        # matches sqp_avoidance_node 20Hz
+racecar_version: SRX2
+
+# Shape / RoC (mirrors sqp_avoidance_node defaults)
+lookahead: 15.0
+width_car: 0.30
+evasion_dist: 0.25
+spline_bound_mindist: 0.25
+avoidance_resolution: 20
+back_to_raceline_before: 5.0
+back_to_raceline_after: 5.0
+obs_traj_tresh: 1.5
+
+## IY : raceline tail append for local_wpnts continuity.
+tail_len_m: 8.0
+tail_smooth_m: 1.5
+
+warm_start:
+  shift_lookahead_s: 0.10    # dt_solve used in §3.2 step 0 ego prediction
+
+regularization:
+  lambda_reg: 0.05           # very low: warm-start should guide, not lock-in wiggles
+  homotopy_lock: true        # keep the same overtake side once chosen
+
+weights:
+  lambda_smooth: 7000.0      # 2nd-diff smoothness — higher = less wavy but harder to solve
+  lambda_start_heading: 500.0  # d[1]==d[0] penalty — lower helps solver converge
+  lambda_apex_bias: 0.0      # ||d||^2 toward centerline — keep low/0 for clean detour
+  lambda_side: 50.0          # reduced: side penalty no longer fights raceline return
+  lambda_jerk: 50.0        # 3rd-diff penalty; kills micro-wiggles inside a bump
+
+abort:
+  performance_margin_s: 1.00 # T_margin (debug: relaxed from 0.10 to let paths draw)
+  consecutive_cycles: 3      # streak before trip
+  cooldown_s: 2.0            # re-entry lockout
+  safety_sigma_multiplier: 3.0
+
+fallback:
+  hold_last_valid: true     # true = keep last valid path on SQP failure (no empty publish)
+  max_fail_hold_cycles: 5    # after N consecutive failures, give up and publish empty

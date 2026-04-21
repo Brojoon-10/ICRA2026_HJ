@@ -126,7 +126,9 @@ class OppTrajPredictor:
         return SetBoolResponse(success, message)
 
     def global_to_opptraj(self, wptlist: list):
-        wpnts_opponent = [OppWpnt(s_m=wp.s_m, d_m=wp.d_m, x_m=wp.x_m, y_m=wp.y_m, proj_vs_mps=wp.vx_mps) for wp in wptlist]
+        ### HJ : global Wpnt에는 z_m이 있으므로 그대로 전파해 OppWpnt.z_m 일관성 유지.
+        wpnts_opponent = [OppWpnt(s_m=wp.s_m, d_m=wp.d_m, x_m=wp.x_m, y_m=wp.y_m, z_m=wp.z_m, proj_vs_mps=wp.vx_mps) for wp in wptlist]
+        ### HJ : end
         opp_traj_gp_msg = self.make_opponent_trajectory_msg(wpnts_opponent)
         opp_traj_marker_array = self.visualize_opponent_wpnts(wpnts_opponent)
         self.opp_traj_gp_pub.publish(opp_traj_gp_msg)
@@ -146,13 +148,9 @@ class OppTrajPredictor:
         max_vel = max((wp.vx_mps for wp in self.wpnts_updated), default=10.0)
         if max_vel <= 1e-3:
             max_vel = 10.0
-        # OppWpnt has no z_m field; pull track-surface z from spline_z(s) so
-        # cylinders sit on the actual 3D surface instead of z=0.
-        s_arr = np.array([wp.s_m for wp in oppwpnts_list])
-        try:
-            z_surface_arr = np.asarray(self.converter.spline_z(s_arr)).flatten()
-        except Exception:
-            z_surface_arr = np.zeros(len(s_arr))
+        ### HJ : OppWpnt에 z_m이 추가되어 publisher가 spline_z(s)로 이미 올바른 레이어 z를
+        # 채워두므로 viz는 wp.x_m/y_m/z_m을 그대로 사용. frenet2glob service 호출 불필요.
+        ### HJ : end
         for i in range(len(oppwpnts_list)):
             # Orange marks unobserved regions (proj_vs_mps is the
             # raceline-vx * 0.9 fallback, not a GP posterior).
@@ -161,7 +159,7 @@ class OppTrajPredictor:
             marker = Marker(header=rospy.Header(frame_id="map"), id=i, type=Marker.CYLINDER)
             marker.pose.position.x = oppwpnts_list[i].x_m
             marker.pose.position.y = oppwpnts_list[i].y_m
-            marker.pose.position.z = float(z_surface_arr[i]) + marker_height / 2
+            marker.pose.position.z = oppwpnts_list[i].z_m + marker_height / 2
             marker.pose.orientation.w = 1.0
             marker.scale.x = min(max(5 * oppwpnts_list[i].d_var, 0.07), 0.7)
             marker.scale.y = min(max(5 * oppwpnts_list[i].d_var, 0.07), 0.7)

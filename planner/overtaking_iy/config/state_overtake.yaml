@@ -1,0 +1,47 @@
+# ## IY : rolling-horizon overtake config (MPC state:=overtake style).
+
+rate_hz: 60.0
+racecar_version: SRX2
+
+# ## IY : fixed time-based horizon, no forced raceline return at tail.
+rolling_mode: true
+T_horizon: 2.0            # seconds, short online horizon (next tick extends)
+s_min_horizon: 9.0        # meters, floor at v=0
+## IY : raceline tail for local_wpnts continuity.
+tail_len_m: 0.0           # meters appended beyond overtake horizon
+tail_smooth_m: 0.0        # meters over which d blends from overtake to 0
+
+lookahead: 15.0
+width_car: 0.30
+evasion_dist: 0.30
+spline_bound_mindist: 0.30
+avoidance_resolution: 20
+# unused when rolling_mode=true, kept for unconditional param loads
+back_to_raceline_before: 5.0
+back_to_raceline_after: 5.0
+obs_traj_tresh: 1.5
+
+warm_start:
+  shift_lookahead_s: 0.10
+
+regularization:
+  lambda_reg: 0.5           # ## IY : gentle anchor to prev solution for tick continuity
+  homotopy_lock: true
+
+weights:
+  lambda_smooth: 12000.0    # ## IY : stronger smoothness (no raceline anchor)
+  lambda_start_heading: 500.0
+  lambda_apex_bias: 0.0     # ## IY : off — user does not want raceline convergence
+  lambda_side: 10.0         # ## IY : reduced, no long return to bias
+  lambda_jerk: 500.0        # ## IY : stronger jerk penalty to suppress wiggles
+  lambda_term: 0.0          # ## IY : off — tail free, no forced raceline pull
+
+abort:
+  performance_margin_s: 1.00
+  consecutive_cycles: 3
+  cooldown_s: 2.0
+  safety_sigma_multiplier: 3.0
+
+fallback:
+  hold_last_valid: true
+  max_fail_hold_cycles: 5

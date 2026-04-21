@@ -53,6 +53,7 @@ find_package(catkin REQUIRED COMPONENTS
     Prediction.msg
     PredictionArray.msg
     OpponentTrajectory.msg
+    OpponentTrajectories.msg
     OppWpnt.msg
     ProjOppPoint.msg
     ProjOppTraj.msg
