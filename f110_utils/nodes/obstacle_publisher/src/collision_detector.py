@@ -9,7 +9,11 @@ from tf.transformations import quaternion_from_euler
 
 class OdCollisionDetector:
     def __init__(self):
-        rospy.Subscriber("/tracking/obstacles", ObstacleArray, self.od_cb)
+        ### HJ (20260422) : collision judgment must use ground truth, not the
+        # noisy/gated tracker-facing topic. 3d_obstacle_publisher exposes
+        # /tracking/obstacles_truth (always-on, clean) for exactly this.
+        rospy.Subscriber("/tracking/obstacles_truth", ObstacleArray, self.od_cb)
+        ### HJ : end
         rospy.Subscriber("/car_state/odom_frenet", Odometry, self.odom_cb)
         rospy.Subscriber('/global_waypoints', WpntArray, self.glb_wpnts_cb)
         self.col_pub = rospy.Publisher("/opponent_collision", Bool, queue_size=10)

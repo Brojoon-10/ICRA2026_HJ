@@ -5,10 +5,22 @@
 ###      - Frenet2GlobArr now returns z; fill Obstacle.z_m and OppWpnt height
 ###      - Marker visualization uses obstacle.z_m so it sits on the track surface
 ###      - Node name / topics unchanged so it can drop-in replace the 2D node
+###
+### HJ (20260422) : mimic real tracker output
+###   (1) Detect gate: only publish when obstacle is within [s_back, s_fwd] of ego
+###       and |dd| < d_max (Frenet, with s-wrap).
+###   (2) Coast: once lost, keep publishing last posterior for `coast_duration` s
+###       (freeze mode), matching ttl_dynamic=40 / rate_tracking=40Hz = 1.0s.
+###   (3) Cartesian xyz noise injection → re-derive (s,d) via glob2frenet so
+###       msg fields stay consistent.
+###   (4) Linear KF on state x=[s, d, vs, vd] with const-velocity model;
+###       posterior is what we publish, so downstream sees a smoothed tracker-
+###       like output rather than raw noisy measurements.
 ### HJ : end
 
 import rospy
 import numpy as np
+import copy
 from geometry_msgs.msg import PointStamped, PoseStamped
 from f110_msgs.msg import ObstacleArray, Obstacle, WpntArray, Wpnt, OpponentTrajectory, OppWpnt
 from visualization_msgs.msg import Marker, MarkerArray
@@ -70,8 +82,39 @@ class ObstaclePublisher3D:
         self._osc_phase = self.osc_phase0
         ### HJ : end
 
+        ### HJ (20260422) : detect gate / coast / noise / KF parameters
+        # Detect gate (ego-relative, Frenet, with s-wrap)
+        self.detect_s_back = rospy.get_param("/obstacle_publisher/detect_s_back", -5.0)
+        self.detect_s_fwd  = rospy.get_param("/obstacle_publisher/detect_s_fwd",  10.0)
+        self.detect_d_max  = rospy.get_param("/obstacle_publisher/detect_d_max",  10.0)
+        # Coast (matches ttl_dynamic=40 / rate_tracking=40Hz = 1.0s by default)
+        self.coast_duration = rospy.get_param("/obstacle_publisher/coast_duration", 1.0)
+        # Measurement noise (cartesian xyz); re-derived s,d via glob2frenet
+        self.noise_enable   = rospy.get_param("/obstacle_publisher/noise_enable", True)
+        self.noise_sigma_xy = rospy.get_param("/obstacle_publisher/noise_sigma_xy", 0.05)
+        self.noise_sigma_z  = rospy.get_param("/obstacle_publisher/noise_sigma_z",  0.02)
+        # Linear KF on [s, d, vs, vd] (const-velocity); Q/R diag
+        self.kf_enable      = rospy.get_param("/obstacle_publisher/kf_enable", True)
+        self.kf_q_s   = rospy.get_param("/obstacle_publisher/kf_q_s",   1e-4)
+        self.kf_q_d   = rospy.get_param("/obstacle_publisher/kf_q_d",   1e-4)
+        self.kf_q_vs  = rospy.get_param("/obstacle_publisher/kf_q_vs",  0.5)
+        self.kf_q_vd  = rospy.get_param("/obstacle_publisher/kf_q_vd",  0.5)
+        # Measurement noise in (s,d); default to rough xy sigma (curvature-dependent)
+        self.kf_r_s   = rospy.get_param("/obstacle_publisher/kf_r_s",   (self.noise_sigma_xy) ** 2)
+        self.kf_r_d   = rospy.get_param("/obstacle_publisher/kf_r_d",   (self.noise_sigma_xy) ** 2)
+
+        # KF state (lazy init on first visible tick)
+        self._kf_x = None            # np.array shape (4,)
+        self._kf_P = None            # np.array shape (4,4)
+        self._last_seen_t = None     # rospy.Time when obstacle last passed detect gate
+        self._last_posterior = None  # last Obstacle msg content for coast freeze
+        self._rng = np.random.default_rng()
+        ### HJ : end
+
         rospy.Subscriber("/car_state/odom_frenet", Odometry, self.odom_cb)
         self.car_odom = Odometry()
+        self._ego_s = 0.0
+        self._ego_d = 0.0
 
         ### HJ : RViz "2D Nav Goal" → respawn obstacle at nearest s on opponent line
         # 이 스택의 RViz config는 Nav Goal을 "/goal" 로 publish (obstacle_spawner와 공유).
@@ -81,6 +124,10 @@ class ObstaclePublisher3D:
         ### HJ : end
 
         self.obstacle_pub = rospy.Publisher("/tracking/obstacles", ObstacleArray, queue_size=10)
+        ### HJ (20260422) : always-on clean ground-truth channel for collision_detector
+        # `/tracking/obstacles` is gated/noisy (planner-facing). Collision must use truth.
+        self.obstacle_truth_pub = rospy.Publisher("/tracking/obstacles_truth", ObstacleArray, queue_size=10)
+        ### HJ : end
         self.obstacle_mrk_pub = rospy.Publisher("/dummy_obstacle_markers", MarkerArray, queue_size=10)
         self.opponent_traj_pub = rospy.Publisher("/opponent_waypoints", OpponentTrajectory, queue_size=10)
 
@@ -113,6 +160,11 @@ class ObstaclePublisher3D:
 
     def odom_cb(self, data: Odometry):
         self.car_odom = data
+        ### HJ (20260422) : cache ego s/d for detect gate
+        # Convention in this stack: odom_frenet.pose.pose.position.x = s, .y = d
+        self._ego_s = data.pose.pose.position.x
+        self._ego_d = data.pose.pose.position.y
+        ### HJ : end
 
     ### HJ : nav-goal respawn callback
     def nav_goal_cb(self, data: PoseStamped):
@@ -155,6 +207,52 @@ class ObstaclePublisher3D:
     def shutdown(self):
         rospy.loginfo("BEEP BOOP DUMMY OD SHUTDOWN")
         self.obstacle_pub.publish(ObstacleArray())
+        self.obstacle_truth_pub.publish(ObstacleArray())
+
+    ### HJ (20260422) : helpers for detect gate / KF
+    def _wrap_to_half(self, ds, L):
+        """Wrap ds into [-L/2, +L/2] for closed-loop track."""
+        return (ds + L / 2.0) % L - L / 2.0
+
+    def _in_detect_gate(self, s_obs, d_obs, s_ego, d_ego, L):
+        ds = self._wrap_to_half(s_obs - s_ego, L)
+        if not (self.detect_s_back <= ds <= self.detect_s_fwd):
+            return False
+        if abs(d_obs - d_ego) > self.detect_d_max:
+            return False
+        return True
+
+    def _kf_reset(self, s0, d0, vs0, vd0):
+        self._kf_x = np.array([s0, d0, vs0, vd0], dtype=float)
+        # init covariance: trust position somewhat, velocity less
+        self._kf_P = np.diag([0.01, 0.01, 1.0, 1.0])
+
+    def _kf_predict(self, dt):
+        F = np.array([[1, 0, dt, 0],
+                      [0, 1, 0, dt],
+                      [0, 0, 1,  0],
+                      [0, 0, 0,  1]], dtype=float)
+        Q = np.diag([self.kf_q_s, self.kf_q_d, self.kf_q_vs, self.kf_q_vd])
+        self._kf_x = F @ self._kf_x
+        self._kf_P = F @ self._kf_P @ F.T + Q
+
+    def _kf_update(self, s_meas, d_meas, L):
+        H = np.array([[1, 0, 0, 0],
+                      [0, 1, 0, 0]], dtype=float)
+        R = np.diag([self.kf_r_s, self.kf_r_d])
+        # innovation in s uses wrap to avoid jumps across s=0/L boundary
+        s_pred = self._kf_x[0]
+        y_s = self._wrap_to_half(s_meas - s_pred, L)
+        y_d = d_meas - self._kf_x[1]
+        y = np.array([y_s, y_d])
+        S = H @ self._kf_P @ H.T + R
+        K = self._kf_P @ H.T @ np.linalg.inv(S)
+        self._kf_x = self._kf_x + K @ y
+        # keep s within [0, L)
+        self._kf_x[0] = self._kf_x[0] % L
+        I4 = np.eye(4)
+        self._kf_P = (I4 - K @ H) @ self._kf_P
+    ### HJ : end
 
     ### MAIN ###
     def ros_loop(self):
@@ -251,6 +349,9 @@ class ObstaclePublisher3D:
             self.dynamic_obstacle.d_left = self.dynamic_obstacle.d_center + size/2
 
             self.dynamic_obstacle.vs = self.dyn_obstacle_speed
+            self.dynamic_obstacle.vd = 0.0
+            self.dynamic_obstacle.is_static = False
+            self.dynamic_obstacle.is_visible = True
             resp = self.frenet2glob([self.dynamic_obstacle.s_center], [self.dynamic_obstacle.d_center])
             self.dynamic_obstacle.x_m = resp.x[0]
             self.dynamic_obstacle.y_m = resp.y[0]
@@ -258,10 +359,91 @@ class ObstaclePublisher3D:
             self.dynamic_obstacle.z_m = resp.z[0] if hasattr(resp, 'z') and len(resp.z) > 0 else 0.0
             ### HJ : end
 
-            obstacle_msg.obstacles.append(self.dynamic_obstacle)
-            self.publish_obstacle_cartesian(obstacle_msg.obstacles)
+            ### HJ (20260422) : build TRUTH msg (always-on, clean) for collision_detector
+            truth_msg = ObstacleArray()
+            truth_msg.header.stamp = obstacle_msg.header.stamp
+            truth_msg.header.frame_id = obstacle_msg.header.frame_id
+            truth_obs = copy.deepcopy(self.dynamic_obstacle)
+            truth_msg.obstacles.append(truth_obs)
+            self.obstacle_truth_pub.publish(truth_msg)
+            # marker uses truth so RViz always shows ground-truth position
+            self.publish_obstacle_cartesian(truth_msg.obstacles)
+            ### HJ : end
 
-            self.obstacle_pub.publish(obstacle_msg)
+            ### HJ (20260422) : build NOISY+gated+KF msg for /tracking/obstacles
+            s_true = self.dynamic_obstacle.s_center
+            d_true = self.dynamic_obstacle.d_center
+            x_true = self.dynamic_obstacle.x_m
+            y_true = self.dynamic_obstacle.y_m
+            z_true = self.dynamic_obstacle.z_m
+
+            visible = self._in_detect_gate(s_true, d_true, self._ego_s, self._ego_d, max_s)
+
+            if visible:
+                # Measurement: cartesian xyz noise → glob2frenet to keep (s,d) consistent
+                if self.noise_enable:
+                    xn = x_true + self._rng.normal(0.0, self.noise_sigma_xy)
+                    yn = y_true + self._rng.normal(0.0, self.noise_sigma_xy)
+                    zn = z_true + self._rng.normal(0.0, self.noise_sigma_z)
+                    meas = self.glob2frenet([xn], [yn], [zn])
+                    s_meas = float(meas.s[0])
+                    d_meas = float(meas.d[0])
+                else:
+                    xn, yn, zn = x_true, y_true, z_true
+                    s_meas, d_meas = s_true, d_true
+
+                if self.kf_enable:
+                    if self._kf_x is None:
+                        self._kf_reset(s_meas, d_meas, self.dyn_obstacle_speed, 0.0)
+                    else:
+                        self._kf_predict(self.looptime)
+                        self._kf_update(s_meas, d_meas, max_s)
+                    s_pub, d_pub = float(self._kf_x[0]) % max_s, float(self._kf_x[1])
+                    vs_pub, vd_pub = float(self._kf_x[2]), float(self._kf_x[3])
+                    # re-derive xyz from posterior (s,d) so msg fields stay consistent
+                    rp = self.frenet2glob([s_pub], [d_pub])
+                    x_pub, y_pub = float(rp.x[0]), float(rp.y[0])
+                    z_pub = float(rp.z[0]) if hasattr(rp, 'z') and len(rp.z) > 0 else 0.0
+                else:
+                    s_pub, d_pub = s_meas, d_meas
+                    vs_pub, vd_pub = self.dyn_obstacle_speed, 0.0
+                    x_pub, y_pub, z_pub = xn, yn, zn
+
+                pub_obs = copy.deepcopy(self.dynamic_obstacle)
+                pub_obs.s_center = s_pub
+                pub_obs.d_center = d_pub
+                pub_obs.s_start = (s_pub - self.obj_len / 2) % max_s
+                pub_obs.s_end   = (s_pub + self.obj_len / 2) % max_s
+                pub_obs.d_right = d_pub - pub_obs.size / 2
+                pub_obs.d_left  = d_pub + pub_obs.size / 2
+                pub_obs.x_m, pub_obs.y_m, pub_obs.z_m = x_pub, y_pub, z_pub
+                pub_obs.vs = vs_pub
+                pub_obs.vd = vd_pub
+                pub_obs.is_visible = True
+
+                obstacle_msg.obstacles.append(pub_obs)
+                self.obstacle_pub.publish(obstacle_msg)
+
+                self._last_posterior = pub_obs
+                self._last_seen_t = rospy.Time.now()
+            else:
+                now = rospy.Time.now()
+                if (self._last_seen_t is not None
+                        and self._last_posterior is not None
+                        and (now - self._last_seen_t).to_sec() < self.coast_duration):
+                    # coast: freeze last posterior, flag not-visible
+                    coast_obs = copy.deepcopy(self._last_posterior)
+                    coast_obs.is_visible = False
+                    obstacle_msg.obstacles.append(coast_obs)
+                    self.obstacle_pub.publish(obstacle_msg)
+                else:
+                    # drop: publish empty, reset KF so next visibility re-inits
+                    self._kf_x = None
+                    self._kf_P = None
+                    self._last_posterior = None
+                    self._last_seen_t = None
+                    self.obstacle_pub.publish(obstacle_msg)  # empty
+            ### HJ : end
 
             counter = counter + 1
 

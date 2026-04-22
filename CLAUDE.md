@@ -111,24 +111,25 @@ UNICORN Racing Team의 자율주행 레이싱 스택 (ROS1, Noetic).
 
 ## Docker 환경
 - 컨테이너 이름: `icra2026`
-- 호스트 → 컨테이너 경로 매핑: `/home/unicorn/icra_2026_ws/UNICORN-ICCAS_2025` → `/home/unicorn/catkin_ws/src/race_stack`
+- 호스트 → 컨테이너 경로 매핑: `$HOME/icra2026_ws/ICRA2026_HJ` → `$HOME/catkin_ws/src/race_stack`
+  (컨테이너 안에서 `$HOME`은 호스트 사용자명과 동일하게 구성됨)
 - **빌드, import 테스트, 코드 실행은 반드시 Docker 컨테이너 안에서 할 것**
 - **Gazebo 시뮬레이터는 컨테이너 바깥(호스트)에서 ROS로 구동 중** — 컨테이너 ↔ 호스트 간 ROS master 공유
 ```bash
-# 컨테이너 내부에서 명령 실행
-docker exec icra2026 bash -c "source /opt/ros/noetic/setup.bash && source /home/unicorn/catkin_ws/devel/setup.bash && <명령>"
+# 컨테이너 내부에서 명령 실행 ($HOME은 컨테이너 안에서도 호스트와 동일하게 매핑됨)
+docker exec icra2026 bash -c 'source /opt/ros/noetic/setup.bash && source $HOME/catkin_ws/devel/setup.bash && <명령>'
 
 # 빌드 예시
-docker exec icra2026 bash -c "source /opt/ros/noetic/setup.bash && source /home/unicorn/catkin_ws/devel/setup.bash && cd /home/unicorn/catkin_ws && catkin build"
+docker exec icra2026 bash -c 'source /opt/ros/noetic/setup.bash && source $HOME/catkin_ws/devel/setup.bash && cd $HOME/catkin_ws && catkin build'
 ```
 - 로컬 파일 수정은 호스트에서, 빌드/테스트는 Docker에서
 - **로컬 git에 영향주는 docker 명령 (fetch, checkout 등) 절대 금지**
 
 ## 빌드
 ```bash
-cd /home/unicorn/catkin_ws && catkin build
+cd $HOME/catkin_ws && catkin build
 # HJ 집중 패키지
-catkin build mpc_planner 3d_sampling_based_planner sqp_planner
+catkin build mpc_planner 3d_sampling_based_planner sqp_planner obstacle_publisher
 ```
 
 ## 실행 (gazebo_wall_2, sim — HJ 기준)

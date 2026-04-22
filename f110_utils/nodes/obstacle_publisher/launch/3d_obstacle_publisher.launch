@@ -21,6 +21,26 @@
     <arg name="osc_amplitude" default="0.4"/> <!-- m, d 방향 진폭 -->
     <arg name="osc_phase0" default="0.0"/> <!-- rad, 시작 위상 (다중 장애물 분산용) -->
 
+    <!-- ### HJ (20260422) : tracker-mimic parameters
+            Detect gate: only gate-in when obstacle is within [s_back..s_fwd] of ego
+            Coast: freeze posterior for this duration after leaving gate
+                   (matches ttl_dynamic=40 / rate_tracking=40Hz = 1.0s)
+            Noise: cartesian xyz Gaussian (re-derived to s,d via glob2frenet)
+            KF:    linear, state [s, d, vs, vd], const-velocity model
+         ### HJ : end -->
+    <arg name="detect_s_back"  default="-5.0"/>
+    <arg name="detect_s_fwd"   default="10.0"/>
+    <arg name="detect_d_max"   default="10.0"/>   <!-- effectively off on single-layer tracks -->
+    <arg name="coast_duration" default="1.0"/>    <!-- s -->
+    <arg name="noise_enable"   default="true"/>
+    <arg name="noise_sigma_xy" default="0.05"/>   <!-- m -->
+    <arg name="noise_sigma_z"  default="0.02"/>   <!-- m -->
+    <arg name="kf_enable"      default="true"/>
+    <arg name="kf_q_s"         default="0.0001"/>
+    <arg name="kf_q_d"         default="0.0001"/>
+    <arg name="kf_q_vs"        default="0.5"/>
+    <arg name="kf_q_vd"        default="0.5"/>
+
     <!-- Launch Collision detector (unchanged, 2D/3D agnostic) -->
     <node name="collision_detector" pkg="obstacle_publisher" type="collision_detector.py" output="screen"/>
 
@@ -36,5 +56,17 @@
         <param name="osc_frequency" value="$(arg osc_frequency)"/>
         <param name="osc_amplitude" value="$(arg osc_amplitude)"/>
         <param name="osc_phase0" value="$(arg osc_phase0)"/>
+        <param name="detect_s_back"  value="$(arg detect_s_back)"/>
+        <param name="detect_s_fwd"   value="$(arg detect_s_fwd)"/>
+        <param name="detect_d_max"   value="$(arg detect_d_max)"/>
+        <param name="coast_duration" value="$(arg coast_duration)"/>
+        <param name="noise_enable"   value="$(arg noise_enable)"/>
+        <param name="noise_sigma_xy" value="$(arg noise_sigma_xy)"/>
+        <param name="noise_sigma_z"  value="$(arg noise_sigma_z)"/>
+        <param name="kf_enable"      value="$(arg kf_enable)"/>
+        <param name="kf_q_s"  value="$(arg kf_q_s)"/>
+        <param name="kf_q_d"  value="$(arg kf_q_d)"/>
+        <param name="kf_q_vs" value="$(arg kf_q_vs)"/>
+        <param name="kf_q_vd" value="$(arg kf_q_vd)"/>
     </node>
 </launch>
