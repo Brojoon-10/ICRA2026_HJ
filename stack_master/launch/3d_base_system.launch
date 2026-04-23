@@ -142,13 +142,4 @@
     </include>
   </group>
 
-  <!-- Dynamic planner parameter servers -->
-  <group ns="dyn_planners">
-    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="global_tracking" /></include>
-    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="recovery_planner" /></include>
-    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="start_planner" /></include>
-    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="static_avoidance_planner" /></include>
-    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="dynamic_avoidance_planner" /></include>
-  </group>
-
 </launch>
