@@ -16,9 +16,9 @@
     <arg name="reactive" default="false"/> <!-- true면 temporal 짧은 주기 진동 -->
     <arg name="d_oscillate" default="true"/> <!-- 진동 on/off (기본 on = overshoot 라인) -->
     <arg name="osc_mode" default="$(eval 'temporal' if reactive else 'spatial')"/>
-    <arg name="osc_n_waves_per_lap" default="1.0"/> <!-- spatial 모드: 랩당 파 수 -->
+    <arg name="osc_n_waves_per_lap" default="1.5"/> <!-- spatial 모드: 랩당 파 수 -->
     <arg name="osc_frequency" default="$(eval 0.6 if reactive else 0.1)"/> <!-- temporal 모드: Hz -->
-    <arg name="osc_amplitude" default="0.4"/> <!-- m, d 방향 진폭 -->
+    <arg name="osc_amplitude" default="0.25"/> <!-- m, d 방향 진폭 -->
     <arg name="osc_phase0" default="0.0"/> <!-- rad, 시작 위상 (다중 장애물 분산용) -->
 
     <!-- ### HJ (20260422) : tracker-mimic parameters
@@ -40,6 +40,22 @@
     <arg name="kf_q_d"         default="0.0001"/>
     <arg name="kf_q_vs"        default="0.5"/>
     <arg name="kf_q_vd"        default="0.5"/>
+
+    <!-- ### HJ : absorbed gazebo static obstacle publisher (was separate launch).
+              enable_gazebo_static_obs=true → 3d_obstacle_publisher also reads
+              /gazebo/static_obstacles/{poses,radii} and appends them to the
+              single /tracking/obstacles stream (no dual-publisher race).
+              Safe no-op when those topics are absent (e.g. non-gazebo runs).
+         ### HJ : end -->
+    <arg name="enable_gazebo_static_obs" default="true"/>
+    <arg name="gz_in_poses_topic"   default="/gazebo/static_obstacles/poses"/>
+    <arg name="gz_in_radii_topic"   default="/gazebo/static_obstacles/radii"/>
+    <arg name="gz_out_markers_topic" default="/gazebo_static_obstacle_markers"/>
+    <arg name="gz_id_offset"        default="100"/>
+    <!-- s-gate for static obstacles on planner-facing /tracking/obstacles.
+         Truth channel ignores this gate (collision detector sees everything). -->
+    <arg name="gz_static_s_back"    default="-2.0"/>
+    <arg name="gz_static_s_fwd"     default="15.0"/>
 
     <!-- Launch Collision detector (unchanged, 2D/3D agnostic) -->
     <node name="collision_detector" pkg="obstacle_publisher" type="collision_detector.py" output="screen"/>
@@ -68,5 +84,13 @@
         <param name="kf_q_d"  value="$(arg kf_q_d)"/>
         <param name="kf_q_vs" value="$(arg kf_q_vs)"/>
         <param name="kf_q_vd" value="$(arg kf_q_vd)"/>
+        <!-- ### HJ : gazebo static obstacle absorption -->
+        <param name="enable_gazebo_static_obs" value="$(arg enable_gazebo_static_obs)"/>
+        <param name="gz_in_poses_topic"   value="$(arg gz_in_poses_topic)"/>
+        <param name="gz_in_radii_topic"   value="$(arg gz_in_radii_topic)"/>
+        <param name="gz_out_markers_topic" value="$(arg gz_out_markers_topic)"/>
+        <param name="gz_id_offset"        value="$(arg gz_id_offset)"/>
+        <param name="gz_static_s_back"    value="$(arg gz_static_s_back)"/>
+        <param name="gz_static_s_fwd"     value="$(arg gz_static_s_fwd)"/>
     </node>
 </launch>

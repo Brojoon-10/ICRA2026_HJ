@@ -21,7 +21,8 @@
 import rospy
 import numpy as np
 import copy
-from geometry_msgs.msg import PointStamped, PoseStamped
+from geometry_msgs.msg import PointStamped, PoseArray
+from std_msgs.msg import Float64MultiArray
 from f110_msgs.msg import ObstacleArray, Obstacle, WpntArray, Wpnt, OpponentTrajectory, OppWpnt
 from visualization_msgs.msg import Marker, MarkerArray
 from frenet_conversion.srv import Glob2FrenetArr, Frenet2GlobArr
@@ -116,11 +117,12 @@ class ObstaclePublisher3D:
         self._ego_s = 0.0
         self._ego_d = 0.0
 
-        ### HJ : RViz "2D Nav Goal" → respawn obstacle at nearest s on opponent line
-        # 이 스택의 RViz config는 Nav Goal을 "/goal" 로 publish (obstacle_spawner와 공유).
-        # 클릭 좌표를 glob2frenet으로 변환한 뒤 dynamic_obstacle.s_center 로 점프.
+        ### HJ : RViz "Publish Point" → respawn obstacle at nearest s on opponent line
+        # RViz Publish Point tool publishes PointStamped on /clicked_point.
+        # Click xyz is passed to glob2frenet, then dynamic_obstacle.s_center jumps there.
+        # Nav Goal (/goal) is left to obstacle_spawner; we don't share that channel.
         self._pending_respawn_s = None
-        rospy.Subscriber("/goal", PoseStamped, self.nav_goal_cb, queue_size=1)
+        rospy.Subscriber("/clicked_point", PointStamped, self.nav_goal_cb, queue_size=1)
         ### HJ : end
 
         self.obstacle_pub = rospy.Publisher("/tracking/obstacles", ObstacleArray, queue_size=10)
@@ -144,6 +146,38 @@ class ObstaclePublisher3D:
             "convert_frenet2globarr_service", Frenet2GlobArr, persistent=True)
         self.mincurv_wpnts = None
 
+        ### HJ : absorbed gazebo static obstacle publisher (was separate launch)
+        # Subscribes to gazebo static obstacle topics and appends them to the
+        # single /tracking/obstacles stream so we don't fight a dual publisher.
+        # If topics never publish (non-gazebo env), behavior reduces to dummy-only.
+        self.enable_gz_static = rospy.get_param(
+            "/obstacle_publisher/enable_gazebo_static_obs", True)
+        self.gz_poses_topic = rospy.get_param(
+            "/obstacle_publisher/gz_in_poses_topic", "/gazebo/static_obstacles/poses")
+        self.gz_radii_topic = rospy.get_param(
+            "/obstacle_publisher/gz_in_radii_topic", "/gazebo/static_obstacles/radii")
+        self.gz_markers_topic = rospy.get_param(
+            "/obstacle_publisher/gz_out_markers_topic", "/gazebo_static_obstacle_markers")
+        self.gz_id_offset = rospy.get_param(
+            "/obstacle_publisher/gz_id_offset", 100)
+        # s-gate for static obstacles on /tracking/obstacles (planner-facing).
+        # Truth channel ignores this gate (collision_detector sees everything).
+        self.gz_static_s_back = rospy.get_param(
+            "/obstacle_publisher/gz_static_s_back", -2.0)
+        self.gz_static_s_fwd  = rospy.get_param(
+            "/obstacle_publisher/gz_static_s_fwd",  15.0)
+
+        self._gz_poses = None     # list of geometry_msgs/Pose
+        self._gz_radii = None     # list of float
+        self._gz_cached = []      # list of Obstacle, recomputed on message change
+        self._gz_cache_key = None
+        self.gz_marker_pub = None
+        if self.enable_gz_static:
+            rospy.Subscriber(self.gz_poses_topic, PoseArray, self._gz_poses_cb, queue_size=1)
+            rospy.Subscriber(self.gz_radii_topic, Float64MultiArray, self._gz_radii_cb, queue_size=1)
+            self.gz_marker_pub = rospy.Publisher(self.gz_markers_topic, MarkerArray, queue_size=10)
+        ### HJ : end
+
     def init_dynamic_obstacle(self) -> Obstacle:
         dynamic_obstacle = Obstacle()
         dynamic_obstacle.id = 1
@@ -166,19 +200,122 @@ class ObstaclePublisher3D:
         self._ego_d = data.pose.pose.position.y
         ### HJ : end
 
-    ### HJ : nav-goal respawn callback
-    def nav_goal_cb(self, data: PoseStamped):
-        """RViz 2D Nav Goal → 가장 가까운 opponent line의 s로 장애물을 재배치."""
+    ### HJ : clicked-point respawn callback
+    def nav_goal_cb(self, data: PointStamped):
+        """RViz Publish Point → 가장 가까운 opponent line의 s로 장애물을 재배치."""
         try:
             # Glob2FrenetArr expects (x, y, z) for 3D service
-            z = data.pose.position.z
-            resp = self.glob2frenet([data.pose.position.x], [data.pose.position.y], [z])
+            resp = self.glob2frenet([data.point.x], [data.point.y], [data.point.z])
             s_new = float(resp.s[0])
             self._pending_respawn_s = s_new
             rospy.loginfo(f"[3d_obstacle_publisher] Respawn requested at s={s_new:.2f}m "
-                          f"(clicked xy=({data.pose.position.x:.2f}, {data.pose.position.y:.2f}))")
+                          f"(clicked xy=({data.point.x:.2f}, {data.point.y:.2f}))")
         except Exception as e:
-            rospy.logwarn(f"[3d_obstacle_publisher] nav_goal conversion failed: {e}")
+            rospy.logwarn(f"[3d_obstacle_publisher] clicked_point conversion failed: {e}")
+    ### HJ : end
+
+    ### HJ : gazebo static obstacle callbacks + cache build
+    def _gz_poses_cb(self, msg: PoseArray):
+        self._gz_poses = list(msg.poses)
+
+    def _gz_radii_cb(self, msg: Float64MultiArray):
+        self._gz_radii = list(msg.data)
+
+    def _build_gz_static_obstacles(self, max_s):
+        """Convert cached gazebo poses/radii to a list of Obstacle (static).
+
+        Rebuilds only when the input arrays change (pose count or content id).
+        frenet service is called once per change to avoid per-tick cost.
+        """
+        if (self._gz_poses is None or self._gz_radii is None
+                or len(self._gz_poses) == 0 or len(self._gz_radii) == 0):
+            return []
+
+        n = min(len(self._gz_poses), len(self._gz_radii))
+        # cheap change-detect: (n, first/last xy, first radius)
+        p0 = self._gz_poses[0].position
+        pN = self._gz_poses[n - 1].position
+        key = (n, round(p0.x, 4), round(p0.y, 4),
+               round(pN.x, 4), round(pN.y, 4),
+               round(float(self._gz_radii[0]), 4))
+        if key == self._gz_cache_key and self._gz_cached:
+            return self._gz_cached
+
+        xs = [float(self._gz_poses[i].position.x) for i in range(n)]
+        ys = [float(self._gz_poses[i].position.y) for i in range(n)]
+        zs = [float(self._gz_poses[i].position.z) for i in range(n)]
+        try:
+            resp = self.glob2frenet(xs, ys, zs)
+        except Exception as e:
+            rospy.logwarn_throttle(2.0,
+                f"[3d_obstacle_publisher] gz static frenet convert failed: {e}")
+            return self._gz_cached  # fall back to previous
+
+        obstacles = []
+        for i in range(n):
+            radius = float(self._gz_radii[i])
+            s_c = float(resp.s[i])
+            d_c = float(resp.d[i])
+            obs = Obstacle()
+            obs.id = self.gz_id_offset + i
+            obs.x_m = xs[i]
+            obs.y_m = ys[i]
+            obs.z_m = zs[i]
+            obs.s_center = s_c
+            obs.d_center = d_c
+            obs.s_start = (s_c - radius) % max_s
+            obs.s_end = (s_c + radius) % max_s
+            obs.d_right = d_c - radius
+            obs.d_left = d_c + radius
+            obs.size = radius * 2
+            obs.vs = 0.0
+            obs.vd = 0.0
+            obs.is_static = True
+            obs.is_visible = True
+            obs.is_actually_a_gap = False
+            obs.sector_id = -1
+            obs.in_static_obs_sector = False
+            obstacles.append(obs)
+
+        self._gz_cached = obstacles
+        self._gz_cache_key = key
+        rospy.loginfo_throttle(5.0,
+            f"[3d_obstacle_publisher] gz static obstacles active: n={n}")
+        return obstacles
+
+    def _gz_in_s_gate(self, s_obs, s_ego, L):
+        """Planner-channel gate for static obstacles (s-only, ego-relative, s-wrap)."""
+        ds = self._wrap_to_half(s_obs - s_ego, L)
+        return self.gz_static_s_back <= ds <= self.gz_static_s_fwd
+
+    def _publish_gz_static_markers(self, obstacles):
+        if self.gz_marker_pub is None:
+            return
+        marker_msg = MarkerArray()
+        now = rospy.Time.now()
+        for obs in obstacles:
+            r = obs.size / 2.0 if obs.size > 0 else 0.2
+            mrk = Marker()
+            mrk.header.frame_id = "map"
+            mrk.header.stamp = now
+            mrk.ns = "gazebo_static_obs"
+            mrk.id = obs.id
+            mrk.type = Marker.CYLINDER
+            mrk.action = Marker.ADD
+            mrk.pose.position.x = obs.x_m
+            mrk.pose.position.y = obs.y_m
+            mrk.pose.position.z = obs.z_m
+            mrk.pose.orientation.w = 1.0
+            mrk.scale.x = r * 2
+            mrk.scale.y = r * 2
+            mrk.scale.z = 0.3
+            mrk.color.r = 1.0
+            mrk.color.g = 0.3
+            mrk.color.b = 0.0
+            mrk.color.a = 0.8
+            mrk.lifetime = rospy.Duration(0.5)
+            marker_msg.markers.append(mrk)
+        self.gz_marker_pub.publish(marker_msg)
     ### HJ : end
 
     ### HELPERS ###
@@ -317,6 +454,22 @@ class ObstaclePublisher3D:
             obstacle_msg.header.stamp = rospy.Time.now()
             obstacle_msg.header.frame_id = "frenet"
 
+            ### HJ : tick-level gazebo static obstacle list (cached by content key).
+            # static_obs_list   → raw (truth channel, always published)
+            # static_obs_gated  → s-gate filtered (planner channel /tracking/obstacles)
+            static_obs_list = (
+                self._build_gz_static_obstacles(max_s)
+                if self.enable_gz_static else []
+            )
+            if static_obs_list:
+                static_obs_gated = [
+                    o for o in static_obs_list
+                    if self._gz_in_s_gate(o.s_center, self._ego_s, max_s)
+                ]
+            else:
+                static_obs_gated = []
+            ### HJ : end
+
             ### HJ : apply pending nav-goal respawn before advancing s
             if self._pending_respawn_s is not None:
                 self.dynamic_obstacle.s_center = self._pending_respawn_s % max_s
@@ -365,9 +518,14 @@ class ObstaclePublisher3D:
             truth_msg.header.frame_id = obstacle_msg.header.frame_id
             truth_obs = copy.deepcopy(self.dynamic_obstacle)
             truth_msg.obstacles.append(truth_obs)
+            ### HJ : merge gz static obstacles into truth (always visible, no noise)
+            if static_obs_list:
+                truth_msg.obstacles.extend(copy.deepcopy(static_obs_list))
+                self._publish_gz_static_markers(static_obs_list)
+            ### HJ : end
             self.obstacle_truth_pub.publish(truth_msg)
-            # marker uses truth so RViz always shows ground-truth position
-            self.publish_obstacle_cartesian(truth_msg.obstacles)
+            # marker uses truth (dummy only) so RViz always shows ground-truth position
+            self.publish_obstacle_cartesian([truth_obs])
             ### HJ : end
 
             ### HJ (20260422) : build NOISY+gated+KF msg for /tracking/obstacles
@@ -422,6 +580,10 @@ class ObstaclePublisher3D:
                 pub_obs.is_visible = True
 
                 obstacle_msg.obstacles.append(pub_obs)
+                ### HJ : merge s-gated gz static obstacles into /tracking/obstacles
+                if static_obs_gated:
+                    obstacle_msg.obstacles.extend(copy.deepcopy(static_obs_gated))
+                ### HJ : end
                 self.obstacle_pub.publish(obstacle_msg)
 
                 self._last_posterior = pub_obs
@@ -435,6 +597,10 @@ class ObstaclePublisher3D:
                     coast_obs = copy.deepcopy(self._last_posterior)
                     coast_obs.is_visible = False
                     obstacle_msg.obstacles.append(coast_obs)
+                    ### HJ : s-gated static obstacles stay in stream during coast
+                    if static_obs_gated:
+                        obstacle_msg.obstacles.extend(copy.deepcopy(static_obs_gated))
+                    ### HJ : end
                     self.obstacle_pub.publish(obstacle_msg)
                 else:
                     # drop: publish empty, reset KF so next visibility re-inits
@@ -442,7 +608,11 @@ class ObstaclePublisher3D:
                     self._kf_P = None
                     self._last_posterior = None
                     self._last_seen_t = None
-                    self.obstacle_pub.publish(obstacle_msg)  # empty
+                    ### HJ : s-gated static still published even when dummy dropped
+                    if static_obs_gated:
+                        obstacle_msg.obstacles.extend(copy.deepcopy(static_obs_gated))
+                    ### HJ : end
+                    self.obstacle_pub.publish(obstacle_msg)  # empty (or static-only)
             ### HJ : end
 
             counter = counter + 1

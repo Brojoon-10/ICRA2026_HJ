@@ -1,4 +1,10 @@
 <launch>
+    <!-- ### HJ : DEPRECATED — functionality absorbed into 3d_obstacle_publisher.launch.
+              Do NOT launch this alongside 3d_obstacle_publisher.launch; both would
+              publish on /tracking/obstacles causing a dual-publisher race.
+              Use `3d_obstacle_publisher.launch enable_gazebo_static_obs:=true`
+              (default) instead. Kept for legacy / standalone-test use only.
+         ### HJ : end -->
     <!-- ### HJ : Gazebo static obstacle → /tracking/obstacles (bypasses detect + tracking) -->
     <arg name="in_poses_topic" default="/gazebo/static_obstacles/poses"/>
     <arg name="in_radii_topic" default="/gazebo/static_obstacles/radii"/>
