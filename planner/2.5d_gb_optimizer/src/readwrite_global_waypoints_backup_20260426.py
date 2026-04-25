@@ -77,37 +77,6 @@ def read_global_waypoints(map_name:str)->Tuple[
     # Deserialize JSON and Reconstruct the maps elements
     with open(path, 'r') as f:
         d: Dict[str, List] = json.load(f)
-
-    ### HJ : backfill psi_centerline_rad on old JSONs (compat with pre-2026-04-26 exports).
-    ###      Wpnt.msg now has float64 psi_centerline_rad (centerline tangent at the
-    ###      wpnt's matched s_opt). Solvers convert d_eff = d_left/cos(psi_rad − psi_centerline_rad).
-    ###      Source priority: (1) wpnt['psi_centerline_rad'] if already present (new exports),
-    ###      (2) centerline_ref.psi_center_rad[k] (intermediate exports), (3) wpnt['psi_rad']
-    ###      with warning (very old exports — racing-line tangent, biased by sin(chi_opt)).
-    psi_center_arr = d.get('centerline_ref', {}).get('psi_center_rad')
-    _backfill_warned = False
-    for key in ('global_traj_wpnts_iqp', 'global_traj_wpnts_sp'):
-        if key not in d:
-            continue
-        for k, w in enumerate(d[key].get('wpnts', [])):
-            if 'psi_centerline_rad' in w:
-                continue
-            if psi_center_arr is not None and k < len(psi_center_arr):
-                w['psi_centerline_rad'] = float(psi_center_arr[k])
-            else:
-                w['psi_centerline_rad'] = float(w.get('psi_rad', 0.0))
-                if not _backfill_warned:
-                    print(f"[WARN] READ_GLOBAL_WAYPOINTS: '{map_name}' has no centerline_ref.psi_center_rad; "
-                          f"falling back to psi_rad (racing-line tangent — boundary corridor will be off "
-                          f"by sin(chi_opt) at corners). Re-export to fix.")
-                    _backfill_warned = True
-    # also backfill centerline_waypoints (its psi_centerline_rad ≡ its own psi_rad)
-    if 'centerline_waypoints' in d:
-        for w in d['centerline_waypoints'].get('wpnts', []):
-            if 'psi_centerline_rad' not in w:
-                w['psi_centerline_rad'] = float(w.get('psi_rad', 0.0))
-    ### HJ : end
-
     map_info_str = message_converter.convert_dictionary_to_ros_message('std_msgs/String', d['map_info_str'])
     est_lap_time = message_converter.convert_dictionary_to_ros_message('std_msgs/Float32', d['est_lap_time'])
     centerline_markers = message_converter.convert_dictionary_to_ros_message(
