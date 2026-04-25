@@ -1,14 +1,14 @@
-Sector0:
-  end: 434
-  no_FTG: false
-  only_FTG: false
-  scaling: 2.0
-  start: 0
-Sector1:
-  end: 867
-  no_FTG: false
-  only_FTG: false
-  scaling: 2.0
-  start: 434
 global_limit: 1.0
 n_sectors: 2
+Sector0:
+  start: 0
+  end: 426
+  scaling: 1.0
+  only_FTG: false
+  no_FTG: false
+Sector1:
+  start: 427
+  end: 856
+  scaling: 1.0
+  only_FTG: false
+  no_FTG: false
