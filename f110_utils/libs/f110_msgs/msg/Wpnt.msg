@@ -25,3 +25,10 @@ float64 ax_mps2
 float64 mu_rad
 ### HJ : end
 
+### HJ : centerline tangent at this wpnt's matched s_opt.
+###      d_left/d_right are measured along centerline normal axis, so solvers
+###      need this for corridor conversion: d_eff = d_left / cos(psi_rad − psi_centerline_rad).
+###      Also used for accurate boundary marker drawing (centerline-normal direction).
+float64 psi_centerline_rad
+### HJ : end
+

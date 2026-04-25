@@ -299,6 +299,10 @@ def export_waypoints():
             'vx_mps': float(v_new[k]),
             'ax_mps2': float(ax_new[k]),
             'mu_rad': float(mu[k]),
+            ### HJ : centerline tangent at matched s_opt — for solver corridor
+            ###      conversion d_eff = d_left/cos(psi_rad − psi_centerline_rad).
+            'psi_centerline_rad': float(psi_center_at_rl[k]),
+            ### HJ : end
         }
         waypoints.append(wpnt)
 
@@ -391,6 +395,9 @@ def _build_centerline_waypoints(track):
             'kappa_radpm': float(track.Omega_z[k]),
             'vx_mps': 0.0,
             'ax_mps2': 0.0,
+            ### HJ : centerline wpnt itself — psi_centerline_rad == psi_rad
+            'psi_centerline_rad': float(track.theta[k]),
+            ### HJ : end
         })
     return {
         'header': {'seq': 0, 'stamp': {'secs': 0, 'nsecs': 0}, 'frame_id': ''},
