@@ -106,7 +106,8 @@ class SectorSlicer:
 
         def finish(event):
             plt.close()
-            self.sector_pnts.append(len(s))
+            ### HJ : closed-interval [start, end] convention -> last boundary is last valid idx
+            self.sector_pnts.append(len(s) - 1)
             self.sector_pnts = sorted(list(set(self.sector_pnts)))
 
         slider = Slider(axslider, 'Waypoint idx', 0, len(s)-1, valinit=0, valfmt='%d')
@@ -122,7 +123,8 @@ class SectorSlicer:
 
     def sectors_to_yaml(self):
         if len(self.sector_pnts) == 1:
-            self.sector_pnts.append(len(self.glb_wpnts.wpnts))
+            ### HJ : closed-interval fallback -> last boundary is last valid idx
+            self.sector_pnts.append(len(self.glb_wpnts.wpnts) - 1)
         n_sectors = len(self.sector_pnts) - 1
         dict_file = {'global_limit': self.speed_scaling, 'n_sectors': n_sectors}
         for i in range(0, n_sectors):
@@ -131,6 +133,18 @@ class SectorSlicer:
                                             'scaling':self.speed_scaling}
             dict_file['Sector' + str(i)].update({'only_FTG': False})
             dict_file['Sector' + str(i)].update({'no_FTG': False})
+
+        ### HJ : sanity check inclusive [start,end] partition (no gap, no overlap, full coverage)
+        N = len(self.glb_wpnts.wpnts)
+        assert dict_file['Sector0']['start'] == 0, f"Sector0.start must be 0, got {dict_file['Sector0']['start']}"
+        for i in range(n_sectors - 1):
+            assert dict_file[f'Sector{i+1}']['start'] == dict_file[f'Sector{i}']['end'] + 1, \
+                f"Sector{i+1}.start ({dict_file[f'Sector{i+1}']['start']}) != Sector{i}.end+1 ({dict_file[f'Sector{i}']['end']+1})"
+        assert dict_file[f'Sector{n_sectors-1}']['end'] == N - 1, \
+            f"Last Sector.end ({dict_file[f'Sector{n_sectors-1}']['end']}) != len(wpnts)-1 ({N-1})"
+        for i in range(n_sectors):
+            assert dict_file[f'Sector{i}']['start'] <= dict_file[f'Sector{i}']['end'], \
+                f"Sector{i} has start>end: ({dict_file[f'Sector{i}']['start']},{dict_file[f'Sector{i}']['end']})"
 
         yaml_path = os.path.join(self.yaml_dir, 'speed_scaling.yaml')
         with open(yaml_path, 'w') as file:

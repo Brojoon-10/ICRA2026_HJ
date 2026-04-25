@@ -128,7 +128,8 @@ class StaticObstacleSectorSlicer:
         dict_file = {'n_sectors': n_sectors}
 
         for i in range(n_sectors):
-            start_idx = self.sector_pnts_indices[i]
+            ### HJ : closed-interval [start, end] convention -> next.start = prev.end + 1 (no overlap)
+            start_idx = self.sector_pnts_indices[i] if i == 0 else self.sector_pnts_indices[i] + 1
             end_idx = self.sector_pnts_indices[i + 1]
 
             s_start = self.glb_wpnts.wpnts[start_idx].s_m
@@ -143,6 +144,18 @@ class StaticObstacleSectorSlicer:
                 'name': f"sector_{i + 1}",
                 'static_obs_section': False
             }
+
+        ### HJ : sanity check inclusive [start,end] partition (no gap, no overlap, full coverage)
+        N = len(self.glb_wpnts.wpnts)
+        assert dict_file['Static_Obs_sector0']['start'] == 0, f"Static_Obs_sector0.start must be 0, got {dict_file['Static_Obs_sector0']['start']}"
+        for i in range(n_sectors - 1):
+            assert dict_file[f'Static_Obs_sector{i+1}']['start'] == dict_file[f'Static_Obs_sector{i}']['end'] + 1, \
+                f"Static_Obs_sector{i+1}.start ({dict_file[f'Static_Obs_sector{i+1}']['start']}) != Static_Obs_sector{i}.end+1 ({dict_file[f'Static_Obs_sector{i}']['end']+1})"
+        assert dict_file[f'Static_Obs_sector{n_sectors-1}']['end'] == N - 1, \
+            f"Last Static_Obs_sector.end ({dict_file[f'Static_Obs_sector{n_sectors-1}']['end']}) != len(wpnts)-1 ({N-1})"
+        for i in range(n_sectors):
+            assert dict_file[f'Static_Obs_sector{i}']['start'] <= dict_file[f'Static_Obs_sector{i}']['end'], \
+                f"Static_Obs_sector{i} has start>end: ({dict_file[f'Static_Obs_sector{i}']['start']},{dict_file[f'Static_Obs_sector{i}']['end']})"
 
         yaml_path = os.path.join(self.yaml_dir, 'static_obs_sectors.yaml')
         with open(yaml_path, 'w') as file:
