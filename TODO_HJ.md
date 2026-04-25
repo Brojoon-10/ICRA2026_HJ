@@ -18,6 +18,7 @@
 - [x] Controller 3D (L1 xyz, future z spline, lateral error 3D frenet, 마커 z, AEB)
 - [x] Gazebo static obstacle → planner 직통 연결 (`gazebo_static_obstacle_publisher.py`, Obstacle.msg `z_m` 추가)
 - [x] `gazebo_wall_2` 맵으로 export/테스트 통과 (867pts 급, bounds_3d, ot_sectors 등 일체)
+- [x] **trackbound marker 정확화 (2026-04-25)** — `d_left/d_right`는 centerline normal 축 위 거리인데 marker는 raceline tangent ± π/2 로 그려서 코너에서 sin(chi_opt) 만큼 어긋났음. JSON `centerline_ref` 에 `psi_center_rad` 배열 추가 (raceline wpnt 1:1, centerline x,y의 periodic CubicSpline 미분으로 계산), export/rebuild 양쪽 marker 코드가 이를 사용하도록 수정. rebuild 의 z=0 강제 버그 (centerline/IQP/SP/trackbound sphere) 도 `w["z_m"]` 로 같이 수정. 백업: `<file>_backup_20260425.<ext>`. 파일: `planner/3d_gb_optimizer/global_line/global_racing_line/export_global_waypoints.py`, `stack_master/scripts/rebuild_waypoints.sh`.
 
 > 3D 포팅 자체의 남은 세부 버그/정리 항목은 `HJ_docs/3d_port_bug_catalog.md`, `HJ_docs/3d_dynamic_prediction_and_planner.md` 참조.
 
@@ -101,13 +102,54 @@
 
 ---
 
-## 4. state_machine 연동 (P2 — 후순위)
+## 4. state_machine 연동
 
-> 현재 원칙: **observation 토픽으로 valid 증명이 끝난 백엔드만** state_machine에 attach.
+### 4.1 MPC Phase X — Path Switching + SM 사본 기반 attach (2026-04-23, P0 진행 중)
+
+> 상세 설계: `HJ_docs/mpc_planner_state_machine_integration.md` Phase X 섹션. 원본 SM/launch 불간섭, `3d_mpc_*` 사본으로만 작업.
+
+**당일 완료 목표 (MVP) — 2026-04-23 구현 완료, 실측 대기:**
+- [x] P0: `git status` + `mpc_planner_state_node.py` → `..._backup_20260423.py` 백업
+- [x] P1: MPC 4-state FSM (IDLE / OVERTAKE / TRANSITION_OT2RC / RECOVERY) + dwell + TTC override + TRAIL handling
+- [x] P1: mode별 publish 분기 (OT + TRANSITION → `/planner/avoidance/otwpnts`, RC → `/planner/recovery/wpnts`, IDLE/TRAIL skip)
+- [x] P1: `tick_json` 확장 (`mpc_mode`, `dwell_count`, `alpha_ramp`, `ttc_min`, `recovery_solver_used`, painter, continuity_guard)
+- [x] P1: `mpc_planner_state.launch` 인자 (`state:=auto`, `attach_to_statemachine:=true`, `recovery_solver:=quintic|nlp`)
+- [x] P1.5: `_apply_mode_weights(mode, alpha)` OVERTAKE↔RECOVERY 선형 보간 (2026-04-24) — JIT 보존, `FrenetKinMPC.update_weights()` 활용, param-only switch
+- [x] P1.5: warm-start seed 유지 정책 (tier 0 실패에만 reset)
+- [x] P1.5: 경로 continuity guard (L2 체크 + 첫 `K_guard=5` wp xy/d_m/psi blend, s_m 보존)
+- [x] P2a: RECOVERY quintic 경로 호출 (`geometric_fallback.build_quintic_fallback()` 재활용)
+- [x] P2b: 기존 solver `LIVE_TUNABLE_WEIGHTS` 재활용으로 terminal `q_n_term` / `w_obs=0` 런타임 주입 (2026-04-24). `q_mu_term` 은 NLP 구조 변경 필요 → 다음 세션 (`q_n_term`만으로도 MVP 커버)
+- [x] P2b: `recovery_nlp_profile:` YAML 섹션 + `_apply_mode_weights` 헬퍼 + `_plan_loop` 훅 (2026-04-24)
+- [x] P2c: `~recovery_solver` ROS param + launch 인자 노출
+- [x] P3: `_gb_vx_by_s` 캐시 (s_m 정렬 배열, binary search) — xy 라운드트립 금지
+- [x] P3: `_post_process_speed()` (baseline + curvature cap + ego v 연속성 + seam blend)
+- [x] P4: SM 사본 3파일 — `state_machine/src/mpc/{3d_mpc_state_machine_node.py, state_transitions_mpc.py, states_mpc.py}` (2026-04-24 `mpc/` 서브폴더로 이동)
+- [x] P4: path_source enum (`GB`, `MPC_OT`, `MPC_RC`) + 선택 로직 + `recovery_wpnts_cb` freshness (stamp 저장 + age_ms 디버그)
+- [x] P4: OVERTAKE exit → RECOVERY 경유 분기 (`state_transitions_mpc.py` OvertakingTransition, 2026-04-24) — `_check_latest_wpnts` + `_check_free_frenet` + `NOT _check_close_to_raceline` 조건에서 RECOVERY state 경유
+- [x] P4: `/state_machine_mpc/debug` JSON publish
+- [x] P5: trailing_targets 트리거 조건 path_source 무관하게 통일 (원본 `get_farthest_target()` 재사용)
+- [x] P6: `stack_master/launch/3d_mpc_headtohead.launch` 신규 (state_machine 노드만 교체 + SQP/sampling OFF 강제)
+- [x] P7: `catkin build mpc_planner state_machine` (성공, warnings only from gtest CMake policy)
+- [ ] P7: 시나리오 1~4 (clear / static / dynamic-pass / dynamic-stuck) + background `rostopic echo -c` + 주기 집계 agent + 이상 감지 agent
+- [ ] P7: 시나리오 5 Recovery A/B (quintic vs nlp) → 비교 표 HJ_docs 기입
+- [ ] P7: 합격선 위반 시 튜닝 반복
+- [x] P7: 원본 기준 commit SHA(`1242f29`) 박제 → 사본 rebase 용이성 (HJ_docs에 기록)
+
+**합격선** (전체 표는 `HJ_docs/mpc_planner_state_machine_integration.md` Phase X 참조):
+- solve_ms p95 OVERTAKE < 30ms, RECOVERY(quintic) < 3ms, RECOVERY(nlp) < 35ms
+- traj jitter < 0.05m, 경로 continuity L2 (blend 후) < 0.05m
+- seam 인접 vx diff < 0.3 m/s, margin_min > 0.15m
+- RECOVERY 종점 |n| < 0.05m
+- `/planner/avoidance/otwpnts` publisher count == 1
+
+### 4.2 공용 state_machine 통합 (P2 — Phase X 검증 후)
+
+> 원칙: **observation 토픽으로 valid 증명이 끝난 백엔드만** state_machine에 attach.
 
 - [ ] 각 백엔드의 attach 스위치 (`attach_to_statemachine`, `sampling_planner_enable`, `dynamic_avoidance_mode`) 동작 표 정리
 - [ ] 복수 백엔드 동시 활성 시 **single publisher 원칙** 강제 — launch-level guard 또는 런치 인자 mutex 검토
 - [ ] state_machine `_pub_local_wpnts()` 쪽 tail-blending 로직이 백엔드별 출력 특성(스무딩/비등간격)에 robust한지 확인
+- [ ] Phase X 사본 충분히 검증되면 원본 `3d_state_machine_node.py` 통합 검토 + `dynamic_avoidance_mode:=MPC_INTERNAL` 정식 옵션화
 
 ---
 
