@@ -112,7 +112,8 @@ class OvertakingSectorSlicer:
 
         def finish(event):
             plt.close()
-            self.sector_pnts.append(len(s))
+            ### HJ : closed-interval [start, end] convention -> last boundary is last valid idx
+            self.sector_pnts.append(len(s) - 1)
             self.sector_pnts = sorted(list(set(self.sector_pnts)))
 
         slider = Slider(axslider, 'Waypoint idx', 0, len(s)-1, valinit=0, valfmt='%d')
@@ -128,7 +129,8 @@ class OvertakingSectorSlicer:
 
     def sectors_to_yaml(self):
         if len(self.sector_pnts) == 1:
-            self.sector_pnts.append(len(self.glb_wpnts.wpnts))
+            ### HJ : closed-interval fallback -> last boundary is last valid idx
+            self.sector_pnts.append(len(self.glb_wpnts.wpnts) - 1)
 
         n_sectors = len(self.sector_pnts) - 1
         dict_file = {
@@ -142,6 +144,18 @@ class OvertakingSectorSlicer:
                 'start': self.sector_pnts[i] if i == 0 else self.sector_pnts[i] + 1,
                 'end': self.sector_pnts[i+1]}
             dict_file['Overtaking_sector' + str(i)].update({'ot_flag': False})
+
+        ### HJ : sanity check inclusive [start,end] partition (no gap, no overlap, full coverage)
+        N = len(self.glb_wpnts.wpnts)
+        assert dict_file['Overtaking_sector0']['start'] == 0, f"Overtaking_sector0.start must be 0, got {dict_file['Overtaking_sector0']['start']}"
+        for i in range(n_sectors - 1):
+            assert dict_file[f'Overtaking_sector{i+1}']['start'] == dict_file[f'Overtaking_sector{i}']['end'] + 1, \
+                f"Overtaking_sector{i+1}.start ({dict_file[f'Overtaking_sector{i+1}']['start']}) != Overtaking_sector{i}.end+1 ({dict_file[f'Overtaking_sector{i}']['end']+1})"
+        assert dict_file[f'Overtaking_sector{n_sectors-1}']['end'] == N - 1, \
+            f"Last Overtaking_sector.end ({dict_file[f'Overtaking_sector{n_sectors-1}']['end']}) != len(wpnts)-1 ({N-1})"
+        for i in range(n_sectors):
+            assert dict_file[f'Overtaking_sector{i}']['start'] <= dict_file[f'Overtaking_sector{i}']['end'], \
+                f"Overtaking_sector{i} has start>end: ({dict_file[f'Overtaking_sector{i}']['start']},{dict_file[f'Overtaking_sector{i}']['end']})"
 
         yaml_path = os.path.join(self.yaml_dir, 'ot_sectors.yaml')
         with open(yaml_path, 'w') as file:
