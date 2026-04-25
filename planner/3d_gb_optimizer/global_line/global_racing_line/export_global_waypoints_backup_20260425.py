@@ -117,26 +117,22 @@ def _build_cylinder_markers(xs, ys, zs, vs, r, g, b):
     return markers
 
 
-### HJ : trackbounds 1:1 with raceline wpnts; direction = CENTERLINE normal at matched s_opt.
-###      d_left/d_right are measured along centerline normal axis, so drawing along
-###      racing line tangent ± π/2 was off by sin(chi_opt) at corners.
-def _build_trackbounds_markers(waypoints, psi_center):
-    """Centerline-normal trackbound markers (1:1 with wpnts).
-    좌=보라(0.5,0,0.5), 우=노랑(0.5,1,0). z는 wpnt의 z_m 그대로 사용.
-
-    psi_center[k] = centerline tangent at the s_opt corresponding to waypoints[k].
-    """
+### HJ : trackbounds now 1:1 with raceline wpnts, using wpnt psi + d_left/d_right
+def _build_trackbounds_markers(waypoints):
+    """Wpnt-aligned 좌/우 트랙 경계 sphere markers (1:1 with wpnts, psi-normal direction).
+    좌=보라(0.5,0,0.5), 우=노랑(0.5,1,0). z는 wpnt의 z_m 그대로 사용."""
     markers = []
     marker_id = 0
 
-    for k, w in enumerate(waypoints):
+    for w in waypoints:
         x, y, z = w['x_m'], w['y_m'], w['z_m']
-        psi_c = float(psi_center[k])
+        psi = w['psi_rad']
         d_left = w['d_left']
         d_right = w['d_right']
 
-        x_l = x + d_left * np.cos(psi_c + np.pi / 2)
-        y_l = y + d_left * np.sin(psi_c + np.pi / 2)
+        # 왼쪽 경계 (psi + pi/2 방향)
+        x_l = x + d_left * np.cos(psi + np.pi / 2)
+        y_l = y + d_left * np.sin(psi + np.pi / 2)
         m = _make_marker_template()
         m['id'] = marker_id
         m['pose']['position'] = {'x': float(x_l), 'y': float(y_l), 'z': float(z)}
@@ -144,8 +140,9 @@ def _build_trackbounds_markers(waypoints, psi_center):
         markers.append(m)
         marker_id += 1
 
-        x_r = x + d_right * np.cos(psi_c - np.pi / 2)
-        y_r = y + d_right * np.sin(psi_c - np.pi / 2)
+        # 오른쪽 경계 (psi - pi/2 방향)
+        x_r = x + d_right * np.cos(psi - np.pi / 2)
+        y_r = y + d_right * np.sin(psi - np.pi / 2)
         m = _make_marker_template()
         m['id'] = marker_id
         m['pose']['position'] = {'x': float(x_r), 'y': float(y_r), 'z': float(z)}
@@ -228,20 +225,11 @@ def export_waypoints():
     z_new = cs_z(arc_new)
 
     # v, ax, s_opt, n_opt 보간 (arc length 기준, 선형보간)
-    ### HJ : `period=total_loop` was applied to monotonic s_opt → wrong wrap at closure
-    ###       (s_opt jumps from ~total_center to 0, period interp blends them at the seam).
-    ###       Fix: extend arc table by one closure point so np.interp doesn't need period.
     arc_r_inner = arc_r[:-1]  # 중복 끝점 제외한 arc values
-    arc_r_ext = np.append(arc_r_inner, total_loop)
-    s_opt_r_ext = np.append(s_opt_r, float(track.s[-1]))   # closure → centerline 한 바퀴
-    n_opt_r_ext = np.append(n_opt_r, n_opt_r[0])           # n is closed loop
-    v_r_ext     = np.append(v_r,     v_r[0])
-    ax_r_ext    = np.append(ax_r,    ax_r[0])
-    v_new     = np.interp(arc_new, arc_r_ext, v_r_ext)
-    ax_new    = np.interp(arc_new, arc_r_ext, ax_r_ext)
-    s_opt_new = np.interp(arc_new, arc_r_ext, s_opt_r_ext)
-    n_opt_new = np.interp(arc_new, arc_r_ext, n_opt_r_ext)
-    ### HJ : end
+    v_new = np.interp(arc_new, arc_r_inner, v_r, period=total_loop)
+    ax_new = np.interp(arc_new, arc_r_inner, ax_r, period=total_loop)
+    s_opt_new = np.interp(arc_new, arc_r_inner, s_opt_r, period=total_loop)
+    n_opt_new = np.interp(arc_new, arc_r_inner, n_opt_r, period=total_loop)
 
     # ── Step 4: heading, kappa, pitch 계산 (스플라인 미분) ──
     dx_dt = cs_x(arc_new, 1)
@@ -255,24 +243,6 @@ def export_waypoints():
     dz_dt = cs_z(arc_new, 1)
     mu = -np.arcsin(np.clip(dz_dt / np.sqrt(dx_dt**2 + dy_dt**2 + dz_dt**2), -1.0, 1.0))
     ### IY : end
-
-    ### HJ : centerline tangent at each raceline wpnt's matched s_opt.
-    ###      Used for trackbound markers (drawn along centerline normal, not raceline normal).
-    s_c = track.s
-    total_center = float(s_c[-1])
-    x_c_inner = track.x[:-1]
-    y_c_inner = track.y[:-1]
-    z_c_inner = track.z[:-1]
-    arc_c = np.append(s_c[:-1], total_center)
-    cs_xc = CubicSpline(arc_c, np.append(x_c_inner, x_c_inner[0]), bc_type='periodic')
-    cs_yc = CubicSpline(arc_c, np.append(y_c_inner, y_c_inner[0]), bc_type='periodic')
-    cs_zc = CubicSpline(arc_c, np.append(z_c_inner, z_c_inner[0]), bc_type='periodic')
-
-    s_opt_for_psi = np.clip(s_opt_new, 0.0, total_center)
-    dxc_ds = cs_xc(s_opt_for_psi, 1)
-    dyc_ds = cs_yc(s_opt_for_psi, 1)
-    psi_center_at_rl = np.arctan2(dyc_ds, dxc_ds)
-    ### HJ : end
 
     # ── Step 5: 트랙 경계 거리 계산 + waypoints 생성 ──
     waypoints = []
@@ -318,7 +288,7 @@ def export_waypoints():
     )
     ### HJ : end
 
-    trackbounds_markers = _build_trackbounds_markers(waypoints, psi_center_at_rl)
+    trackbounds_markers = _build_trackbounds_markers(waypoints)
 
     # ── JSON 출력 (참고 포맷 호환) ──
     output = {
@@ -344,12 +314,9 @@ def export_waypoints():
         'trackbounds_markers': {'markers': trackbounds_markers},
         ### IY : centerline 기준 s, n (local racing line solver 초기 guess용)
         ### Wpnt msg에 없는 필드이므로 별도 섹션으로 저장
-        ### HJ : psi_center_rad 추가 — raceline wpnt[k]가 매칭되는 centerline tangent.
-        ###      trackbound marker를 centerline normal 방향으로 그리는 데 사용.
         'centerline_ref': {
-            's_center_m':     [float(s_opt_new[k]) for k in range(n_new)],
-            'n_center_m':     [float(n_opt_new[k]) for k in range(n_new)],
-            'psi_center_rad': [float(psi_center_at_rl[k]) for k in range(n_new)],
+            's_center_m': [float(s_opt_new[k]) for k in range(n_new)],
+            'n_center_m': [float(n_opt_new[k]) for k in range(n_new)],
         },
     }
 

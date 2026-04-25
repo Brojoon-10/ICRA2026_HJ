@@ -89,14 +89,6 @@ iqp_wpnts = data["global_traj_wpnts_iqp"]["wpnts"]
 sp_wpnts  = data["global_traj_wpnts_sp"]["wpnts"]
 cl_wpnts  = data["centerline_waypoints"]["wpnts"]
 
-# HJ : centerline tangent at each iqp/sp wpnt's matched s_opt (for trackbound markers)
-psi_center = data.get("centerline_ref", {}).get("psi_center_rad")
-if psi_center is None:
-    print("  [warn] centerline_ref.psi_center_rad missing → falling back to wpnt psi_rad (less accurate at corners)")
-elif len(psi_center) != len(iqp_wpnts):
-    print(f"  [warn] psi_center_rad length ({len(psi_center)}) != iqp_wpnts ({len(iqp_wpnts)}) → falling back to psi_rad")
-    psi_center = None
-
 vmin_iqp = min(w["vx_mps"] for w in iqp_wpnts)
 vmax_iqp = max(w["vx_mps"] for w in iqp_wpnts)
 vmin_sp  = min(w["vx_mps"] for w in sp_wpnts)
@@ -107,27 +99,22 @@ print(f"  SP:  {len(sp_wpnts)} wpnts, vel {vmin_sp:.3f}~{vmax_sp:.3f} m/s")
 print(f"  CL:  {len(cl_wpnts)} wpnts")
 
 # ── Centerline markers (blue spheres) ──
-# HJ : preserve 3D z (was hard-coded 0.0, broken on banked/sloped tracks)
 new_cl = []
 for i, w in enumerate(cl_wpnts):
-    new_cl.append(make_marker(i, w["x_m"], w["y_m"], w["z_m"], SPHERE_SCALE, COLOR_BLUE))
+    new_cl.append(make_marker(i, w["x_m"], w["y_m"], 0.0, SPHERE_SCALE, COLOR_BLUE))
 data["centerline_markers"] = {"markers": new_cl}
 print(f"  centerline markers: {len(new_cl)}")
 
 # ── Trackbounds: 1:1 with iqp wpnts, even=LEFT(purple), odd=RIGHT(yellow-green) ──
-# HJ : draw along CENTERLINE normal (psi_center) instead of raceline normal — d_left/d_right
-#      are measured along centerline normal axis, so racing-line-tangent ± π/2 was off by
-#      sin(chi_opt) at corners (~tens of cm).
 new_tb = []
 for i, w in enumerate(iqp_wpnts):
-    psi = float(psi_center[i]) if psi_center is not None else w["psi_rad"]
-    x, y, z = w["x_m"], w["y_m"], w["z_m"]
+    psi, x, y = w["psi_rad"], w["x_m"], w["y_m"]
     lx = x + w["d_left"]  * math.cos(psi + math.pi / 2)
     ly = y + w["d_left"]  * math.sin(psi + math.pi / 2)
     rx = x + w["d_right"] * math.cos(psi - math.pi / 2)
     ry = y + w["d_right"] * math.sin(psi - math.pi / 2)
-    new_tb.append(make_marker(i * 2,     lx, ly, z, SPHERE_SCALE, COLOR_PURPLE))
-    new_tb.append(make_marker(i * 2 + 1, rx, ry, z, SPHERE_SCALE, COLOR_YELLOW_GREEN))
+    new_tb.append(make_marker(i * 2,     lx, ly, 0.0, SPHERE_SCALE, COLOR_PURPLE))
+    new_tb.append(make_marker(i * 2 + 1, rx, ry, 0.0, SPHERE_SCALE, COLOR_YELLOW_GREEN))
 data["trackbounds_markers"] = {"markers": new_tb}
 print(f"  trackbounds: {len(new_tb)} ({len(new_tb)//2} pairs)")
 
@@ -135,7 +122,7 @@ print(f"  trackbounds: {len(new_tb)} ({len(new_tb)//2} pairs)")
 new_iqp = []
 for i, w in enumerate(iqp_wpnts):
     c = velocity_color(w["vx_mps"], vmin_iqp, vmax_iqp)
-    new_iqp.append(make_marker(i, w["x_m"], w["y_m"], w["z_m"], SPHERE_SCALE, c))
+    new_iqp.append(make_marker(i, w["x_m"], w["y_m"], 0.0, SPHERE_SCALE, c))
 data["global_traj_markers_iqp"] = {"markers": new_iqp}
 print(f"  IQP markers: {len(new_iqp)}")
 
@@ -143,7 +130,7 @@ print(f"  IQP markers: {len(new_iqp)}")
 new_sp = []
 for i, w in enumerate(sp_wpnts):
     c = velocity_color(w["vx_mps"], vmin_sp, vmax_sp)
-    new_sp.append(make_marker(i, w["x_m"], w["y_m"], w["z_m"], SPHERE_SCALE, c))
+    new_sp.append(make_marker(i, w["x_m"], w["y_m"], 0.0, SPHERE_SCALE, c))
 data["global_traj_markers_sp"] = {"markers": new_sp}
 print(f"  SP markers: {len(new_sp)}")
 
@@ -176,7 +163,7 @@ for k in data:
         ordered[k] = data[k]
 
 with open(os.path.join(map_dir, "global_waypoints.json"), "w") as f:
-    json.dump(ordered, f, indent=2)   # HJ : match export_global_waypoints.py format
+    json.dump(ordered, f)
 print("  Saved!")
 
 # ── Visualization ──
