@@ -1637,6 +1637,27 @@ class MPCPlannerStateNode:
             self._prev_mpc_mode = prev
             self._mpc_mode = target
             self._mode_dwell = 0
+            ### HJ : 2026-04-26 (A5) — warm-start reset on WITH_OBS → NO_OBS.
+            ###      Right after overtake, the warm-start carries the OT
+            ###      avoidance shape (n[k] biased to one side around obstacle
+            ###      position). New cost balance (no obstacle) wants ego on
+            ###      raceline. With limited iterations, ipopt may settle near
+            ###      the OT shape's local minimum → trajectory comes out
+            ###      wobbly for several ticks until warm-start drifts to GB.
+            ###      Resetting forces a fresh seed so the new convergence-only
+            ###      cost lands a clean GB-aligned trajectory immediately.
+            ###      WITH_OBS direction kept normal (warm-start continuity
+            ###      matters for OT path smoothness).
+            if (prev == MPC_MODE_WITH_OBS and target == MPC_MODE_NO_OBS
+                    and self.solver_backend == 'frenet_kin'):
+                try:
+                    self.solver.reset_warm_start()
+                    rospy.loginfo_throttle(
+                        2.0, '[mpc][%s] warm-start reset on OT→NO_OBS',
+                        rospy.get_name())
+                except Exception:
+                    pass
+            ### HJ : end
         else:
             self._mode_dwell += 1
 
