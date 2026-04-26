@@ -554,10 +554,20 @@ class OvertakingIYNode:
             self.prev_s = None
             return
         n = len(self.prev_d)
-        s_av = self.prev_s.copy()
         cur_d = float(self.frenet_state.pose.pose.position.y)
-        d_init = shift_solution(self.prev_d, self.prev_s, s_av,
-                                delta_s_shift=self.cur_v * self.dt)
+        cur_s = float(self.frenet_state.pose.pose.position.x)
+        # rebuild s_av from current position
+        delta_s = float(self.prev_s[1] - self.prev_s[0]) if n > 1 else 0.3
+        s_av = np.array([cur_s + i * delta_s for i in range(n)])
+        # jump detection
+        s_gap = abs((cur_s - self.prev_s[0]) % self.scaled_max_s)
+        if s_gap > self.scaled_max_s / 2:
+            s_gap = self.scaled_max_s - s_gap
+        if s_gap > 1.0:
+            d_init = np.zeros(n)
+        else:
+            d_init = shift_solution(self.prev_d, self.prev_s, s_av,
+                                    delta_s_shift=self.cur_v * self.dt)
         d_init[0] = cur_d
         n_src = len(self.scaled_wpnts_msg.wpnts)
         idxs = [int(np.round(s / self.scaled_delta_s)) % n_src for s in s_av]
@@ -594,20 +604,28 @@ class OvertakingIYNode:
         if np.max(np.abs(d_opt)) < 0.05:
             self.prev_d = None
             self.prev_s = None
+            self._pending_msg = OTWpntArray(
+                header=Header(stamp=rospy.Time.now(), frame_id='map'), wpnts=[])
             return
+        # dense interpolation (same as _rolling_step)
+        n_dense = max(n, int((s_av[-1] - s_av[0]) / self.scaled_delta_s))
+        s_dense = np.linspace(s_av[0], s_av[-1], n_dense)
+        d_dense = np.interp(s_dense, s_av, d_opt)
+        s_wrap = np.mod(s_dense, self.scaled_max_s)
+        xyz = self.converter.get_cartesian_3d(s_wrap, d_dense).T
+        n_src = len(self.scaled_wpnts_msg.wpnts)
         msg = OTWpntArray(header=Header(stamp=rospy.Time.now(), frame_id='map'))
         out = []
-        for k in range(n):
-            idx = idxs[k]
+        for k in range(n_dense):
+            idx = int(np.round(s_wrap[k] / self.scaled_delta_s)) % n_src
             src = self.scaled_wpnts_msg.wpnts[idx]
             w = Wpnt()
             w.id = k
-            w.s_m = float(s_av[k])
-            w.d_m = float(d_opt[k])
-            cart = self.converter.get_cartesian_3d([float(s_av[k])], [float(d_opt[k])])
-            w.x_m = float(cart[0])
-            w.y_m = float(cart[1])
-            w.z_m = float(cart[2])
+            w.s_m = float(s_dense[k])
+            w.d_m = float(d_dense[k])
+            w.x_m = float(xyz[k, 0])
+            w.y_m = float(xyz[k, 1])
+            w.z_m = float(xyz[k, 2])
             w.psi_rad = float(src.psi_rad)
             w.kappa_radpm = float(src.kappa_radpm)
             w.vx_mps = float(src.vx_mps)
@@ -847,6 +865,7 @@ class OvertakingIYNode:
                     self.evasion_pub.publish(self._pending_msg)
                 else:
                     rospy.logwarn('[OvertakingIY] cold start skipped (%.0fms)', solve_ms)
+                    self._clear_markers()
                 self._pending_msg = None
             if solve_ok:
                 self.last_solve_ms = solve_ms
@@ -1320,8 +1339,8 @@ class OvertakingIYNode:
             rospy.loginfo_throttle(1.0,
                 '[OvertakingIY] ABORT=%s t_ot=%.2f t_trail=%.2f',
                 abort_reason.value, t_ot, t_trail)
-            self._handle_failure(dry_run, is_abort=True)
-            return True, t_ot, t_trail, abort_reason, side
+            # still publish path even on abort (SM needs it for trailing)
+            # fall through to publish below
 
         #log start-point gap for diagnosing "path starts behind ego"
         s0_gap = float(np.mod(evasion_s[0] - self.cur_s, self.scaled_max_s))

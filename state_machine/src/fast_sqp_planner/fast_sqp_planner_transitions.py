@@ -40,6 +40,8 @@ def GlobalTrackingTransition(state_machine) -> Tuple[StateType, StateType]:
     """GB_TRACK state transitions."""
     ot_sector = state_machine._check_ot_sector()
     has_near = _has_obs_ahead(state_machine)
+    n_obs = len(state_machine.cur_obstacles_in_interest)
+    rospy.logwarn_throttle(2.0, f"[TRANS] GB: ot={ot_sector} near={has_near} n_obs={n_obs}")
 
     # ot_flag=true + obstacle close enough → OVERTAKE
     if ot_sector and has_near:

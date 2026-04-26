@@ -40,7 +40,7 @@ near_knots_K: 15
 obs_ramp_knots: 5
 
 optimize_velocity: false
-velocity_mode: 2_5d    # 2_5d | 3d | nlp
+velocity_mode: 3d    # 2_5d | 3d | nlp
 
 abort:
   performance_margin_s: 1.00

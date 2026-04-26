@@ -2,7 +2,7 @@
 # loaded alongside state_machine_params.yaml when state_machine_type:=overtaking
 
 close_threshold_tight: 0.2
-close_threshold_loose: 0.3
+close_threshold_loose: 0.2
 close_speed_ratio_thres: 0.5
 ot_collision_ttc_s: 0.5
 ot_engage_ttc_s: 1.0
