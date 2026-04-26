@@ -207,9 +207,14 @@ trail_vel_ramp_ticks: 8
 #  IPOPT
 # =============================================================================
 
-ipopt_max_iter: 200       # Typical successful solve converges in ~15 iters.
-                          # 200 caps worst-case failure to ~40 ms so the
-                          # fallback ladder engages quickly.
+ipopt_max_iter: 80        # ### HJ : 2026-04-26 (A2) — was 200. Bag analysis
+                          # showed worst-case failed solve hit 136ms (~0.7 ms/iter
+                          # on hard infeasibility), which exceeded SM freshness
+                          # threshold and triggered spurious GB fallback flap.
+                          # 80 caps worst-case fail to ~55 ms; tier-1 hold-last
+                          # publishes immediately afterward → SM stays in sync.
+                          # Successful solves still finish in <20ms (~15 iters
+                          # typical), so this only affects fail behaviour.
 ipopt_print_level: 0
 
 # Linear solver. HSL ma27 is ~2x faster than MUMPS on this sparsity pattern.
