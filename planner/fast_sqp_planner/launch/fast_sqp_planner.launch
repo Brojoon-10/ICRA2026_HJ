@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<!-- Takeover launch: remap overrides SQP while running, auto-fallback on stop. -->
+<launch>
+  <node pkg="fast_sqp_planner" type="fast_sqp_planner_node.py"
+        name="planner_rolling" output="screen">
+    <remap from="/planner/fast_sqp_planner/otwpnts" to="/planner/avoidance/otwpnts"/>
+    <rosparam command="load"
+              file="$(find fast_sqp_planner)/config/fast_sqp_planner.yaml"/>
+  </node>
+</launch>
