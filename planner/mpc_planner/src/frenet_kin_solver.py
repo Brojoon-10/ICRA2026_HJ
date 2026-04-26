@@ -146,6 +146,10 @@ class FrenetKinMPC:
 
         # cost weights (running cost)
         self.q_n = float(params.get('q_n', 3.0))
+        # ### HJ : 2026-04-24 — stage n k-ramp (recovery convergence).
+        # Default 0.0 = legacy behaviour (constant q_n). YAML / rqt set
+        # a positive value to enable per-step ramp up to k=N.
+        self.q_n_ramp = float(params.get('q_n_ramp', 0.0))
         self.gamma = float(params.get('gamma_progress', 10.0))
         self.r_a = float(params.get('r_a', 0.5))
         self.r_reg = float(params.get('r_steer_reg', 0.1))
@@ -292,6 +296,34 @@ class FrenetKinMPC:
         P_n_prev = opti.parameter(N + 1)
         P_cont_active = opti.parameter()
 
+        # Live-tunable cost parameters (promoted to opti.parameter so they
+        # can be updated per-solve from rqt_reconfigure without NLP rebuild).
+        # Default values are seeded from self.* in _solve_single_pass; any
+        # change to self.q_n etc. is picked up on the next tick.
+        P_q_n = opti.parameter()
+        # ### HJ : 2026-04-24 — stage n k-ramp for recovery convergence.
+        # Effective q_n at step k becomes `q_n + q_n_ramp · (k/N)` so early
+        # horizon stays soft (solver free to deviate around obstacles) and
+        # late horizon progressively enforces n→0 (converges to raceline
+        # before terminal). Works with both WITH_OBS (gentle ramp) and
+        # NO_OBS (aggressive ramp — recovery mode).
+        P_q_n_ramp = opti.parameter()
+        P_q_n_term = opti.parameter()
+        P_q_v_term = opti.parameter()
+        P_gamma = opti.parameter()
+        P_r_a = opti.parameter()
+        P_r_reg = opti.parameter()
+        P_r_dd = opti.parameter()
+        P_r_dd_rate = opti.parameter()
+        P_w_obs = opti.parameter()
+        P_w_cont = opti.parameter()
+        P_w_wall_buf = opti.parameter()
+        P_w_slack = opti.parameter()
+        P_sigma_s_obs = opti.parameter()
+        P_sigma_n_obs = opti.parameter()
+        P_wall_buf = opti.parameter()
+        P_gap_lat = opti.parameter()
+
         # ---- dynamics ----
         for k in range(N):
             opti.subject_to(n_[k + 1] == n_[k]
@@ -335,79 +367,87 @@ class FrenetKinMPC:
             opti.subject_to(slk[k] >= 0.0)
 
         # ---- cost ----
+        # All cost weights reference opti.parameter() handles so live
+        # rqt_reconfigure updates take effect on the next solve without
+        # rebuilding the symbolic NLP (JIT stays warm).
         J_contour = 0
+        _denom_N = float(max(N, 1))
         for k in range(N + 1):
-            J_contour = J_contour + self.q_n * n_[k] ** 2
+            # q_n_k = P_q_n + P_q_n_ramp * (k / N)  (see P_q_n_ramp docstring)
+            q_n_k = P_q_n + P_q_n_ramp * (float(k) / _denom_N)
+            J_contour = J_contour + q_n_k * n_[k] ** 2
 
         J_reg = 0
         for k in range(N + 1):
-            J_reg = J_reg + self.r_reg * de[k] ** 2
+            J_reg = J_reg + P_r_reg * de[k] ** 2
 
         # v3: δ̇ (steer-rate) penalty — directly penalises curvature rate
         # since κ = tan(δ)/L and δ̇ changes κ̇. This is the C^1 guarantee
         # replacement for the v2 (Δδ)^2 trick.
         J_dd = 0
         for k in range(N):
-            J_dd = J_dd + self.r_dd * dd[k] ** 2
+            J_dd = J_dd + P_r_dd * dd[k] ** 2
 
         # v3: δ̈ (steer-rate-rate) penalty — jerk analogue. Keeps κ̇
         # continuous → no kinked knots even under disturbance.
         J_dd_rate = 0
         for k in range(N - 1):
-            J_dd_rate = J_dd_rate + self.r_dd_rate * (dd[k + 1] - dd[k]) ** 2
+            J_dd_rate = J_dd_rate + P_r_dd_rate * (dd[k + 1] - dd[k]) ** 2
 
         J_smooth_a = 0
         for k in range(N - 1):
-            J_smooth_a = J_smooth_a + self.r_a * (a_[k + 1] - a_[k]) ** 2
+            J_smooth_a = J_smooth_a + P_r_a * (a_[k + 1] - a_[k]) ** 2
 
         prog = 0
         for k in range(N):
             prog = prog + v_[k] * ca.cos(mu[k]) * dT
-        J_progress = -self.gamma * prog
+        J_progress = -P_gamma * prog
 
-        # Obstacle bubble + side bias (same structure as v2; weights tuned)
+        # Obstacle bubble + side bias (same structure as v2; weights tuned).
+        # σ_s / σ_n / gap_lat are parameters so the bubble shape is
+        # live-tunable too.
         J_obs = 0
         J_bias = 0
         for o in range(n_obs):
             for k in range(N + 1):
-                dx = (P_ref_s[k] - P_obs_s[o, k]) / self.sigma_s_obs
-                dy = (n_[k] - P_obs_n[o, k]) / self.sigma_n_obs
+                dx = (P_ref_s[k] - P_obs_s[o, k]) / P_sigma_s_obs
+                dy = (n_[k] - P_obs_n[o, k]) / P_sigma_n_obs
                 prox_sk = P_obs_active[o] * ca.exp(-(dx * dx))
-                J_obs = J_obs + (self.w_obs * prox_sk
+                J_obs = J_obs + (P_w_obs * prox_sk
                                  * ca.exp(-(dy * dy)))
                 viol_L = ca.fmax(0.0,
-                                 (P_obs_n[o, k] + self.gap_lat) - n_[k])
+                                 (P_obs_n[o, k] + P_gap_lat) - n_[k])
                 viol_R = ca.fmax(0.0,
-                                 n_[k] - (P_obs_n[o, k] - self.gap_lat))
+                                 n_[k] - (P_obs_n[o, k] - P_gap_lat))
                 J_bias = J_bias + P_bias_L * prox_sk * viol_L ** 2
                 J_bias = J_bias + P_bias_R * prox_sk * viol_R ** 2
 
         # Wall cushion (strong quadratic hinge inside wall_buf).
         # ### HJ : v3b — cushion fires when the CAR BODY gets within
         # wall_buf of the wall, i.e. centroid within (ego_half + wall_buf).
-        # Previously centroid was used directly, so a 30 cm centroid-buf
-        # already meant body was 15 cm from the wall before cushion engaged.
+        # ego_half is a hardware constant so stays Python; wall_buf is
+        # a parameter (cushion depth tunable live).
         J_wall = 0
-        buf_c = self.ego_half + self.wall_buf
+        buf_c = self.ego_half + P_wall_buf
         for k in range(N + 1):
             viol_up = ca.fmax(0.0, n_[k] - (P_dL[k] - buf_c))
             viol_dn = ca.fmax(0.0, -n_[k] - (P_dR[k] - buf_c))
-            J_wall = J_wall + self.w_wall_buf * (viol_up ** 2 + viol_dn ** 2)
+            J_wall = J_wall + P_w_wall_buf * (viol_up ** 2 + viol_dn ** 2)
 
         # v3: solution continuity — pulls new n[k] toward prev solution's
         # shifted n[k+1]. w_cont * Σ (n - n_prev)^2 with per-tick gate.
         J_cont = 0
         for k in range(N + 1):
-            J_cont = J_cont + self.w_cont * P_cont_active \
+            J_cont = J_cont + P_w_cont * P_cont_active \
                             * (n_[k] - P_n_prev[k]) ** 2
 
         # v3: terminal cost — raceline return + speed-match near horizon end.
-        J_term = (self.q_n_term * n_[N] ** 2
-                  + self.q_v_term * (v_[N] - P_ref_v[N]) ** 2)
+        J_term = (P_q_n_term * n_[N] ** 2
+                  + P_q_v_term * (v_[N] - P_ref_v[N]) ** 2)
 
         J_slack = 0
         for k in range(N + 1):
-            J_slack = J_slack + self.w_slack * slk[k] ** 2
+            J_slack = J_slack + P_w_slack * slk[k] ** 2
 
         J = (J_contour + J_reg + J_dd + J_dd_rate + J_smooth_a
              + J_progress + J_obs + J_bias + J_wall
@@ -443,7 +483,18 @@ class FrenetKinMPC:
                           obs_s=P_obs_s, obs_n=P_obs_n,
                           obs_active=P_obs_active,
                           bias_L=P_bias_L, bias_R=P_bias_R,
-                          n_prev=P_n_prev, cont_active=P_cont_active)
+                          n_prev=P_n_prev, cont_active=P_cont_active,
+                          # Live-tunable cost parameters
+                          q_n=P_q_n, q_n_ramp=P_q_n_ramp,
+                          q_n_term=P_q_n_term, q_v_term=P_q_v_term,
+                          gamma=P_gamma,
+                          r_a=P_r_a, r_reg=P_r_reg,
+                          r_dd=P_r_dd, r_dd_rate=P_r_dd_rate,
+                          w_obs=P_w_obs, w_cont=P_w_cont,
+                          w_wall_buf=P_w_wall_buf, w_slack=P_w_slack,
+                          sigma_s_obs=P_sigma_s_obs,
+                          sigma_n_obs=P_sigma_n_obs,
+                          wall_buf=P_wall_buf, gap_lat=P_gap_lat)
         self._cost_exprs = dict(
             contour=J_contour, reg=J_reg, dd=J_dd, dd_rate=J_dd_rate,
             smooth_a=J_smooth_a, progress=J_progress,
@@ -459,6 +510,55 @@ class FrenetKinMPC:
         self._have_prev = False
         self._prev_de1 = 0.0
         self.warm = False
+
+    # Live-tunable weight attribute names. Every attribute listed here is
+    # bound to a matching opti.parameter() in setup() and pushed to the
+    # solver each solve() via set_value, so changing the attribute takes
+    # effect on the NEXT tick without any NLP rebuild.
+    LIVE_TUNABLE_WEIGHTS = (
+        'q_n', 'q_n_ramp',
+        'q_n_term', 'q_v_term', 'gamma',
+        'r_a', 'r_reg', 'r_dd', 'r_dd_rate',
+        'w_obs', 'w_side_bias', 'w_cont', 'w_wall_buf', 'w_slack',
+        'sigma_s_obs', 'sigma_n_obs',
+        'wall_buf', 'gap_lat',
+    )
+
+    def update_weights(self, **kwargs):
+        """Hot-swap cost weights / bubble shape without rebuilding the NLP.
+
+        Accepts any subset of LIVE_TUNABLE_WEIGHTS plus the alias
+        'gamma_progress' (mapped to 'gamma'). Unknown keys are ignored
+        with a one-shot warning so stale YAML / rqt fields do not crash.
+
+        Returns a dict of {name: (old, new)} for every attribute actually
+        changed, for logging.
+        """
+        changed = {}
+        for key, raw in kwargs.items():
+            attr = 'gamma' if key == 'gamma_progress' else key
+            if attr not in self.LIVE_TUNABLE_WEIGHTS:
+                warnings.warn(
+                    "[frenet_kin_solver.update_weights] unknown key %r — "
+                    "ignored" % key, stacklevel=2)
+                continue
+            try:
+                new = float(raw)
+            except (TypeError, ValueError):
+                warnings.warn(
+                    "[frenet_kin_solver.update_weights] non-numeric value "
+                    "for %r: %r — ignored" % (key, raw), stacklevel=2)
+                continue
+            old = float(getattr(self, attr))
+            if abs(old - new) > 1e-12:
+                setattr(self, attr, new)
+                changed[attr] = (old, new)
+        return changed
+
+    def get_weights(self):
+        """Current snapshot of every live-tunable weight. Used by the node
+        to seed rqt sliders without duplicating attribute names."""
+        return {k: float(getattr(self, k)) for k in self.LIVE_TUNABLE_WEIGHTS}
 
     def _build_wall_bounds(self, d_left_arr, d_right_arr):
         dL = np.asarray(d_left_arr, dtype=float)
@@ -652,6 +752,26 @@ class FrenetKinMPC:
         opti.set_value(P['bias_R'], bR)
         opti.set_value(P['n_prev'], n_prev)
         opti.set_value(P['cont_active'], cont_active)
+
+        # Push live-tunable cost weights every tick so rqt_reconfigure
+        # changes take effect on the next solve.
+        opti.set_value(P['q_n'],         self.q_n)
+        opti.set_value(P['q_n_ramp'],    self.q_n_ramp)
+        opti.set_value(P['q_n_term'],    self.q_n_term)
+        opti.set_value(P['q_v_term'],    self.q_v_term)
+        opti.set_value(P['gamma'],       self.gamma)
+        opti.set_value(P['r_a'],         self.r_a)
+        opti.set_value(P['r_reg'],       self.r_reg)
+        opti.set_value(P['r_dd'],        self.r_dd)
+        opti.set_value(P['r_dd_rate'],   self.r_dd_rate)
+        opti.set_value(P['w_obs'],       self.w_obs)
+        opti.set_value(P['w_cont'],      self.w_cont)
+        opti.set_value(P['w_wall_buf'],  self.w_wall_buf)
+        opti.set_value(P['w_slack'],     self.w_slack)
+        opti.set_value(P['sigma_s_obs'], max(self.sigma_s_obs, 1e-3))
+        opti.set_value(P['sigma_n_obs'], max(self.sigma_n_obs, 1e-3))
+        opti.set_value(P['wall_buf'],    self.wall_buf)
+        opti.set_value(P['gap_lat'],     self.gap_lat)
 
         # ---- warm start ----
         # Pass 2+ always re-seed (previous pass's debug values may be in

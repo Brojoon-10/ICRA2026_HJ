@@ -45,8 +45,14 @@ from f110_msgs.msg import (WpntArray, Wpnt, OTWpntArray,
                            ObstacleArray, OpponentTrajectory)
 
 # ### HJ : Phase 5 — dynamic_reconfigure (per-instance server).
+# MPCCost       : legacy MPCC / Frenet-D backends (rebuild on weight change)
+# FrenetKinCost : FrenetKin v3+ (opti.parameter() hot-swap; JIT stays warm)
 from dynamic_reconfigure.server import Server
 from mpc_planner.cfg import MPCCostConfig
+try:
+    from mpc_planner.cfg import FrenetKinCostConfig
+except ImportError:
+    FrenetKinCostConfig = None
 
 # Import solver from sibling src/ directory
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -73,7 +79,37 @@ except Exception as _e:  # pragma: no cover
 else:
     _debug_logger_import_err = None
 
-_VALID_STATES = ('overtake', 'recovery', 'observe')
+_VALID_STATES = ('overtake', 'recovery', 'observe', 'auto')
+
+# ### HJ : Phase X (refactored) — 2-state MPC FSM for state:=auto.
+#   WITH_OBS : obstacle within horizon. Solver runs with full obstacle cost
+#              + SideDecider (LEFT/RIGHT/TRAIL/CLEAR). OVERTAKE AND TRAIL
+#              behaviour both emerge from this cost mix — SideDecider picks
+#              TRAIL when passing isn't feasible, capping v_max to follow
+#              instead of force-passing.
+#   NO_OBS   : no obstacle in horizon. Solver runs with obstacle cost off +
+#              strong n→0 / GB tracking weights (converge-to-raceline).
+#
+# Mode transitions are DISCRETE (obs enters/exits horizon) but output is
+# kept CONTINUOUS via:
+#   (a) weight alpha ramp over K_trans ticks (w_t = (1-α)·W_with_obs + α·W_no_obs)
+#   (b) warm-start seed carry-over (mode flip does not reset x_sol / u_sol)
+#   (c) tick-to-tick path continuity guard on published wpnts
+#
+# Single MPC output — always publishes to /planner/mpc/wpnts (attach mode).
+# The solver output trajectory inherently converges to n≈0 in NO_OBS and
+# naturally deflects around obstacles in WITH_OBS. SM picks "GB or MPC"
+# downstream; this node never "stops" solving.
+MPC_MODE_WITH_OBS = 'WITH_OBS'
+MPC_MODE_NO_OBS = 'NO_OBS'
+_MPC_MODES = (MPC_MODE_WITH_OBS, MPC_MODE_NO_OBS)
+
+# Legacy aliases (deprecated; kept so any stale reference maps to the nearest
+# current mode rather than crashing). Remove once all consumers are migrated.
+MPC_MODE_IDLE = MPC_MODE_NO_OBS
+MPC_MODE_OVERTAKE = MPC_MODE_WITH_OBS
+MPC_MODE_TRANSITION_OT2RC = MPC_MODE_WITH_OBS
+MPC_MODE_RECOVERY = MPC_MODE_NO_OBS
 
 
 class MPCPlannerStateNode:
@@ -203,6 +239,22 @@ class MPCPlannerStateNode:
             wall_safe=float(rospy.get_param('~wall_safe', 0.15)),
             inflation=float(rospy.get_param('~boundary_inflation', 0.05)),
         )
+        ### HJ : obstacle half_width source for SideDecider feasibility math.
+        ###      "fixed" — use _obs_half_fixed unconditionally (conservative)
+        ###      "msg"   — use obstacle.size / 2 from prediction (per-obstacle)
+        ###      Switch in real-time via yaml + reload.
+        self._obs_size_source = str(
+            rospy.get_param('~obstacle_size_source', 'fixed')).lower()
+        self._obs_half_fixed = float(
+            rospy.get_param('~obstacle_half_width_fixed', 0.15))
+        self._obs_half_min = float(
+            rospy.get_param('~obstacle_half_min', 0.05))
+        if self._obs_size_source not in ('fixed', 'msg'):
+            rospy.logwarn(
+                '[mpc] obstacle_size_source=%r invalid; using "fixed"',
+                self._obs_size_source)
+            self._obs_size_source = 'fixed'
+        ### HJ : end
         self._last_side_int = SIDE_CLEAR
         self._last_side_str = 'clear'
         self._last_side_scores = {}
@@ -374,16 +426,191 @@ class MPCPlannerStateNode:
             '~timing_ms', Float32, queue_size=1)
 
         # -- Publishers (role-specific) --------------------------------------
-        # Launch file remaps ~out/otwpnts → /planner/avoidance/otwpnts_observation
-        # and ~out/wpnts → /planner/recovery/wpnts_observation (Phase 1~6).
+        # ### HJ : Phase X (refactored) — unified MPC output topic.
+        #   ~out/mpc_wpnts → /planner/mpc/wpnts                (attach mode)
+        #                 → /planner/mpc/wpnts_observation     (observation mode)
+        # Single publisher for all roles (overtake / recovery / auto). The
+        # OTWpntArray.ot_line field carries the semantic tag so SM can label
+        # by behaviour without needing multiple topics.
+        # Legacy ~out/otwpnts and ~out/wpnts are kept as optional second
+        # publishers for backward-compat rollout but the standard path is
+        # the unified topic.
+        self.pub_mpc = None
+        self.pub_ot = None
+        self.pub_rc = None
+        if self.state in ('overtake', 'recovery', 'auto'):
+            self.pub_mpc = rospy.Publisher(
+                '~out/mpc_wpnts', OTWpntArray, queue_size=1)
+        # Legacy dual topics — left unremapped by default (no-op unless a
+        # launch explicitly re-enables them). Kept so a rollback to Phase 1/2
+        # observation plumbing is possible without touching code.
         if self.state == 'overtake':
-            self.pub_out = rospy.Publisher(
+            self.pub_ot = rospy.Publisher(
                 '~out/otwpnts', OTWpntArray, queue_size=1)
         elif self.state == 'recovery':
-            self.pub_out = rospy.Publisher(
+            self.pub_rc = rospy.Publisher(
                 '~out/wpnts', WpntArray, queue_size=1)
+        self.pub_out = self.pub_mpc   # primary role publisher
+
+        # ### HJ : Phase X (refactored) — initial FSM state pinned by launch.
+        if self.state == 'overtake':
+            self._mpc_mode = MPC_MODE_WITH_OBS
+        elif self.state == 'recovery':
+            self._mpc_mode = MPC_MODE_NO_OBS
         else:
-            self.pub_out = None
+            # 'auto' and 'observe' start in NO_OBS (safe convergent solve).
+            self._mpc_mode = MPC_MODE_NO_OBS
+        self._prev_mpc_mode = self._mpc_mode
+        self._mode_dwell = 0
+        self._alpha_ramp = (0.0 if self._mpc_mode == MPC_MODE_WITH_OBS else 1.0)
+
+        # ### HJ : Phase X (refactored) FSM knobs.
+        # Only mode_dwell_min_ticks + K_trans + horizon_s_pred remain used.
+        # n_recovery_trigger / n_recovery_exit / n_idle_ok are kept (read-only
+        # legacy) — the MPC itself no longer branches on ego_n; that decision
+        # now lives in the SM (path source picker). We expose them so yaml
+        # stays backward-compat but default to unused values.
+        self._n_recovery_trigger = float(
+            rospy.get_param('~n_recovery_trigger', 0.15))
+        self._n_recovery_exit = float(
+            rospy.get_param('~n_recovery_exit', 0.08))
+        self._n_idle_ok = float(
+            rospy.get_param('~n_idle_ok', 0.08))
+        self._mode_dwell_min_ticks = int(
+            rospy.get_param('~mode_dwell_min_ticks', 2))
+        self._K_trans = int(
+            rospy.get_param('~K_trans', 8))
+        self._ttc_critical_s = float(
+            rospy.get_param('~ttc_critical_s', 1.5))
+        self._horizon_s_pred = float(
+            rospy.get_param('~horizon_s_pred', 8.0))
+        # ### HJ : 2026-04-24 — asymmetric distance hysteresis on the mode
+        # switch. Previously a single `horizon_s_pred` controlled BOTH cost
+        # scope and mode entry → MPC entered WITH_OBS too early (at 8m) and
+        # crawled compared to GB which flies through. User directive:
+        # enter WITH_OBS only when obstacle is close (≤ 5m), exit back to
+        # NO_OBS when it fades past 10m or tracking is stale.
+        self._obs_enter_dist_m = float(
+            rospy.get_param('~obs_enter_dist_m', 5.0))
+        self._obs_exit_dist_m = float(
+            rospy.get_param('~obs_exit_dist_m', 10.0))
+
+        # ### HJ : 2026-04-24 — adaptive recovery q_n boost.
+        # When ego is close to GB (|ego_n| < thresh), boost stage q_n
+        # beyond the NO_OBS profile value so EARLY horizon also converges
+        # to GB (not just the ramp-enforced terminal). Zero boost when
+        # |ego_n| >= thresh so large deviations still get a smooth curve.
+        # Only active in MPC_MODE_NO_OBS (recovery) — doesn't interfere
+        # with WITH_OBS obstacle avoidance.
+        self._q_n_near_boost = float(
+            rospy.get_param('~q_n_near_boost', 30.0))
+        self._q_n_near_thresh = float(
+            rospy.get_param('~q_n_near_thresh', 0.15))
+        self._last_q_n_boost_applied = 0.0
+
+        # ### HJ : 2026-04-24 — prediction variance aware obstacle bubble.
+        # When enabled, σ_s_obs and σ_n_obs are inflated per tick based on
+        # max(vs_var, vd_var) over active obstacles using a worst-case end-
+        # of-horizon propagation (σ_eff = √(σ_base² + var · (N·dT)²)).
+        # Wider bubble when predictor is uncertain → more defensive.
+        # Launch arg `use_pred_variance:=true` to turn on.
+        self._use_pred_variance = bool(
+            rospy.get_param('~use_pred_variance', False))
+        # Snapshot YAML-defined base sigmas so we can invert the inflation
+        # cleanly if use_pred_variance is toggled at runtime.
+        self._sigma_s_obs_base = float(
+            rospy.get_param('~sigma_s_obs', 0.7))
+        self._sigma_n_obs_base = float(
+            rospy.get_param('~sigma_n_obs', 0.35))
+        # Populated each tick by _build_obstacle_array_frenet.
+        self._last_obs_max_vs_var = 0.0
+        self._last_obs_max_vd_var = 0.0
+        self._last_sigma_s_eff = self._sigma_s_obs_base
+        self._last_sigma_n_eff = self._sigma_n_obs_base
+
+        # Densified output step (match GB waypoints_dist = 0.1 m so SM slicer
+        # and controller lookahead see a familiar spacing).
+        self._mpc_output_ds = float(
+            rospy.get_param('~mpc_output_ds', 0.1))
+        # Densify toggle — user directive 2026-04-24 (second iteration): the
+        # solver's time-parametrised output produces uneven spatial spacing
+        # (Δs varies with v_k per step). Re-enable post-densify so SM +
+        # vel_planner_25d see equispaced 0.1 m grid and compute a smoother
+        # velocity profile. Set ~mpc_densify_enable:=false to revert to raw.
+        self._mpc_densify_enable = bool(
+            rospy.get_param('~mpc_densify_enable', True))
+
+        # ### HJ : Phase X — weight profile for NO_OBS mode (hot-swap via
+        # FrenetKinMPC.update_weights). Loaded from YAML `no_obs_profile:`.
+        # WITH_OBS mode uses the top-level YAML (state_overtake.yaml) values
+        # exactly as before — that's the baseline captured lazily.
+        no_obs_profile = rospy.get_param('~no_obs_profile', {}) or {}
+        if not isinstance(no_obs_profile, dict):
+            rospy.logwarn('[mpc] ~no_obs_profile must be a dict — ignored.')
+            no_obs_profile = {}
+        # Accept legacy key name for one release so existing YAMLs keep working.
+        if not no_obs_profile:
+            legacy = rospy.get_param('~recovery_nlp_profile', {}) or {}
+            if isinstance(legacy, dict) and legacy:
+                no_obs_profile = legacy
+                rospy.loginfo('[mpc] using legacy ~recovery_nlp_profile as ~no_obs_profile')
+        # ### HJ : 2026-04-24 — filter unknown keys BEFORE building the
+        # profile dict. Stale rosparams (e.g. `r_steer_reg` from prior
+        # launches) can linger on the ROS master even after the YAML is
+        # cleaned up, since <rosparam load> MERGES rather than replaces.
+        # Filtering here avoids the update_weights UserWarning spam and
+        # makes the node resilient to stale master state.
+        _allowed_keys = set(getattr(FrenetKinMPC, 'LIVE_TUNABLE_WEIGHTS', ()))
+        _allowed_keys.add('gamma_progress')   # alias → gamma
+        filtered = {}
+        dropped = []
+        for k, v in no_obs_profile.items():
+            if k in _allowed_keys:
+                filtered[str(k)] = float(v)
+            else:
+                dropped.append(k)
+        if dropped:
+            rospy.logwarn(
+                '[mpc] ~no_obs_profile has unknown keys %s (likely stale rosparam); dropping.',
+                sorted(dropped))
+        self._no_obs_weights = filtered
+        # Lazy snapshot of WITH_OBS baseline (user-tuned values from rqt).
+        self._with_obs_baseline_weights = None
+        self._last_applied_weight_alpha = None
+
+        # Speed painter parameters (Phase 3).
+        self._painter_enable = bool(
+            rospy.get_param('~painter_enable', True))
+        self._painter_n_near = float(
+            rospy.get_param('~painter_n_near', 0.15))
+        self._painter_K_blend = int(
+            rospy.get_param('~painter_K_blend', 10))
+        self._painter_a_max = float(
+            rospy.get_param('~painter_a_max', 3.0))
+
+        # Path continuity guard parameters (Phase 1.5).
+        self._continuity_guard_enable = bool(
+            rospy.get_param('~continuity_guard_enable', True))
+        self._continuity_K_guard = int(
+            rospy.get_param('~continuity_K_guard', 5))
+        self._continuity_threshold_m = float(
+            rospy.get_param('~continuity_threshold_m', 0.15))
+        self._last_published_wpnts = None   # list[Wpnt] cache for L2 check
+        self._last_published_mode = None
+        self._last_continuity_L2 = 0.0
+        self._last_path_blend_applied = False
+        self._last_painter_seam_idx = -1
+        self._last_painter_blend_applied = False
+        self._last_painter_vx_first_delta = 0.0
+
+        # GB vx cache for speed painter (s-based lookup; xy-roundtrip forbidden).
+        self._gb_vx_by_s_s = None   # sorted 1-D array of s_m values
+        self._gb_vx_by_s_v = None   # matching vx_mps values
+
+        # Mode transition bookkeeping for tick_json.
+        self._last_ttc_min = float('inf')
+        self._last_obs_in_horizon = False
+        self._last_min_obs_ds = float('inf')
 
         # -- Subscribers ------------------------------------------------------
         rospy.Subscriber('/global_waypoints', WpntArray, self._global_wpnts_cb, queue_size=1)
@@ -434,9 +661,21 @@ class MPCPlannerStateNode:
         self.g_kappa = np.array([getattr(w, 'kappa_radpm', 0.0) for w in wpnts], dtype=float)
         self.g_dleft = np.array([w.d_left for w in wpnts], dtype=float)
         self.g_dright = np.array([w.d_right for w in wpnts], dtype=float)
+        ### HJ : centerline tangent at the foot used to measure d_left/d_right.
+        ###      d_left/d_right are now centerline-normal distances (raceline-anchored).
+        ###      Solver's |n[k]| <= corridor expects RACELINE-normal limits, so we apply
+        ###      d_eff = d / cos(psi_rad - psi_centerline_rad) at slice time.
+        self.g_psi_center = np.array(
+            [getattr(w, 'psi_centerline_rad', w.psi_rad) for w in wpnts], dtype=float)
+        ### HJ : end
         self.g_vx = np.array([w.vx_mps for w in wpnts], dtype=float)
         self.g_mu = np.array([getattr(w, 'mu_rad', 0.0) for w in wpnts], dtype=float)
         self.track_length = float(self.g_s[-1])
+
+        # ### HJ : Phase X — GB vx cache (s-based lookup for speed painter).
+        # 3D rule: never xy→frenet round-trip. Use solver/lifter's s directly.
+        self._gb_vx_by_s_s = self.g_s.copy()
+        self._gb_vx_by_s_v = self.g_vx.copy()
 
         # ### HJ : Phase 2 — raceline-base lifter (no Track3D; see module
         # docstring for the centerline/raceline mismatch rationale).
@@ -455,20 +694,29 @@ class MPCPlannerStateNode:
         # _weight_cb once with .cfg defaults to prime the server — we must
         # suppress rebuild BEFORE constructing, then push our YAML-loaded
         # values back into rqt in one shot.
-        # ### HJ : skip dynreg server for frenet_kin backend — MPCCost.cfg
-        # fields are tied to legacy frenet_d/xy solver attributes. frenet_kin
-        # uses YAML-only tuning; a dedicated FrenetKinCost.cfg is TODO.
-        if self.solver_backend == 'frenet_kin':
-            self._dyn_srv = None
-            rospy.loginfo('[mpc][%s] dynreg server skipped (solver_backend=frenet_kin; '
-                          'tune via state_*.yaml + node restart)', rospy.get_name())
-        else:
-            self._suppress_dynreg_cb = True
-            try:
+        # frenet_kin uses FrenetKinCostConfig (hot-swap via opti.parameter);
+        # legacy backends keep MPCCostConfig (rebuild on weight change).
+        self._suppress_dynreg_cb = True
+        try:
+            if self.solver_backend == 'frenet_kin':
+                if FrenetKinCostConfig is None:
+                    rospy.logwarn(
+                        '[mpc][%s] FrenetKinCost cfg not built yet — '
+                        'rqt tuning disabled. Run catkin build mpc_planner.',
+                        rospy.get_name())
+                    self._dyn_srv = None
+                else:
+                    self._dyn_srv = Server(
+                        FrenetKinCostConfig, self._weight_cb_kin)
+                    self._push_params_to_dynreg_kin()
+                    rospy.loginfo(
+                        '[mpc][%s] FrenetKinCost dynreg server ready — '
+                        'live tuning enabled (JIT-safe).', rospy.get_name())
+            else:
                 self._dyn_srv = Server(MPCCostConfig, self._weight_cb)
                 self._push_params_to_dynreg()
-            finally:
-                self._suppress_dynreg_cb = False
+        finally:
+            self._suppress_dynreg_cb = False
 
         self._publish_status('INIT_OK')
         rospy.loginfo('[mpc][%s] solver ready: %d waypoints, track=%.1fm',
@@ -520,7 +768,12 @@ class MPCPlannerStateNode:
 
     def _pick_obs_source(self):
         """Return (ObstacleArray, 'predict'|'track'|'none'). Prediction wins
-        when fresh; tracking is fallback; otherwise signal cost-off."""
+        when fresh; tracking is fallback; otherwise signal cost-off.
+
+        DEPRECATED for planning: use _merge_obs_sources instead so we don't
+        lose static obstacles (which only appear in tracking) when dynamic
+        prediction is fresh. Kept for legacy xy-backend path.
+        """
         if self._is_fresh(self._obs_predict_t) and \
            self._obs_predict is not None and self._obs_predict.obstacles:
             return self._obs_predict, 'predict'
@@ -528,6 +781,53 @@ class MPCPlannerStateNode:
            self._obs_track is not None and self._obs_track.obstacles:
             return self._obs_track, 'track'
         return None, 'none'
+
+    def _merge_obs_sources(self):
+        """### HJ : 2026-04-25 — fuse prediction + tracking obstacle streams.
+
+        User reported: when dynamic obstacle + static obstacle coexist, MPC
+        was tracking only the dynamic one. Root cause: _pick_obs_source
+        returns prediction XOR tracking. Prediction topic typically carries
+        only the opponent (dynamic) obstacle — static obstacles live in the
+        tracking topic. Selecting prediction alone silently drops static.
+
+        Fix: merge both sources. Dedupe by obstacle `id` (prediction wins —
+        it carries the propagated trajectory for that obstacle). Return list
+        of Obstacle msgs + a human-readable tag like 'merge:P1+T2'.
+        """
+        pred_fresh = (self._is_fresh(self._obs_predict_t)
+                      and self._obs_predict is not None
+                      and len(self._obs_predict.obstacles) > 0)
+        track_fresh = (self._is_fresh(self._obs_track_t)
+                       and self._obs_track is not None
+                       and len(self._obs_track.obstacles) > 0)
+        if not pred_fresh and not track_fresh:
+            return [], 'none'
+
+        out = []
+        seen_ids = set()
+        n_p = 0
+        n_t = 0
+        # Prediction first — if the same id is in tracking too, prediction
+        # version (with vs/vd from GP/propagation) is preferred.
+        if pred_fresh:
+            for o in self._obs_predict.obstacles:
+                oid = int(getattr(o, 'id', -1))
+                if oid in seen_ids:
+                    continue
+                out.append(o)
+                seen_ids.add(oid)
+                n_p += 1
+        if track_fresh:
+            for o in self._obs_track.obstacles:
+                oid = int(getattr(o, 'id', -1))
+                if oid != -1 and oid in seen_ids:
+                    continue   # id already from prediction
+                out.append(o)
+                seen_ids.add(oid)
+                n_t += 1
+        tag = 'merge:P%d+T%d' % (n_p, n_t)
+        return out, tag
 
     def _extrapolate_obs_traj(self, obs, N, dT):
         """Expand one Obstacle into (N, 2) Cartesian trajectory.
@@ -619,18 +919,28 @@ class MPCPlannerStateNode:
         obs_arr = np.zeros((self.n_obs_max, N_plus_1, 3), dtype=np.float64)
         obs_arr[:, :, 0] = far  # s
         obs_arr[:, :, 1] = far  # n (far lateral too, harmless)
+        ### HJ : per-slot half_width sidecar — populated according to
+        ###      obstacle_size_source (fixed | msg). Fixed default keeps the
+        ###      pre-2026-04-26 behaviour.
+        self._obs_half_arr = np.full(self.n_obs_max,
+                                     self._obs_half_fixed, dtype=np.float64)
+        ### HJ : end
 
         if self.collision_mode == 'none' or self.w_obstacle <= 0.0:
             return obs_arr, 'disabled'
 
-        src, tag = self._pick_obs_source()
-        if tag == 'none':
+        # ### HJ : 2026-04-25 — use merged source (prediction + tracking) so
+        # dynamic + static obstacles coexist in one obs_arr. Was: prediction
+        # XOR tracking, which silently dropped static obstacles whenever an
+        # opponent was being predicted.
+        merged_obs, tag = self._merge_obs_sources()
+        if tag == 'none' or len(merged_obs) == 0:
             return obs_arr, 'stale'
 
         def fwd_dist(o):
             return (o.s_center - ego_s) % tl
 
-        obs_list = sorted(src.obstacles, key=fwd_dist)
+        obs_list = sorted(merged_obs, key=fwd_dist)
         obs_list = [o for o in obs_list if fwd_dist(o) < 0.5 * tl]
         # ### HJ : dedup near-duplicate obstacles (prediction+detection race can
         # emit the same object twice within ~0.5m s and ~0.1m d). Keeping both
@@ -651,6 +961,8 @@ class MPCPlannerStateNode:
         self._last_n_obs_raw = n_obs_raw
 
         n_used = 0
+        max_vs_var = 0.0
+        max_vd_var = 0.0
         for o in obs_list:
             if n_used >= self.n_obs_max:
                 break
@@ -672,13 +984,221 @@ class MPCPlannerStateNode:
                     obs_arr[n_used, k, 0] = s0 + vs * k * dT
                     obs_arr[n_used, k, 1] = d0 + vd * k * dT
             obs_arr[n_used, :, 2] = self.w_obstacle
+            ### HJ : per-slot half_width selection.
+            if self._obs_size_source == 'msg':
+                size_raw = float(getattr(o, 'size', 0.0) or 0.0)
+                self._obs_half_arr[n_used] = max(size_raw * 0.5, self._obs_half_min)
+            else:  # 'fixed'
+                self._obs_half_arr[n_used] = self._obs_half_fixed
+            ### HJ : end
+            # ### HJ : 2026-04-24 — collect prediction variance for
+            # use_pred_variance. `s_var/d_var/vs_var/vd_var` may be zero
+            # (static obs, or predictor doesn't fill them). getattr defaults
+            # to 0 → no inflation contribution.
+            max_vs_var = max(max_vs_var, float(getattr(o, 'vs_var', 0.0) or 0.0))
+            max_vd_var = max(max_vd_var, float(getattr(o, 'vd_var', 0.0) or 0.0))
             n_used += 1
+
+        self._last_obs_max_vs_var = max_vs_var
+        self._last_obs_max_vd_var = max_vd_var
 
         if n_used == 0:
             return obs_arr, 'empty'
         return obs_arr, '%s:%d' % (tag, n_used)
 
     # ---------------------------------------------------------------- dynamic_reconfigure
+    # ---- FrenetKin live-tune (opti.parameter() hot-swap, JIT-safe) ---------
+    def _push_params_to_dynreg_kin(self):
+        """Seed FrenetKinCost sliders with the current solver / node values
+        so the first rqt connect doesn't snap to .cfg defaults."""
+        if self._dyn_srv is None:
+            return
+        self._suppress_dynreg_cb = True
+        try:
+            w = self.solver.get_weights()
+            cfg_vals = {
+                # cost weights (live)
+                'q_n':            w['q_n'],
+                'q_n_term':       w['q_n_term'],
+                'q_v_term':       w['q_v_term'],
+                'gamma_progress': w['gamma'],
+                'r_a':            w['r_a'],
+                'r_steer_reg':    w['r_reg'],
+                'r_dd':           w['r_dd'],
+                'r_dd_rate':      w['r_dd_rate'],
+                'w_obs':          w['w_obs'],
+                'sigma_s_obs':    w['sigma_s_obs'],
+                'sigma_n_obs':    w['sigma_n_obs'],
+                'w_side_bias':    w['w_side_bias'],
+                'gap_lat':        w['gap_lat'],
+                'w_wall_buf':     w['w_wall_buf'],
+                'wall_buf':       w['wall_buf'],
+                'w_slack':        w['w_slack'],
+                'w_cont':         w['w_cont'],
+                # fallback (node-side)
+                'fail_streak_H':   int(self._fail_tier_H),
+                'quintic_delta_s': float(self._quintic_delta_s),
+                # one-shot triggers off by default
+                'save_params':  False,
+                'reset_params': False,
+            }
+            self._dyn_srv.update_configuration(cfg_vals)
+        finally:
+            self._suppress_dynreg_cb = False
+
+    def _weight_cb_kin(self, config, level):
+        """rqt callback for FrenetKinCostConfig. Updates solver weights
+        via self.solver.update_weights() — no NLP rebuild."""
+        # one-shot save/reset, same pattern as legacy callback.
+        if config.save_params:
+            self._save_yaml_kin(config)
+            config.save_params = False
+        if config.reset_params:
+            new_cfg = self._reload_yaml_kin()
+            if new_cfg is not None:
+                for k, v in new_cfg.items():
+                    if hasattr(config, k):
+                        setattr(config, k, v)
+                rospy.loginfo('[mpc][%s][reset] reloaded YAML: %s',
+                              rospy.get_name(), self.instance_yaml_path)
+            config.reset_params = False
+
+        # Hot-swap cost weights. Maps rqt keys -> solver attribute names.
+        updates = {
+            'q_n':         float(config.q_n),
+            'q_n_term':    float(config.q_n_term),
+            'q_v_term':    float(config.q_v_term),
+            'gamma':       float(config.gamma_progress),
+            'r_a':         float(config.r_a),
+            'r_reg':       float(config.r_steer_reg),
+            'r_dd':        float(config.r_dd),
+            'r_dd_rate':   float(config.r_dd_rate),
+            'w_obs':       float(config.w_obs),
+            'sigma_s_obs': float(config.sigma_s_obs),
+            'sigma_n_obs': float(config.sigma_n_obs),
+            'w_side_bias': float(config.w_side_bias),
+            'gap_lat':     float(config.gap_lat),
+            'w_wall_buf':  float(config.w_wall_buf),
+            'wall_buf':    float(config.wall_buf),
+            'w_slack':     float(config.w_slack),
+            'w_cont':      float(config.w_cont),
+        }
+        changed = self.solver.update_weights(**updates)
+
+        # Fallback tuning (node-side, no solver touch).
+        self._fail_tier_H = int(config.fail_streak_H)
+        self._quintic_delta_s = float(config.quintic_delta_s)
+
+        if changed and not self._suppress_dynreg_cb:
+            rospy.loginfo_throttle(
+                1.0,
+                '[mpc][%s][kin-tune] %d weight(s) hot-swapped: %s',
+                rospy.get_name(), len(changed),
+                ', '.join('%s=%.3g' % (k, v[1]) for k, v in changed.items()))
+        return config
+
+    def _save_yaml_kin(self, config):
+        """Dump current rqt slider values to self.instance_yaml_path. Keeps
+        unrelated YAML keys untouched (non-dynreg node params survive)."""
+        path = getattr(self, 'instance_yaml_path', None)
+        if not path:
+            rospy.logwarn('[mpc][%s][save] instance_yaml_path unset',
+                          rospy.get_name())
+            return
+        try:
+            with open(path, 'r') as f:
+                data = yaml.safe_load(f) or {}
+        except Exception as exc:
+            rospy.logwarn('[mpc][%s][save] failed to read %s: %s',
+                          rospy.get_name(), path, exc)
+            data = {}
+
+        # keys we own in FrenetKinCost.cfg -> YAML keys (identical names
+        # except gamma_progress which stays gamma_progress in YAML).
+        dump_keys = (
+            'q_n', 'q_n_term', 'q_v_term', 'gamma_progress',
+            'r_a', 'r_steer_reg', 'r_dd', 'r_dd_rate',
+            'w_obs', 'sigma_s_obs', 'sigma_n_obs',
+            'w_side_bias', 'gap_lat',
+            'w_wall_buf', 'wall_buf',
+            'w_slack', 'w_cont',
+            'fail_streak_H', 'quintic_delta_s',
+        )
+        for key in dump_keys:
+            if hasattr(config, key):
+                val = getattr(config, key)
+                data[key] = (int(val) if isinstance(val, bool) or
+                             key == 'fail_streak_H' else float(val))
+        try:
+            with open(path, 'w') as f:
+                yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+            rospy.loginfo('[mpc][%s][save] wrote %d keys to %s',
+                          rospy.get_name(), len(dump_keys), path)
+        except Exception as exc:
+            rospy.logwarn('[mpc][%s][save] failed to write %s: %s',
+                          rospy.get_name(), path, exc)
+
+    def _reload_yaml_kin(self):
+        """Re-read the instance YAML and return a dict of rqt-slider values.
+        Missing keys fall back to the live solver state so the UI doesn't
+        get wiped to zero when the YAML is partial."""
+        path = getattr(self, 'instance_yaml_path', None)
+        if not path:
+            return None
+        try:
+            with open(path, 'r') as f:
+                data = yaml.safe_load(f) or {}
+        except Exception as exc:
+            rospy.logwarn('[mpc][%s][reset] failed to read %s: %s',
+                          rospy.get_name(), path, exc)
+            return None
+
+        w = self.solver.get_weights()
+        def pick(yaml_key, fallback):
+            v = data.get(yaml_key, None)
+            return float(v) if v is not None else float(fallback)
+
+        out = {
+            'q_n':            pick('q_n', w['q_n']),
+            'q_n_term':       pick('q_n_term', w['q_n_term']),
+            'q_v_term':       pick('q_v_term', w['q_v_term']),
+            'gamma_progress': pick('gamma_progress', w['gamma']),
+            'r_a':            pick('r_a', w['r_a']),
+            'r_steer_reg':    pick('r_steer_reg', w['r_reg']),
+            'r_dd':           pick('r_dd', w['r_dd']),
+            'r_dd_rate':      pick('r_dd_rate', w['r_dd_rate']),
+            'w_obs':          pick('w_obs', w['w_obs']),
+            'sigma_s_obs':    pick('sigma_s_obs', w['sigma_s_obs']),
+            'sigma_n_obs':    pick('sigma_n_obs', w['sigma_n_obs']),
+            'w_side_bias':    pick('w_side_bias', w['w_side_bias']),
+            'gap_lat':        pick('gap_lat', w['gap_lat']),
+            'w_wall_buf':     pick('w_wall_buf', w['w_wall_buf']),
+            'wall_buf':       pick('wall_buf', w['wall_buf']),
+            'w_slack':        pick('w_slack', w['w_slack']),
+            'w_cont':         pick('w_cont', w['w_cont']),
+            'fail_streak_H':   int(data.get('fail_streak_H',
+                                            self._fail_tier_H)),
+            'quintic_delta_s': float(data.get('quintic_delta_s',
+                                              self._quintic_delta_s)),
+        }
+        # Apply reloaded cost weights to the live solver so the next solve
+        # picks them up even before rqt pushes them back to the sliders.
+        self.solver.update_weights(
+            q_n=out['q_n'], q_n_term=out['q_n_term'],
+            q_v_term=out['q_v_term'], gamma=out['gamma_progress'],
+            r_a=out['r_a'], r_reg=out['r_steer_reg'],
+            r_dd=out['r_dd'], r_dd_rate=out['r_dd_rate'],
+            w_obs=out['w_obs'], sigma_s_obs=out['sigma_s_obs'],
+            sigma_n_obs=out['sigma_n_obs'],
+            w_side_bias=out['w_side_bias'], gap_lat=out['gap_lat'],
+            w_wall_buf=out['w_wall_buf'], wall_buf=out['wall_buf'],
+            w_slack=out['w_slack'], w_cont=out['w_cont'],
+        )
+        self._fail_tier_H = out['fail_streak_H']
+        self._quintic_delta_s = out['quintic_delta_s']
+        return out
+
+    # ---- Legacy MPCC / Frenet-D callback (rebuild on weight change) -------
     def _push_params_to_dynreg(self):
         """Seed rqt sliders with the rosparam-loaded values so the first
         connect doesn't snap to .cfg defaults and silently overwrite YAML."""
@@ -1008,19 +1528,470 @@ class MPCPlannerStateNode:
             # d_L, d_R at the obstacle's s (use nearest ref_slice index)
             k_near = int(np.argmin(np.abs(rs - s0)))
             k_near = int(np.clip(k_near, 0, N_plus_1 - 1))
+            ### HJ : per-slot half_width from obs_size_source. Falls back to
+            ###      _obs_half_fixed when sidecar unavailable (e.g. legacy backend).
+            try:
+                half_w = float(self._obs_half_arr[o])
+            except (AttributeError, IndexError):
+                half_w = float(self._obs_half_fixed)
             obs_list.append({
                 's0': s0, 'n0': n0, 'v_s_obs': v_s_obs,
-                'half_width': 0.15,      # conservative ego-like half width
+                'half_width': half_w,
                 'd_L': float(dL_ref[k_near]),
                 'd_R': float(dR_ref[k_near]),
                 'ref_v': float(ref_slice['ref_v'][k_near]),
             })
+            ### HJ : end
         # sort by forward distance (smallest s0 first assuming ref_s is
         # monotone forward from ego — which _slice_local_ref guarantees)
         obs_list.sort(key=lambda d: d['s0'])
 
         ego_v = float(getattr(self, 'car_vx', 0.0))
         return self.side_decider.decide(ego_v, obs_list)
+
+    # ---------------------------------------------------------------- Phase X FSM
+    def _obs_in_horizon_and_ttc(self, obs_arr, ego_s, ego_v):
+        """Return (min_ds, ttc_min) over active obstacles.
+
+        min_ds : minimum FORWARD s-distance to any active obstacle (infinity
+                 if no active obstacle or tracking stale). This replaces the
+                 previous boolean "in horizon" gate — the caller
+                 (_update_mpc_mode) applies asymmetric enter/exit distance
+                 thresholds for the mode-switch hysteresis.
+        ttc_min: same as before (min time-to-collision).
+        """
+        if obs_arr is None or obs_arr.shape[0] == 0:
+            return float('inf'), float('inf')
+        min_ds = float('inf')
+        ttc_min = float('inf')
+        for o in range(obs_arr.shape[0]):
+            w_ts = obs_arr[o, :, 2]
+            if float(np.max(w_ts)) <= 0.0:
+                continue   # inactive slot (stale / dedup / out-of-range)
+            s0 = float(obs_arr[o, 0, 0])
+            sN = float(obs_arr[o, -1, 0])
+            ds = s0 - ego_s
+            if ds < 0.0:
+                ds += self.track_length   # wrap
+            if ds < min_ds:
+                min_ds = ds
+            v_obs = (sN - s0) / max(self.N * self.dT, 1e-3)
+            v_rel = max(ego_v - v_obs, 0.1)
+            ttc = max(ds, 0.0) / v_rel
+            if ttc < ttc_min:
+                ttc_min = ttc
+        return min_ds, ttc_min
+
+    def _update_mpc_mode(self, ego_n, side_int, min_obs_ds, ttc_min):
+        """Run the MPC internal 2-state FSM (WITH_OBS / NO_OBS).
+
+        Uses asymmetric distance hysteresis on `min_obs_ds` (min forward
+        s-distance to any active obstacle):
+            enter_dist < exit_dist    (e.g. 5 m / 10 m)
+            NO_OBS → WITH_OBS:  min_obs_ds < enter_dist
+            WITH_OBS → NO_OBS:  min_obs_ds > exit_dist   (or tracking stale
+                                                          → min_obs_ds = inf)
+        This lets GB tracking run at full speed until the opponent is
+        actually close, while preventing flip-flop at the boundary.
+
+        alpha_ramp keeps the solver cost blend continuous across the flip.
+        """
+        if self.state != 'auto':
+            self._mode_dwell += 1
+            self._alpha_ramp = (0.0 if self._mpc_mode == MPC_MODE_WITH_OBS
+                                else 1.0)
+            self._last_ttc_min = float(ttc_min)
+            self._last_obs_in_horizon = bool(min_obs_ds < self._obs_enter_dist_m)
+            self._last_min_obs_ds = float(min_obs_ds)
+            return
+
+        prev = self._mpc_mode
+
+        # ### HJ : 2026-04-24 — asymmetric enter/exit hysteresis (RESTORED).
+        # Approach: stays NO_OBS until obs reaches obs_enter_dist_m (5 m).
+        # Recede:  stays WITH_OBS until obs exceeds obs_exit_dist_m (10 m).
+        # Stale / no obstacle: min_obs_ds = inf → WITH_OBS cannot be entered,
+        # and if already WITH_OBS, exits immediately (inf > exit_dist).
+        if prev == MPC_MODE_WITH_OBS:
+            target = (MPC_MODE_NO_OBS if min_obs_ds > self._obs_exit_dist_m
+                      else MPC_MODE_WITH_OBS)
+        else:
+            target = (MPC_MODE_WITH_OBS if min_obs_ds < self._obs_enter_dist_m
+                      else MPC_MODE_NO_OBS)
+
+        # Anti-chatter dwell guard.
+        if (target != prev
+                and self._mode_dwell < self._mode_dwell_min_ticks):
+            target = prev
+
+        if target != prev:
+            self._prev_mpc_mode = prev
+            self._mpc_mode = target
+            self._mode_dwell = 0
+        else:
+            self._mode_dwell += 1
+
+        # Alpha ramp unchanged.
+        K = max(self._K_trans, 1)
+        step = 1.0 / K
+        goal_alpha = (0.0 if self._mpc_mode == MPC_MODE_WITH_OBS else 1.0)
+        if self._alpha_ramp < goal_alpha:
+            self._alpha_ramp = float(min(self._alpha_ramp + step, goal_alpha))
+        elif self._alpha_ramp > goal_alpha:
+            self._alpha_ramp = float(max(self._alpha_ramp - step, goal_alpha))
+
+        self._last_ttc_min = float(ttc_min)
+        self._last_min_obs_ds = float(min_obs_ds)
+        # "in_horizon" is now defined as "within the enter threshold" for
+        # backward-compat with debug consumers that expected the old boolean.
+        self._last_obs_in_horizon = bool(min_obs_ds < self._obs_enter_dist_m)
+        self._last_side_int_for_mode = int(side_int)
+
+    # ---------------------------------------------------------------- Adaptive recovery q_n
+    def _apply_recovery_near_boost(self, ego_n):
+        """### HJ : 2026-04-24 — when in NO_OBS (recovery) and ego is close
+        to GB, boost stage q_n so the early horizon also converges quickly.
+        q_n_eff = q_n_mode_blended + q_n_near_boost · max(0, 1 - |ego_n|/thresh)
+        Only meaningful in auto mode. Applied AFTER mode weights + variance
+        so it overrides the q_n portion while sigmas stay as variance set.
+        """
+        if self.state != 'auto':
+            return
+        if self._mpc_mode != MPC_MODE_NO_OBS:
+            # outside recovery: clear any residual boost
+            target_boost = 0.0
+        else:
+            n_abs = abs(float(ego_n))
+            thresh = max(self._q_n_near_thresh, 1e-3)
+            factor = max(0.0, 1.0 - n_abs / thresh)
+            target_boost = self._q_n_near_boost * factor
+
+        if abs(target_boost - self._last_q_n_boost_applied) < 1e-3:
+            return
+        # Current solver q_n already reflects mode + alpha blend from
+        # _apply_mode_weights. We add the boost ON TOP (remove prior boost,
+        # add new). Track last applied so we don't double-add.
+        try:
+            base_q_n = float(self.solver.q_n) - self._last_q_n_boost_applied
+            new_q_n = base_q_n + target_boost
+            self.solver.update_weights(q_n=new_q_n)
+            self._last_q_n_boost_applied = target_boost
+        except Exception as e:  # pragma: no cover
+            rospy.logwarn_throttle(
+                2.0, '[mpc][%s] recovery near-boost failed: %s',
+                rospy.get_name(), e)
+
+
+    # ---------------------------------------------------------------- Variance-aware bubble
+    def _apply_variance_inflation(self):
+        """### HJ : 2026-04-24 — If ~use_pred_variance is True, inflate
+        σ_s_obs / σ_n_obs based on current tick's max vs_var / vd_var
+        over active obstacles.
+
+          σ_eff = √(σ_base² + var · (N·dT)²)
+
+        Applied AFTER _apply_mode_weights so it overrides. When disabled,
+        restores the YAML base sigmas (in case a prior tick inflated them).
+        No-op when sigma difference is below 1e-4 (avoid update churn).
+        """
+        if not self._use_pred_variance:
+            # Ensure base sigmas are active (in case user toggled param OFF mid-run).
+            sigma_s_target = self._sigma_s_obs_base
+            sigma_n_target = self._sigma_n_obs_base
+        else:
+            t_h = float(self.N) * float(self.dT)
+            sigma_s_target = float(np.sqrt(
+                self._sigma_s_obs_base ** 2 + self._last_obs_max_vs_var * t_h * t_h))
+            sigma_n_target = float(np.sqrt(
+                self._sigma_n_obs_base ** 2 + self._last_obs_max_vd_var * t_h * t_h))
+
+        # Skip call if negligible change
+        if (abs(sigma_s_target - self._last_sigma_s_eff) < 1e-4 and
+                abs(sigma_n_target - self._last_sigma_n_eff) < 1e-4):
+            return
+        try:
+            self.solver.update_weights(
+                sigma_s_obs=sigma_s_target,
+                sigma_n_obs=sigma_n_target)
+            self._last_sigma_s_eff = sigma_s_target
+            self._last_sigma_n_eff = sigma_n_target
+        except Exception as e:  # pragma: no cover
+            rospy.logwarn_throttle(
+                2.0, '[mpc][%s] variance inflation failed: %s',
+                rospy.get_name(), e)
+
+    # ---------------------------------------------------------------- Phase X weight switch
+    def _capture_with_obs_baseline(self):
+        """Snapshot current solver weights as the WITH_OBS baseline. Called
+        lazily on the first update so user's rqt-tuned values (if any)
+        become the baseline rather than hard-coded YAML values."""
+        if self._with_obs_baseline_weights is None:
+            try:
+                self._with_obs_baseline_weights = dict(self.solver.get_weights())
+            except Exception:
+                self._with_obs_baseline_weights = {}
+
+    def _apply_mode_weights(self, alpha_ramp):
+        """Phase X — push a blended weight profile to the solver.
+
+        alpha_ramp semantics:
+            0.0 → pure WITH_OBS weights (baseline)
+            1.0 → pure NO_OBS weights (obstacle cost off, stronger n→0 pull)
+            in-between → linear blend per-key
+
+        Called every tick — idempotent on no-change.
+        """
+        if not self._no_obs_weights:
+            return  # no NO_OBS profile configured; solver keeps baseline
+        self._capture_with_obs_baseline()
+        if not self._with_obs_baseline_weights:
+            return
+        alpha = float(np.clip(alpha_ramp, 0.0, 1.0))
+        if (self._last_applied_weight_alpha is not None
+                and abs(self._last_applied_weight_alpha - alpha) < 1e-3):
+            return
+
+        base = self._with_obs_baseline_weights
+        target = self._no_obs_weights
+        blend = {}
+        for key, base_val in base.items():
+            no_obs_val = target.get(key, base_val)
+            blend[key] = (1.0 - alpha) * base_val + alpha * no_obs_val
+        # Target-only keys → scale linearly.
+        for key, no_obs_val in target.items():
+            if key not in base:
+                blend[key] = alpha * no_obs_val
+
+        try:
+            self.solver.update_weights(**blend)
+            self._last_applied_weight_alpha = alpha
+        except Exception as e:  # pragma: no cover
+            rospy.logwarn_throttle(
+                2.0, '[mpc][%s] update_weights failed: %s',
+                rospy.get_name(), e)
+
+    # ---------------------------------------------------------------- Phase X speed painter
+    def _lookup_gb_vx(self, s):
+        """Binary-search GB raceline vx at arc-length s. s-based only, no xy
+        roundtrip. Returns vx_mps at the closest raceline waypoint (linear
+        interp between neighbours)."""
+        if self._gb_vx_by_s_s is None:
+            return 0.0
+        s_arr = self._gb_vx_by_s_s
+        v_arr = self._gb_vx_by_s_v
+        # Handle wrap-around
+        s_mod = float(s) % float(self.track_length) if self.track_length > 0 else float(s)
+        idx = int(np.searchsorted(s_arr, s_mod))
+        if idx <= 0:
+            return float(v_arr[0])
+        if idx >= len(s_arr):
+            return float(v_arr[-1])
+        s_lo = s_arr[idx - 1]
+        s_hi = s_arr[idx]
+        if s_hi - s_lo < 1e-9:
+            return float(v_arr[idx])
+        alpha = (s_mod - s_lo) / (s_hi - s_lo)
+        return float((1.0 - alpha) * v_arr[idx - 1] + alpha * v_arr[idx])
+
+    ### HJ : 2026-04-26 — smoothed kappa for SPEED CAP ONLY.
+    ###      Computes a smooth, continuous curvature profile from wp xy. The
+    ###      raw kappa stored on each wp (from solver) can ring tick-to-tick;
+    ###      using it directly for v_curv = sqrt(mu·g/|kappa|) yields jagged
+    ###      speed profiles. We re-derive kappa from xy via arc-length finite
+    ###      differences and then savgol-smooth the heading (window 7,
+    ###      polyorder 2 by default — small window so we don't bleed corner
+    ###      curvature into straight regions). Path xy is NOT modified.
+    ###      Returns np.array of len(wp_list).
+    def _smooth_kappa_for_speed(self, wp_list):
+        n = len(wp_list)
+        if n < 3:
+            return np.zeros(n, dtype=np.float64)
+        xs = np.array([float(w.x_m) for w in wp_list], dtype=np.float64)
+        ys = np.array([float(w.y_m) for w in wp_list], dtype=np.float64)
+        dxs = np.diff(xs)
+        dys = np.diff(ys)
+        seg = np.sqrt(dxs * dxs + dys * dys)
+        seg = np.where(seg < 1e-6, 1e-6, seg)
+        # Heading per segment (n-1), then per-vertex by averaging neighbours.
+        psi_seg = np.arctan2(dys, dxs)
+        # Unwrap so atan2 jumps don't fake a huge curvature.
+        psi_seg = np.unwrap(psi_seg)
+        psi = np.zeros(n, dtype=np.float64)
+        psi[1:-1] = 0.5 * (psi_seg[:-1] + psi_seg[1:])
+        psi[0] = psi_seg[0]
+        psi[-1] = psi_seg[-1]
+        # Savgol smooth on psi if window fits.
+        try:
+            from scipy.signal import savgol_filter
+            win = 7 if n >= 7 else (5 if n >= 5 else 3)
+            if win % 2 == 0:
+                win -= 1
+            poly = 2 if win >= 5 else 1
+            if win >= 3 and n >= win:
+                psi_smooth = savgol_filter(psi, window_length=win,
+                                           polyorder=poly, mode='nearest')
+            else:
+                psi_smooth = psi
+        except Exception:
+            psi_smooth = psi
+        # kappa = dpsi/ds at each vertex (centered diff).
+        # ds at vertex i ≈ (seg[i-1] + seg[i]) / 2 for interior; ends use neighbour seg.
+        ds = np.zeros(n, dtype=np.float64)
+        ds[1:-1] = 0.5 * (seg[:-1] + seg[1:])
+        ds[0] = seg[0]
+        ds[-1] = seg[-1]
+        ds = np.where(ds < 1e-6, 1e-6, ds)
+        dpsi = np.zeros(n, dtype=np.float64)
+        dpsi[1:-1] = 0.5 * (
+            (psi_smooth[2:] - psi_smooth[1:-1]) +
+            (psi_smooth[1:-1] - psi_smooth[:-2]))
+        dpsi[0] = psi_smooth[1] - psi_smooth[0]
+        dpsi[-1] = psi_smooth[-1] - psi_smooth[-2]
+        kappa = dpsi / ds
+        # Optional second-pass low-pass on kappa itself for extra smoothness.
+        try:
+            from scipy.signal import savgol_filter
+            win2 = 5 if n >= 5 else 3
+            if win2 % 2 == 0:
+                win2 -= 1
+            if win2 >= 3 and n >= win2:
+                kappa = savgol_filter(kappa, window_length=win2,
+                                      polyorder=1, mode='nearest')
+        except Exception:
+            pass
+        return kappa
+    ### HJ : end
+
+    def _post_process_speed(self, wp_list, mpc_mode):
+        """Paint speed on MPC output waypoints and apply seam blend.
+
+        Modifies wp_list[*].vx_mps in place. Returns (seam_idx, blend_applied,
+        vx_first_step_delta) for tick_json.
+
+        ### HJ : 2026-04-26 — curvature smoothing for speed cap ONLY.
+        ###      The path xy (and stored kappa_radpm) is NOT modified — that
+        ###      remains exactly what the solver produced, so the controller
+        ###      sees the original geometry. Just for the v_curv cap we build
+        ###      a separate smoothed-kappa view via:
+        ###        (1) re-derive kappa from xy with arc-length finite diffs
+        ###            (avoids stale per-step kappa from solver)
+        ###        (2) savgol low-pass on the heading sequence (window 7,
+        ###            polyorder 2) so per-wp kappa noise → smooth profile
+        ###      Speed cap then uses smooth_kappa[k] in place of wp.kappa.
+        ###      Result: vx profile no longer jitters with raw solver kappa
+        ###      ringing, but path xy is untouched.
+
+        Backward compat: painter is only active under state:='auto'. Legacy
+        overtake/recovery/observe launches preserve original solver vx.
+        """
+        if self.state != 'auto':
+            return -1, False, 0.0
+        if not self._painter_enable or not wp_list:
+            return -1, False, 0.0
+
+        # 1) baseline: GB raceline vx at each wp.s_m
+        baseline_vx = [self._lookup_gb_vx(w.s_m) for w in wp_list]
+
+        # ---- smooth kappa view (speed-only, path xy untouched) ----
+        smooth_kappa = self._smooth_kappa_for_speed(wp_list)
+
+        # 2) curvature/mu cap — simple grip-limited v^2 ≤ mu*g/|kappa|
+        g = 9.81
+        capped = []
+        for k, (w, v_gb) in enumerate(zip(wp_list, baseline_vx)):
+            kappa = abs(float(smooth_kappa[k]))
+            mu = max(abs(float(getattr(w, 'mu_rad', 0.0))), 0.6)
+            if kappa < 1e-4:
+                v_curv = v_gb
+            else:
+                v_curv = float(np.sqrt(max(mu * g / kappa, 0.0)))
+            capped.append(min(v_gb, v_curv))
+
+        # 3) ego v continuity — clip wp0 then forward acc limit
+        ego_v = float(getattr(self, 'car_vx', 0.0))
+        dT = self.dT
+        a_max = self._painter_a_max
+        capped[0] = float(np.clip(capped[0], ego_v - a_max * dT,
+                                  ego_v + a_max * dT))
+        for k in range(1, len(capped)):
+            capped[k] = min(capped[k], capped[k - 1] + a_max * dT)
+
+        # 4) seam blend
+        K = max(self._painter_K_blend, 1)
+        if mpc_mode == MPC_MODE_NO_OBS:
+            # NO_OBS mode is the convergent solve — tail is always near GB,
+            # so blend the final K waypoints to GB vx smoothly.
+            seam_idx = max(len(capped) - K, 0)
+        else:
+            # WITH_OBS: scan forward for first waypoint that is near GB
+            # (|d| < n_near); seam blend begins there. If none found, skip.
+            seam_idx = -1
+            for k, w in enumerate(wp_list):
+                if abs(float(getattr(w, 'd_m', 0.0))) < self._painter_n_near:
+                    seam_idx = k
+                    break
+        blend_applied = False
+        if seam_idx >= 0:
+            blend_end = min(seam_idx + K, len(capped))
+            for k in range(seam_idx, blend_end):
+                alpha = (k - seam_idx + 1) / K
+                vx_gb = self._lookup_gb_vx(wp_list[k].s_m)
+                capped[k] = (1.0 - alpha) * capped[k] + alpha * vx_gb
+            blend_applied = True
+
+        # Write back
+        for k, w in enumerate(wp_list):
+            w.vx_mps = float(capped[k])
+
+        vx_first_step_delta = float(abs(capped[0] - ego_v))
+        return seam_idx, blend_applied, vx_first_step_delta
+
+    def _apply_continuity_guard(self, wp_list):
+        """Blend first K_guard waypoints of wp_list with the previously
+        published wp_list (s-shifted) if their wp-wise L2 exceeds threshold.
+        Modifies wp_list[*].{x_m, y_m, z_m, d_m, psi_rad} in place.
+
+        Returns (L2, applied) for tick_json.
+
+        Backward compat: active only under state:='auto'.
+        """
+        if self.state != 'auto':
+            return 0.0, False
+        if (not self._continuity_guard_enable
+                or self._last_published_wpnts is None
+                or len(self._last_published_wpnts) == 0
+                or len(wp_list) == 0):
+            return 0.0, False
+        K = max(self._continuity_K_guard, 1)
+        prev = self._last_published_wpnts
+        # Align by s: for each current wp, pick the previous wp with closest s.
+        # Simpler: use shifted index (1-step forward shift assumption).
+        cur_head = wp_list[:K]
+        prev_shifted = prev[1:1 + K] if len(prev) > 1 else prev[:K]
+        n = min(len(cur_head), len(prev_shifted))
+        if n == 0:
+            return 0.0, False
+        sq_sum = 0.0
+        for k in range(n):
+            dx = cur_head[k].x_m - prev_shifted[k].x_m
+            dy = cur_head[k].y_m - prev_shifted[k].y_m
+            dz = getattr(cur_head[k], 'z_m', 0.0) - getattr(prev_shifted[k], 'z_m', 0.0)
+            sq_sum += dx * dx + dy * dy + dz * dz
+        L2 = float(np.sqrt(sq_sum / n))
+        if L2 <= self._continuity_threshold_m:
+            return L2, False
+        # Blend xy/z/d_m/psi_rad (keep s_m monotone).
+        for k in range(n):
+            beta = (k + 1) / K   # 0 → 1; weight of new path grows
+            cur_head[k].x_m = float((1 - beta) * prev_shifted[k].x_m + beta * cur_head[k].x_m)
+            cur_head[k].y_m = float((1 - beta) * prev_shifted[k].y_m + beta * cur_head[k].y_m)
+            if hasattr(cur_head[k], 'z_m'):
+                cur_head[k].z_m = float((1 - beta) * getattr(prev_shifted[k], 'z_m', 0.0)
+                                        + beta * cur_head[k].z_m)
+            cur_head[k].d_m = float((1 - beta) * prev_shifted[k].d_m + beta * cur_head[k].d_m)
+            cur_head[k].psi_rad = float((1 - beta) * prev_shifted[k].psi_rad
+                                        + beta * cur_head[k].psi_rad)
+        return L2, True
 
     # ---------------------------------------------------------------- lift
     def _lift_frenet_to_xy(self, traj_frenet, ref_slice):
@@ -1064,6 +2035,8 @@ class MPCPlannerStateNode:
 
         center_pts, left_pts, right_pts = [], [], []
         d_left_arr, d_right_arr = [], []
+        d_left_raw_arr, d_right_raw_arr = [], []
+        cos_delta_arr = []
         ref_v, ref_s, ref_dx, ref_dy, ref_psi, ref_kappa = [], [], [], [], [], []
         s_offset = 0.0
         prev_s = None
@@ -1076,17 +2049,37 @@ class MPCPlannerStateNode:
             x = self.g_x[idx]
             y = self.g_y[idx]
             psi = self.g_psi[idx]
-            dl = self.g_dleft[idx]
-            dr = self.g_dright[idx]
+            dl_raw = self.g_dleft[idx]
+            dr_raw = self.g_dright[idx]
             kappa = self.g_kappa[idx]
 
-            normal = np.array([-np.sin(psi), np.cos(psi)])
+            ### HJ : centerline-normal corridor → raceline-normal corridor.
+            ###      d_left/d_right are measured along centerline normal at the foot.
+            ###      Solver's hard wall |n[k]| <= eff_d expects RACELINE-normal limits.
+            ###      Linear conversion: eff_d_rn = d_cn / cos(psi_R - psi_C).
+            ###      Cap cos to 0.5 (60 deg) as a safety net against numerical glitches
+            ###      — F1tenth tracks never sustain |Delta| beyond that.
+            psi_c = self.g_psi_center[idx] if self.g_psi_center is not None else psi
+            cos_delta = float(max(np.cos(psi - psi_c), 0.5))
+            dl = float(dl_raw) / cos_delta
+            dr = float(dr_raw) / cos_delta
+            ### HJ : end
+
+            ### HJ : marker now drawn along centerline normal (matches the actual
+            ###      walls that walls_d was measured against). center stays at the
+            ###      raceline waypoint; the wall point is raceline_xy ± n_C * d_raw.
+            normal_R = np.array([-np.sin(psi), np.cos(psi)])
+            normal_C = np.array([-np.sin(psi_c), np.cos(psi_c)])
             center = np.array([x, y])
             center_pts.append(center)
-            left_pts.append(center + normal * max(dl - inflation, 0.0))
-            right_pts.append(center - normal * max(dr - inflation, 0.0))
+            left_pts.append(center + normal_C * max(dl_raw - inflation, 0.0))
+            right_pts.append(center - normal_C * max(dr_raw - inflation, 0.0))
             d_left_arr.append(float(dl))
             d_right_arr.append(float(dr))
+            d_left_raw_arr.append(float(dl_raw))
+            d_right_raw_arr.append(float(dr_raw))
+            cos_delta_arr.append(cos_delta)
+            ### HJ : end
             ref_v.append(float(self.g_vx[idx]))
             ref_dx.append(np.cos(psi))
             ref_dy.append(np.sin(psi))
@@ -1107,8 +2100,11 @@ class MPCPlannerStateNode:
             'center_points': np.array(center_pts),
             'left_points': np.array(left_pts),
             'right_points': np.array(right_pts),
-            'd_left_arr': np.array(d_left_arr),
-            'd_right_arr': np.array(d_right_arr),
+            'd_left_arr': np.array(d_left_arr),       # raceline-normal eff (post cos(Δ))
+            'd_right_arr': np.array(d_right_arr),     # raceline-normal eff (post cos(Δ))
+            'd_left_raw_arr': np.array(d_left_raw_arr),     # centerline-normal as published
+            'd_right_raw_arr': np.array(d_right_raw_arr),
+            'cos_delta_arr': np.array(cos_delta_arr),
             'ref_v': np.array(ref_v),
             'ref_s': np.array(ref_s),
             'ref_dx': np.array(ref_dx),
@@ -1201,6 +2197,49 @@ class MPCPlannerStateNode:
             side_int = SIDE_CLEAR; side_str = 'n/a'; side_scores = {}
             bias_scale = 0.0
 
+        # ### HJ : Phase X — MPC internal FSM (auto mode). In legacy
+        # overtake/recovery/observe, this is a no-op that only bumps dwell.
+        ego_v_now = float(getattr(self, 'car_vx', 0.0))
+        min_obs_ds, ttc_min = self._obs_in_horizon_and_ttc(
+            obs_arr, s_cur, ego_v_now)
+        self._update_mpc_mode(ego_n, side_int, min_obs_ds, ttc_min)
+
+        # ### HJ : 2026-04-24 — corridor sanity diagnostic. If ego is
+        # physically outside the corridor at solve-time (dragged in Gazebo,
+        # spawned over a wall, localisation glitch), the NLP's n_0=ego_n
+        # initial constraint violates the hard bounds → slack absorbs but
+        # first few stages may still be outside. Log so we can distinguish
+        # "solver bad" vs "ego was spawned outside corridor". Throttled.
+        try:
+            wall_safe = float(getattr(self.solver, 'wall_safe', 0.15))
+            d_L_ego = float(self.lifter._interp(s_cur, self.lifter.g_dleft))
+            d_R_ego = float(self.lifter._interp(s_cur, self.lifter.g_dright))
+            n_lo_ego = -(d_R_ego - wall_safe)
+            n_hi_ego = +(d_L_ego - wall_safe)
+            if ego_n < n_lo_ego or ego_n > n_hi_ego:
+                rospy.logwarn_throttle(
+                    0.5,
+                    '[mpc][%s] ego OUTSIDE corridor @ s=%.2f: n=%.3f bounds=[%.3f, %.3f]'
+                    ' — NLP will use slack; first-tick path may still violate walls.',
+                    rospy.get_name(), s_cur, ego_n, n_lo_ego, n_hi_ego)
+                self._last_ego_outside_corridor = True
+            else:
+                self._last_ego_outside_corridor = False
+        except Exception:
+            self._last_ego_outside_corridor = False
+
+        # ### HJ : Phase X (refactored) — single NLP path. The solver always
+        # runs; no quintic bypass, no skip. FSM mode just decides the weight
+        # profile, blended smoothly via alpha_ramp. Obstacle presence flips
+        # the target profile; the alpha ramp keeps the trajectory continuous.
+        self._apply_mode_weights(self._alpha_ramp)
+        # ### HJ : 2026-04-24 — variance-aware sigma inflation (AFTER mode
+        # blend so variance has the final word on σ).
+        self._apply_variance_inflation()
+        # ### HJ : 2026-04-24 — adaptive recovery q_n near boost (AFTER
+        # mode blend so we can read the blended q_n baseline from solver).
+        self._apply_recovery_near_boost(ego_n)
+
         warm_used = int(bool(getattr(self.solver, 'warm', False)))
 
         t0 = time.time()
@@ -1273,8 +2312,10 @@ class MPCPlannerStateNode:
         # Previously `_try_quintic_fallback(s_cur)` re-projected (car_x, car_y)
         # via lifter.project_xy_to_sn — 2D nearest that aliases overpass
         # floors. The /odom_frenet s is z-aware and cannot alias.
+        # ### HJ : 2026-04-24 — wall clip ON so NLP→tier2 cascade doesn't
+        # punch the corridor even if ego is spawned outside it.
         traj_fb, frenet_fb = self._try_quintic_fallback(
-            s_cur, ego_n, delta_s=self._quintic_delta_s)
+            s_cur, ego_n, delta_s=self._quintic_delta_s, clip_walls=True)
         if traj_fb is not None:
             self._handle_tier2_geometric(
                 traj_fb, frenet_fb, ego_n, status, solve_ms, obs_tag)
@@ -1293,8 +2334,10 @@ class MPCPlannerStateNode:
         # recovery-style directive: tier3 is now an aggressive short-Δs
         # quintic (ego_n → 0 convergence). If even that blows up, we fall
         # through to the last-resort pure raceline slice.
+        # ### HJ : 2026-04-24 — wall clip ON (same rationale as tier2).
         traj_short, frenet_short = self._try_quintic_fallback(
-            s_cur, ego_n, delta_s=max(self._quintic_delta_s * 0.5, 3.0))
+            s_cur, ego_n, delta_s=max(self._quintic_delta_s * 0.5, 3.0),
+            clip_walls=True)
         if traj_short is not None:
             self._handle_tier3_convergence_quintic(
                 traj_short, frenet_short, ego_n, status, solve_ms, obs_tag)
@@ -1360,6 +2403,7 @@ class MPCPlannerStateNode:
             return {
                 'backend':        'frenet_kin',
                 'q_n':            float(s.q_n),
+                'q_n_ramp':       float(getattr(s, 'q_n_ramp', 0.0)),
                 'gamma_progress': float(s.gamma),
                 'r_a':            float(s.r_a),
                 'r_steer_reg':    float(s.r_reg),
@@ -1551,7 +2595,8 @@ class MPCPlannerStateNode:
         )
 
     # ---- Tier 2 ------------------------------------------------------------
-    def _try_quintic_fallback(self, s_cur, ego_n, delta_s=None):
+    def _try_quintic_fallback(self, s_cur, ego_n, delta_s=None,
+                               n_samples=None, clip_walls=False):
         """### HJ : v3b — recovery-style "ego_n → 0" smooth return primitive.
 
         Uses (s_cur, ego_n) from /odom_frenet directly so the 3D overpass
@@ -1561,11 +2606,25 @@ class MPCPlannerStateNode:
         the user is debugging (solver dies at bridge, tier2 then re-projects
         to the wrong floor and sends the car onto the lower path).
 
-        Returns (xy_traj (N+1,5) [x, y, psi, s, z], frenet (N+1,4) [s, n, 0, v])
+        Parameters
+        ----------
+        n_samples : int | None
+            Samples along s. None → `self.N + 1` (legacy tier 2/3 fallback
+            shape). Phase X auto-mode RECOVERY passes a larger value (e.g. 81)
+            so SM / controller see a dense, equispaced-in-s trajectory.
+        clip_walls : bool
+            If True, hard-clip |n| to `[wall_safe - d_right, d_left - wall_safe]`
+            at every sample and re-lift xy. Phase X RECOVERY enables this so
+            the polynomial doesn't punch through track bounds — legacy tier
+            2/3 fallback keeps it off (corridor handled by the solver itself).
+
+        Returns (xy_traj (K,5) [x, y, psi, s, z], frenet (K,4) [s, n, 0, v])
         or (None, None) if the lifter blows up.
         """
         if delta_s is None:
             delta_s = self._quintic_delta_s
+        if n_samples is None:
+            n_samples = self.N + 1
         try:
             psi_track = self.lifter._interp_psi(s_cur)
             psi_delta = float(np.arctan2(
@@ -1573,12 +2632,38 @@ class MPCPlannerStateNode:
                 np.cos(self.car_yaw - psi_track)))
             xy_traj, sn_traj = build_quintic_fallback(
                 self.lifter, s_cur, ego_n, psi_delta,
-                delta_s=delta_s, n_samples=self.N + 1,
+                delta_s=delta_s, n_samples=int(n_samples),
                 return_frenet=True)
-            # Augment xy_traj (N+1,3) → (N+1,5) with carried [s, z] so the
+            N1 = xy_traj.shape[0]
+
+            # ### HJ : Phase X — wall-bound clip (auto RECOVERY only).
+            # Quintic is pure BC fit; without clipping it can punch through
+            # walls on tight corners. Clip n to the track corridor with
+            # wall_safe buffer, then re-lift xy so the published trajectory
+            # stays inside. (Clipping is a 1-D numpy op; re-lift is K calls
+            # of lifter.sn_to_xy — ~1 ms @ K=81.)
+            if clip_walls:
+                wall_safe = float(getattr(self.solver, 'wall_safe', 0.15))
+                xy_relifted = np.zeros_like(xy_traj)
+                for i in range(N1):
+                    s_i = float(sn_traj[i, 0])
+                    d_L = float(self.lifter._interp(s_i, self.lifter.g_dleft))
+                    d_R = float(self.lifter._interp(s_i, self.lifter.g_dright))
+                    n_lo = -(d_R - wall_safe)
+                    n_hi = +(d_L - wall_safe)
+                    if n_lo > n_hi:  # degenerate corridor — skip clip
+                        n_lo, n_hi = -wall_safe, +wall_safe
+                    n_clip = float(np.clip(sn_traj[i, 1], n_lo, n_hi))
+                    sn_traj[i, 1] = n_clip
+                    x, y = self.lifter.sn_to_xy(s_i, n_clip)
+                    xy_relifted[i, 0] = x
+                    xy_relifted[i, 1] = y
+                    xy_relifted[i, 2] = xy_traj[i, 2]  # psi (tangent)
+                xy_traj = xy_relifted
+
+            # Augment xy_traj (K,3) → (K,5) with carried [s, z] so the
             # downstream viz/publish path uses 3D-safe z instead of the
             # marker-time xy nearest-index lookup (which would alias floors).
-            N1 = xy_traj.shape[0]
             aug = np.zeros((N1, 5), dtype=np.float64)
             aug[:, :3] = xy_traj
             for i in range(N1):
@@ -1586,7 +2671,7 @@ class MPCPlannerStateNode:
                 aug[i, 3] = s_i
                 aug[i, 4] = float(self.lifter._interp(s_i, self.lifter.g_z))
             # Frenet companion for fill_wpnt_from_s (solver-frenet-shape
-            # compatible: (N+1, 4) [s, n, mu=0, v=ego_v_placeholder]).
+            # compatible: (K, 4) [s, n, mu=0, v=ego_v_placeholder]).
             v_fb = float(np.clip(self.car_vx, 0.5,
                                  max(self.solver.v_max, 0.5)))
             frenet = np.zeros((N1, 4), dtype=np.float64)
@@ -1771,22 +2856,166 @@ class MPCPlannerStateNode:
             w.d_right = fields['d_right']
             wp_arr.wpnts.append(w)
 
+        # ### HJ : Phase X — Speed painter + continuity guard BEFORE role pub.
+        # Painter rewrites vx_mps using GB s-lookup + curvature cap + seam blend.
+        # Continuity guard blends first K_guard waypoints with previous tick.
+        seam_idx_used, blend_applied, vx_first_delta = self._post_process_speed(
+            wp_arr.wpnts, self._mpc_mode)
+        cont_L2, cont_applied = self._apply_continuity_guard(wp_arr.wpnts)
+        self._last_continuity_L2 = float(cont_L2)
+        self._last_path_blend_applied = bool(cont_applied)
+        self._last_painter_seam_idx = int(seam_idx_used)
+        self._last_painter_blend_applied = bool(blend_applied)
+        self._last_painter_vx_first_delta = float(vx_first_delta)
+
+        # ### HJ : Phase X (refactored) — densify is OPT-IN only.
+        # Default: publish solver's native N+1 grid as-is (user directive
+        # 2026-04-24 "mpc 출력 그대로"). Set ~mpc_densify_enable:=true to
+        # reintroduce linear-interp post-densify to mpc_output_ds spacing.
+        if (self._mpc_densify_enable
+                and self.state in ('auto', 'overtake', 'recovery')):
+            wp_arr.wpnts = self._densify_wpnt_list(
+                wp_arr.wpnts, ds=self._mpc_output_ds)
+
         self.pub_best_trajectory.publish(wp_arr)
         self._publish_debug_markers(header, trajectory)
 
-        if self.state == 'overtake' and self.pub_out is not None:
+        # ### HJ : Phase X (refactored) — single unified topic.
+        # `ot_line` carries the semantic tag ("avoid" when WITH_OBS, "recover"
+        # when NO_OBS) so the SM can colour-code without needing multiple
+        # topics. Legacy pub_ot / pub_rc kept optional for rollback.
+        if self.pub_mpc is not None:
             ot = OTWpntArray()
             ot.header = header
             ot.last_switch_time = rospy.Time.now()
             ot.side_switch = False
-            # Dominant side of the chosen trajectory (mean signed d_m).
-            mean_d = float(np.mean([w.d_m for w in wp_arr.wpnts])) if wp_arr.wpnts else 0.0
+            mean_d = (float(np.mean([w.d_m for w in wp_arr.wpnts]))
+                      if wp_arr.wpnts else 0.0)
             ot.ot_side = 'left' if mean_d >= 0.0 else 'right'
-            ot.ot_line = 'mpc'
+            ot.ot_line = ('avoid' if self._mpc_mode == MPC_MODE_WITH_OBS
+                          else 'recover')
             ot.wpnts = wp_arr.wpnts
-            self.pub_out.publish(ot)
-        elif self.state == 'recovery' and self.pub_out is not None:
-            self.pub_out.publish(wp_arr)
+            self.pub_mpc.publish(ot)
+        # Legacy side-publishers (usually disabled via launch remap).
+        if self.pub_ot is not None and self.state == 'overtake':
+            self._publish_ot_wpnts(header, wp_arr)
+        if self.pub_rc is not None and self.state == 'recovery':
+            self.pub_rc.publish(wp_arr)
+
+        # Cache for next-tick continuity guard (deep copy of header-less wpnts).
+        self._last_published_wpnts = [self._wpnt_copy(w) for w in wp_arr.wpnts]
+        self._last_published_mode = self._mpc_mode
+
+    @staticmethod
+    def _wpnt_copy(w):
+        """Lightweight Wpnt shallow-clone for continuity-guard cache."""
+        c = Wpnt()
+        c.id = w.id
+        c.s_m = w.s_m
+        c.d_m = w.d_m
+        c.x_m = w.x_m
+        c.y_m = w.y_m
+        if hasattr(w, 'z_m'):
+            c.z_m = w.z_m
+        c.psi_rad = w.psi_rad
+        c.kappa_radpm = w.kappa_radpm
+        c.vx_mps = w.vx_mps
+        c.ax_mps2 = w.ax_mps2
+        if hasattr(w, 'mu_rad'):
+            c.mu_rad = w.mu_rad
+        c.d_left = w.d_left
+        c.d_right = w.d_right
+        return c
+
+    @staticmethod
+    def _densify_wpnt_list(wpnts, ds=0.1):
+        """Resample waypoints to uniform EUCLIDEAN arc length along (x, y, z).
+
+        User directive 2026-04-24: "s 축 기반 등간격이 아니라, 진짜 냅다 x,y,z
+        평면 등간격 샘플링이어야해." So this is NOT s-based; we compute cumulative
+        xyz Euclidean distance between wpnts and sample the chain uniformly.
+        Result: adjacent output wpnts have `||xyz[i+1] - xyz[i]|| ≈ ds` (no
+        stretch/compress at corners that s-based densify had).
+
+        Field handling:
+          - scalars (s_m, d_m, vx, ax, κ, μ, d_left, d_right): linear interp
+            along the same (cumdist, t) param. Note s_m ends up NON-uniform
+            in s but uniform in arc length — that's the goal.
+          - psi_rad: circular interp (sin/cos avg) to avoid wrap jumps.
+        If native spacing is already ≤ ds (rare), returns as-is.
+        """
+        import math
+        if len(wpnts) < 2:
+            return wpnts
+        # Cumulative arc length over xyz.
+        cumdist = [0.0]
+        for i in range(1, len(wpnts)):
+            dx = float(wpnts[i].x_m - wpnts[i - 1].x_m)
+            dy = float(wpnts[i].y_m - wpnts[i - 1].y_m)
+            dz = float(getattr(wpnts[i], 'z_m', 0.0)
+                       - getattr(wpnts[i - 1], 'z_m', 0.0))
+            cumdist.append(cumdist[-1] + math.sqrt(dx*dx + dy*dy + dz*dz))
+        total = float(cumdist[-1])
+        if total <= 0.0:
+            return wpnts
+        native_mean = total / max(len(wpnts) - 1, 1)
+        if native_mean <= ds * 1.05:
+            return wpnts
+        n_new = int(math.floor(total / ds)) + 1
+        if n_new <= len(wpnts):
+            return wpnts
+        targets = np.linspace(0.0, total, n_new)
+        # Pre-pack cumdist as numpy for searchsorted
+        cum_np = np.asarray(cumdist)
+        out = []
+        for new_id, d_target in enumerate(targets):
+            idx = int(np.searchsorted(cum_np, d_target))
+            if idx <= 0:
+                lo = hi = wpnts[0]; t = 0.0
+            elif idx >= len(wpnts):
+                lo = hi = wpnts[-1]; t = 1.0
+            else:
+                lo = wpnts[idx - 1]
+                hi = wpnts[idx]
+                seg = float(cum_np[idx] - cum_np[idx - 1])
+                t = (float(d_target - cum_np[idx - 1]) / seg) if seg > 1e-9 else 0.0
+            def mix(a, b):
+                return (1.0 - t) * float(a) + t * float(b)
+            w = Wpnt()
+            w.id = int(new_id)
+            w.s_m = mix(lo.s_m, hi.s_m)    # s is interpolated, not re-uniformed
+            w.d_m = mix(lo.d_m, hi.d_m)
+            w.x_m = mix(lo.x_m, hi.x_m)
+            w.y_m = mix(lo.y_m, hi.y_m)
+            if hasattr(w, 'z_m'):
+                w.z_m = mix(getattr(lo, 'z_m', 0.0),
+                            getattr(hi, 'z_m', 0.0))
+            sin_v = (1 - t) * math.sin(lo.psi_rad) + t * math.sin(hi.psi_rad)
+            cos_v = (1 - t) * math.cos(lo.psi_rad) + t * math.cos(hi.psi_rad)
+            w.psi_rad = float(math.atan2(sin_v, cos_v))
+            w.kappa_radpm = mix(lo.kappa_radpm, hi.kappa_radpm)
+            w.vx_mps = mix(lo.vx_mps, hi.vx_mps)
+            w.ax_mps2 = mix(lo.ax_mps2, hi.ax_mps2)
+            if hasattr(w, 'mu_rad'):
+                w.mu_rad = mix(getattr(lo, 'mu_rad', 0.0),
+                               getattr(hi, 'mu_rad', 0.0))
+            w.d_left = mix(lo.d_left, hi.d_left)
+            w.d_right = mix(lo.d_right, hi.d_right)
+            out.append(w)
+        return out
+
+    def _publish_ot_wpnts(self, header, wp_arr):
+        """Legacy per-role publisher (only called when state=='overtake' AND
+        pub_ot is remapped). Not used in Phase X auto mode."""
+        ot = OTWpntArray()
+        ot.header = header
+        ot.last_switch_time = rospy.Time.now()
+        ot.side_switch = False
+        mean_d = float(np.mean([w.d_m for w in wp_arr.wpnts])) if wp_arr.wpnts else 0.0
+        ot.ot_side = 'left' if mean_d >= 0.0 else 'right'
+        ot.ot_line = 'mpc'
+        ot.wpnts = wp_arr.wpnts
+        self.pub_ot.publish(ot)
 
     def _publish_debug_markers(self, header, trajectory):
         arr = MarkerArray()
@@ -2079,6 +3308,39 @@ class MPCPlannerStateNode:
             'cost': {k: round(float(v), 3)
                      for k, v in (getattr(self.solver, 'last_cost_breakdown', {}) or {}).items()},
             'weights': self._current_weights_snapshot(),
+            # ### HJ : Phase X — MPC FSM + painter + continuity guard fields.
+            'mpc_mode': str(getattr(self, '_mpc_mode', '-')),
+            'prev_mpc_mode': str(getattr(self, '_prev_mpc_mode', '-')),
+            'mode_dwell': int(getattr(self, '_mode_dwell', 0)),
+            'alpha_ramp': round(float(getattr(self, '_alpha_ramp', 0.0)), 3),
+            'ttc_min': (round(float(getattr(self, '_last_ttc_min', float('inf'))), 3)
+                        if getattr(self, '_last_ttc_min', float('inf')) != float('inf') else None),
+            'obs_in_horizon': bool(getattr(self, '_last_obs_in_horizon', False)),
+            'min_obs_ds': (round(float(getattr(self, '_last_min_obs_ds', float('inf'))), 3)
+                           if getattr(self, '_last_min_obs_ds', float('inf')) != float('inf') else None),
+            'obs_enter_dist_m': float(getattr(self, '_obs_enter_dist_m', 5.0)),
+            'obs_exit_dist_m': float(getattr(self, '_obs_exit_dist_m', 10.0)),
+            'pred_variance': {
+                'enabled': bool(getattr(self, '_use_pred_variance', False)),
+                'max_vs_var': round(float(getattr(self, '_last_obs_max_vs_var', 0.0)), 5),
+                'max_vd_var': round(float(getattr(self, '_last_obs_max_vd_var', 0.0)), 5),
+                'sigma_s_eff': round(float(getattr(self, '_last_sigma_s_eff', 0.0)), 4),
+                'sigma_n_eff': round(float(getattr(self, '_last_sigma_n_eff', 0.0)), 4),
+            },
+            'ego_outside_corridor': bool(getattr(self, '_last_ego_outside_corridor', False)),
+            'weight_alpha_applied': (
+                round(float(getattr(self, '_last_applied_weight_alpha', 0.0)), 3)
+                if getattr(self, '_last_applied_weight_alpha', None) is not None else None),
+            'q_n_near_boost_applied': round(float(getattr(self, '_last_q_n_boost_applied', 0.0)), 3),
+            'painter': {
+                'seam_idx': int(getattr(self, '_last_painter_seam_idx', -1)),
+                'blend_applied': bool(getattr(self, '_last_painter_blend_applied', False)),
+                'vx_first_delta': round(float(getattr(self, '_last_painter_vx_first_delta', 0.0)), 4),
+            },
+            'continuity_guard': {
+                'L2': round(float(getattr(self, '_last_continuity_L2', 0.0)), 4),
+                'applied': bool(getattr(self, '_last_path_blend_applied', False)),
+            },
         }
 
         try:

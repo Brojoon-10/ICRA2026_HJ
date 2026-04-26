@@ -12,8 +12,11 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 # ### HJ : Phase 5 — dynamic_reconfigure server for per-instance MPC tuning.
+# MPCCost       : legacy MPCC / Frenet-D backends
+# FrenetKinCost : FrenetKin v3+ backend (opti.parameter() hot-swap, JIT-safe)
 generate_dynamic_reconfigure_options(
   cfg/MPCCost.cfg
+  cfg/FrenetKinCost.cfg
 )
 
 catkin_package(
