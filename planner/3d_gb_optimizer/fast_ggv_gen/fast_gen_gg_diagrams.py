@@ -170,9 +170,9 @@ if args.tuning:
     else:
         print(f'[fast_gg] WARNING: --tuning specified but {tuning_path} not found')
 
-## IY : V_max = v_max * 1.1 so last grid point exceeds v_max → NLP saturates ax/ay=0
+## IY : V_max = v_max exactly — no overshoot so downstream (raceline NLP, FBGA) respects v_max
 _v_max_cfg = float(vehicle_params['v_max'])
-V_max = _v_max_cfg * 1.1
+V_max = _v_max_cfg
 if V_max <= V_min:
     raise ValueError(f'[fast_gg] v_max ({_v_max_cfg}) must be > V_min ({V_min})')
 print(f'[fast_gg] v_max={_v_max_cfg} → V_max={V_max:.2f} m/s (V_list={V_min}~{V_max:.2f}, N={V_N})')
