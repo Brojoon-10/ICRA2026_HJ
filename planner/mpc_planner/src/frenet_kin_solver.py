@@ -747,6 +747,9 @@ class FrenetKinMPC:
         # the obstacle cap via physical deceleration (a_dec_ramp ≈ 3 m/s²)
         # rather than snapping to the cap at k=0.
         vmax = self._build_vmax(rv, obstacles, side, v0=v0)
+        ### HJ : expose computed vmax for tick_json diagnostics.
+        self._last_vmax = vmax
+        ### HJ : end
 
         ### HJ : 2026-04-26 (A4-a) — n0 clamp 폐기.
         ###      Previously clamped ego_n into [nlb[0], nub[0]] for solver
