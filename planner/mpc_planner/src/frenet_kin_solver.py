@@ -296,6 +296,18 @@ class FrenetKinMPC:
         P_n_prev = opti.parameter(N + 1)
         P_cont_active = opti.parameter()
 
+        ### HJ : 2026-04-26 (A4-b) — per-step wall_buf weight ramp.
+        ###      When ego starts inside / outside the cushion zone, the FIXED
+        ###      cost J_wall(k=0) = w_wall_buf · viol(ego_n)² can dominate
+        ###      and force a kinematically-impossible escape rate at k=1.
+        ###      With this parameter we ramp wall_buf weight from 0 (or small)
+        ###      at k=0..K_entry to 1.0 from K_entry onward. Solver gets a
+        ###      "soft entry": initial steps allow wall violation, mid-late
+        ###      steps enforce. This produces smooth escape paths.
+        ###      Same ramp gates J_slack so slack at k=0 doesn't dominate.
+        P_wall_ramp = opti.parameter(N + 1)
+        ### HJ : end
+
         # Live-tunable cost parameters (promoted to opti.parameter so they
         # can be updated per-solve from rqt_reconfigure without NLP rebuild).
         # Default values are seeded from self.* in _solve_single_pass; any
@@ -432,7 +444,7 @@ class FrenetKinMPC:
         for k in range(N + 1):
             viol_up = ca.fmax(0.0, n_[k] - (P_dL[k] - buf_c))
             viol_dn = ca.fmax(0.0, -n_[k] - (P_dR[k] - buf_c))
-            J_wall = J_wall + P_w_wall_buf * (viol_up ** 2 + viol_dn ** 2)
+            J_wall = J_wall + P_wall_ramp[k] * P_w_wall_buf * (viol_up ** 2 + viol_dn ** 2)
 
         # v3: solution continuity — pulls new n[k] toward prev solution's
         # shifted n[k+1]. w_cont * Σ (n - n_prev)^2 with per-tick gate.
@@ -447,7 +459,7 @@ class FrenetKinMPC:
 
         J_slack = 0
         for k in range(N + 1):
-            J_slack = J_slack + P_w_slack * slk[k] ** 2
+            J_slack = J_slack + P_wall_ramp[k] * P_w_slack * slk[k] ** 2
 
         J = (J_contour + J_reg + J_dd + J_dd_rate + J_smooth_a
              + J_progress + J_obs + J_bias + J_wall
@@ -484,6 +496,8 @@ class FrenetKinMPC:
                           obs_active=P_obs_active,
                           bias_L=P_bias_L, bias_R=P_bias_R,
                           n_prev=P_n_prev, cont_active=P_cont_active,
+                          ### HJ : per-step wall ramp (A4-b)
+                          wall_ramp=P_wall_ramp,
                           # Live-tunable cost parameters
                           q_n=P_q_n, q_n_ramp=P_q_n_ramp,
                           q_n_term=P_q_n_term, q_v_term=P_q_v_term,
@@ -503,6 +517,20 @@ class FrenetKinMPC:
         self.ready = True
 
     # ----------------------------------------------------------------- helpers
+    ### HJ : 2026-04-26 (A4-b) — push per-step wall_buf weight ramp.
+    ###      arr length must equal N+1, values typically 0..1.
+    ###      None → reset to all-ones (default behaviour).
+    def set_wall_ramp(self, arr):
+        if arr is None:
+            self._wall_ramp_arr = None
+            return
+        a = np.asarray(arr, dtype=np.float64).reshape(-1)
+        if a.shape[0] != self.N + 1:
+            raise ValueError(
+                f'set_wall_ramp: expected len={self.N+1}, got {a.shape[0]}')
+        self._wall_ramp_arr = a
+    ### HJ : end
+
     def reset_warm_start(self):
         self._warm_X = None
         self._warm_U = None
@@ -720,7 +748,20 @@ class FrenetKinMPC:
         # rather than snapping to the cap at k=0.
         vmax = self._build_vmax(rv, obstacles, side, v0=v0)
 
-        n0_clamped = float(np.clip(n0, nlb[0], nub[0]))
+        ### HJ : 2026-04-26 (A4-a) — n0 clamp 폐기.
+        ###      Previously clamped ego_n into [nlb[0], nub[0]] for solver
+        ###      stability. But this HID the wall-violation cost from the
+        ###      solver: it thought ego was at corridor edge, so J_wall(k=0)
+        ###      ≈ 0, slack[0] = 0, and the solver had no urgency to escape.
+        ###      Result: when ego started near-wall, solver kept "drifting
+        ###      along wall" instead of converging to GB.
+        ###      Now we pass real n0. Hard initial n[0]==P_n0 with corridor
+        ###      slk[k] absorbs the violation; solver naturally generates an
+        ###      escape path. JIT-safe (no graph change). The wall_ramp added
+        ###      in A4-b/c relaxes wall_buf cost at k=0,1 so the slacked
+        ###      escape stays kinematically smooth.
+        n0_clamped = float(n0)
+        ### HJ : end
 
         obs_s_mat, obs_n_mat, obs_active = self._build_obs_params(obstacles)
 
@@ -767,6 +808,14 @@ class FrenetKinMPC:
         opti.set_value(P['bias_R'], bR)
         opti.set_value(P['n_prev'], n_prev)
         opti.set_value(P['cont_active'], cont_active)
+        ### HJ : push per-step wall ramp. Default = ones (no-op, identical to
+        ###      pre-A4-b behaviour). Node sets it via set_wall_ramp() to
+        ###      relax wall_buf cost at early k when ego is near/past wall.
+        wall_ramp_arr = getattr(self, '_wall_ramp_arr', None)
+        if wall_ramp_arr is None or wall_ramp_arr.shape[0] != self.N + 1:
+            wall_ramp_arr = np.ones(self.N + 1, dtype=np.float64)
+        opti.set_value(P['wall_ramp'], wall_ramp_arr)
+        ### HJ : end
 
         # Push live-tunable cost weights every tick so rqt_reconfigure
         # changes take effect on the next solve.
