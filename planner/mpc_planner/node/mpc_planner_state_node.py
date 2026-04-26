@@ -507,6 +507,15 @@ class MPCPlannerStateNode:
         self._q_n_near_thresh = float(
             rospy.get_param('~q_n_near_thresh', 0.15))
         self._last_q_n_boost_applied = 0.0
+        ### HJ : 2026-04-26 (A4-c) — wall entry ramp tuning knobs.
+        # K_entry = clip(overshoot / step_m, K_min, K_max)
+        self._wall_ramp_step_m = float(
+            rospy.get_param('~wall_ramp_step_m', 0.05))
+        self._wall_ramp_K_min = int(
+            rospy.get_param('~wall_ramp_K_min', 3))
+        self._wall_ramp_K_max = int(
+            rospy.get_param('~wall_ramp_K_max', 10))
+        ### HJ : end
 
         # ### HJ : 2026-04-24 — prediction variance aware obstacle bubble.
         # When enabled, σ_s_obs and σ_n_obs are inflated per tick based on
@@ -1682,6 +1691,65 @@ class MPCPlannerStateNode:
                 rospy.get_name(), e)
 
 
+    ### HJ : 2026-04-26 (A4-c) — graceful corridor entry ramp.
+    ###      Detects if ego is inside the wall_buf cushion or outside the
+    ###      hard corridor. Sets `wall_ramp[k]` so J_wall and J_slack costs
+    ###      are zero at k=0..K_entry-1 and ramp to 1 at K_entry+. This lets
+    ###      the solver "accept" the current wall-violation as a fait
+    ###      accompli at k=0 and produce a smooth escape trajectory; only
+    ###      from K_entry onward is wall enforcement at full strength.
+    ###      K_entry chosen so escape rate ≤ a_lat_max ≈ 5 m/s² is feasible.
+    def _apply_wall_entry_ramp(self, ego_n, ref_slice):
+        if ref_slice is None:
+            return
+        N1 = self.N + 1
+        # Default: full enforcement at every step.
+        ramp = np.ones(N1, dtype=np.float64)
+
+        # Cushion threshold: |ego_n| inside (d - cushion) means ego in cushion.
+        try:
+            dL_arr = np.asarray(ref_slice['d_left_arr'], dtype=float)
+            dR_arr = np.asarray(ref_slice['d_right_arr'], dtype=float)
+        except KeyError:
+            self.solver.set_wall_ramp(ramp)
+            return
+
+        wall_buf = float(getattr(self.solver, 'wall_buf', 0.30))
+        ego_half = float(getattr(self.solver, 'ego_half', 0.15))
+        buf_c = ego_half + wall_buf  # cushion total depth from wall
+
+        # Use k=0 corridor for entry detection
+        nub_k0 = float(dL_arr[0]) - buf_c          # cushion outer (left)
+        nlb_k0 = -(float(dR_arr[0]) - buf_c)       # cushion outer (right)
+
+        # Compute overshoot beyond cushion
+        if ego_n > nub_k0:
+            overshoot = float(ego_n) - nub_k0
+        elif ego_n < nlb_k0:
+            overshoot = nlb_k0 - float(ego_n)
+        else:
+            # Inside cushion or comfortably inside corridor; no relaxation
+            self.solver.set_wall_ramp(ramp)
+            return
+
+        # K_entry: how many steps to bring ramp to 1.0.
+        # Heuristic: 1 step per `_wall_ramp_step_m` of overshoot, clamped.
+        step_m = max(self._wall_ramp_step_m, 0.02)
+        K_entry = int(np.ceil(overshoot / step_m))
+        K_entry = int(np.clip(K_entry, self._wall_ramp_K_min,
+                              self._wall_ramp_K_max))
+
+        # Linear ramp 0 → 1 over K_entry steps; 1.0 from K_entry onward.
+        for k in range(N1):
+            if k < K_entry:
+                ramp[k] = float(k) / float(K_entry)
+            else:
+                ramp[k] = 1.0
+
+        self.solver.set_wall_ramp(ramp)
+
+    ### HJ : end
+
     # ---------------------------------------------------------------- Variance-aware bubble
     def _apply_variance_inflation(self):
         """### HJ : 2026-04-24 — If ~use_pred_variance is True, inflate
@@ -2239,6 +2307,18 @@ class MPCPlannerStateNode:
         # ### HJ : 2026-04-24 — adaptive recovery q_n near boost (AFTER
         # mode blend so we can read the blended q_n baseline from solver).
         self._apply_recovery_near_boost(ego_n)
+        ### HJ : 2026-04-26 (A4-c) — graceful corridor entry ramp.
+        ###      When ego starts near/past wall, ramp wall_buf weight from
+        ###      0 at k=0 → 1 over K_entry steps. K_entry scales with how
+        ###      deep ego is in the cushion / outside corridor.
+        if self.solver_backend == 'frenet_kin':
+            try:
+                self._apply_wall_entry_ramp(ego_n, ref_slice)
+            except Exception as _e:
+                rospy.logwarn_throttle(
+                    2.0, '[mpc][%s] wall_ramp apply failed: %s',
+                    rospy.get_name(), _e)
+        ### HJ : end
 
         warm_used = int(bool(getattr(self.solver, 'warm', False)))
 
