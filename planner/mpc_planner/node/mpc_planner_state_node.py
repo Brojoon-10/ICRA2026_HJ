@@ -516,6 +516,17 @@ class MPCPlannerStateNode:
         self._wall_ramp_K_max = int(
             rospy.get_param('~wall_ramp_K_max', 10))
         ### HJ : end
+        ### HJ : 2026-04-26 (A6) — post-OT q_n boost (decay over K ticks).
+        ###      On WITH_OBS → NO_OBS transition, kick q_n above the NO_OBS
+        ###      baseline for K ticks (linear decay) to pull ego back to GB
+        ###      decisively before any wobble can compound. Combined with A5
+        ###      (warm-start reset) and the existing _apply_recovery_near_boost.
+        self._post_ot_boost_amount = float(
+            rospy.get_param('~post_ot_boost_amount', 50.0))
+        self._post_ot_boost_total_ticks = int(
+            rospy.get_param('~post_ot_boost_total_ticks', 15))
+        self._post_ot_boost_ticks_left = 0
+        ### HJ : end
 
         # ### HJ : 2026-04-24 — prediction variance aware obstacle bubble.
         # When enabled, σ_s_obs and σ_n_obs are inflated per tick based on
@@ -1657,6 +1668,9 @@ class MPCPlannerStateNode:
                         rospy.get_name())
                 except Exception:
                     pass
+                ### HJ : 2026-04-26 (A6) — kick post-OT q_n boost.
+                self._post_ot_boost_ticks_left = self._post_ot_boost_total_ticks
+                ### HJ : end
             ### HJ : end
         else:
             self._mode_dwell += 1
@@ -1690,11 +1704,23 @@ class MPCPlannerStateNode:
         if self._mpc_mode != MPC_MODE_NO_OBS:
             # outside recovery: clear any residual boost
             target_boost = 0.0
+            # A6: also clear post-OT countdown (we're not in NO_OBS).
+            self._post_ot_boost_ticks_left = 0
         else:
             n_abs = abs(float(ego_n))
             thresh = max(self._q_n_near_thresh, 1e-3)
             factor = max(0.0, 1.0 - n_abs / thresh)
-            target_boost = self._q_n_near_boost * factor
+            near_boost = self._q_n_near_boost * factor
+            ### HJ : 2026-04-26 (A6) — transient post-OT boost, linear decay.
+            if self._post_ot_boost_ticks_left > 0:
+                decay = (float(self._post_ot_boost_ticks_left)
+                         / float(max(self._post_ot_boost_total_ticks, 1)))
+                post_ot_boost = self._post_ot_boost_amount * decay
+                self._post_ot_boost_ticks_left -= 1
+            else:
+                post_ot_boost = 0.0
+            ### HJ : end
+            target_boost = near_boost + post_ot_boost
 
         if abs(target_boost - self._last_q_n_boost_applied) < 1e-3:
             return
