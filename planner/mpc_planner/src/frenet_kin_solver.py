@@ -571,17 +571,28 @@ class FrenetKinMPC:
         return nlb, nub
 
     def _build_vmax(self, ref_v, obs_arr, side, v0=None):
-        """TRAIL caps vmax so ego falls behind the lead obstacle.
+        """Compute per-step vmax[k] for the horizon.
 
-        ### HJ : v3c — when side==TRAIL and v0 > cap, the cap is reached by
-        ramping vmax[k] from v0 down over |v0-cap|/a_dec_ramp seconds. This
-        keeps the NLP feasible while still enforcing the cap in the mid/late
-        horizon. Without the ramp, vmax[0]=cap < v0 conflicts with the
-        v_[0]==v0 equality and IPOPT returns Infeasible_Problem_Detected.
+        ### HJ : 2026-04-26 (A1) — universal v0-protect ramp.
+        ###      Previously only TRAIL applied a ramp from v0; non-TRAIL paths
+        ###      were left with vmax[k] = min(ref_v[k], v_max). When ref_v
+        ###      itself drops below v0 (entering a slow corner), the same
+        ###      v_[1] <= vmax[1] vs v_[0] = v0 conflict happens — IPOPT
+        ###      returns Infeasible_Problem_Detected even though the physical
+        ###      problem is solvable (just need a few ticks of deceleration).
+        ###      Fix: regardless of side, lift vmax[k] up to v0_ramp_floor[k]:
+        ###          vmax[k] = max(cap[k], v0 - a_dec_ramp · k · dT)
+        ###      cap[k] = base cap (ref_v + v_max + TRAIL obs cap if active).
+        ###      vmax[0] is therefore always ≥ v0 → v_[0]==v0 satisfies bound.
+        ###      As k grows, ramp drops; once below cap, cap takes over (true
+        ###      enforcement). a_dec_ramp ≤ |a_min| guarantees feasibility.
         """
-        vmax = np.minimum(np.asarray(ref_v, dtype=float), self.v_max)
+        # ---- base cap (ref_v + v_max global) ----
+        cap = np.minimum(np.asarray(ref_v, dtype=float), self.v_max)
+
+        # ---- TRAIL obstacle cap ----
         if side == SIDE_TRAIL and obs_arr is not None:
-            cap = self.v_max
+            obs_cap = self.v_max
             for o in range(obs_arr.shape[0]):
                 if float(np.max(obs_arr[o, :, 2])) <= 0.0:
                     continue
@@ -589,21 +600,25 @@ class FrenetKinMPC:
                 sN = float(obs_arr[o, -1, 0])
                 v_obs_s = max((sN - s0)
                               / max(self.N * self.dT, 1e-3), 0.0)
-                cap = min(cap, max(v_obs_s * 0.95, self.v_min))
-            # Ramp from max(v0, cap) down to cap using a_dec_ramp m/s².
-            # k=0 always ≥ v0 so v_[0]==v0 stays feasible; cap is reached at
-            # step k* = ceil(max(v0-cap,0)/(a_dec_ramp*dT)), from there on
-            # all stages get the tight obstacle cap.
+                obs_cap = min(obs_cap, max(v_obs_s * 0.95, self.v_min))
+            cap = np.minimum(cap, obs_cap)
+
+        # ---- universal v0-protect ramp ----
+        if v0 is not None:
             a_dec_ramp = float(getattr(self, 'a_dec_ramp', 3.0))
-            if v0 is None:
-                ramp_start = cap
-            else:
-                ramp_start = max(float(v0), cap)
             N1 = self.N + 1
-            ramp = np.empty(N1, dtype=float)
-            for k in range(N1):
-                ramp[k] = max(cap, ramp_start - a_dec_ramp * self.dT * k)
-            vmax = np.minimum(vmax, ramp)
+            v0f = float(v0)
+            v0_ramp = np.array([
+                max(self.v_min + 0.1, v0f - a_dec_ramp * self.dT * k)
+                for k in range(N1)
+            ], dtype=float)
+            # vmax[k] = max(cap[k], v0_ramp[k])
+            #   - early k: v0_ramp ≥ v0, cap may be < v0 → vmax follows ramp
+            #   - late k: v0_ramp drops below cap → vmax follows cap (enforce)
+            vmax = np.maximum(cap, v0_ramp)
+        else:
+            vmax = cap
+
         vmax = np.maximum(vmax, self.v_min + 0.1)
         return vmax
 
