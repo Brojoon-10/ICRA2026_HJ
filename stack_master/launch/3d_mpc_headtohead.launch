@@ -73,6 +73,15 @@
     <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="start_planner" /></include>
     <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="static_avoidance_planner" /></include>
     <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="dynamic_avoidance_planner" /></include>
+    <!-- ### HJ : 2026-04-26 (A3) — bump freshness thresholds 0.1→0.2 for MPC
+         fork only. Bag analysis showed solver's worst-case fail (~50ms) +
+         normal cycle slip (~30ms) + SM callback latency could add up to 90ms,
+         enough to spuriously trip the 100ms threshold and flap to GB. 200ms
+         absorbs cycle slips comfortably while still failing safe if MPC truly
+         dies. Overrides applied AFTER includes so they win. -->
+    <param name="dynamic_avoidance_planner/latest_threshold" value="0.2"/>
+    <param name="recovery_planner/latest_threshold"          value="0.2"/>
+    <param name="static_avoidance_planner/latest_threshold"  value="0.2"/>
   </group>
 
   <!-- ══════════════════ 3D PLANNERS (enable_planners:=True) ══════════════════ -->
