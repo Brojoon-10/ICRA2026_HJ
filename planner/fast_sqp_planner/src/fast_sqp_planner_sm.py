@@ -371,7 +371,7 @@ class StateMachine:
     def _ot_iy_cb(self, data: OTWpntArray):
         if len(data.wpnts) > 0:
             self._ot_iy_wpnts = list(data.wpnts)
-        else:
+        elif self.cur_state != StateType.TRAILING:
             self._ot_iy_wpnts = None
 
     def _opponent_dist_cb(self, msg):
