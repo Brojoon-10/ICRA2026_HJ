@@ -1738,6 +1738,53 @@ class MPCPlannerStateNode:
                 rospy.get_name(), e)
 
 
+    ### HJ : 2026-04-26 — tick_json diagnostic helpers (A1, A4).
+    def _build_a1_vmax_debug(self):
+        """Sample solver-built vmax[k] to check ramp shape per tick."""
+        try:
+            vmax = getattr(self.solver, '_last_vmax', None)
+            if vmax is None:
+                return {'k0': None, 'k1': None, 'k_mid': None, 'k_end': None,
+                        'monotone_dec': None, 'cap_min': None}
+            arr = np.asarray(vmax, dtype=float)
+            N1 = arr.shape[0]
+            mid = N1 // 2
+            return {
+                'k0': round(float(arr[0]), 3),
+                'k1': round(float(arr[1]), 3) if N1 > 1 else None,
+                'k_mid': round(float(arr[mid]), 3),
+                'k_end': round(float(arr[-1]), 3),
+                'cap_min': round(float(arr.min()), 3),
+                'monotone_dec': bool(np.all(np.diff(arr) <= 1e-6)),
+            }
+        except Exception:
+            return {'k0': None, 'k1': None, 'k_mid': None, 'k_end': None,
+                    'monotone_dec': None, 'cap_min': None}
+
+    def _build_a4_wall_ramp_debug(self):
+        """Report current wall_ramp[k] state and entry detection."""
+        try:
+            ramp = getattr(self.solver, '_wall_ramp_arr', None)
+            if ramp is None:
+                return {'active': False, 'k0': None, 'k1': None, 'k2': None,
+                        'first_full_k': None, 'K_entry': None}
+            arr = np.asarray(ramp, dtype=float)
+            idx_full = np.where(arr >= 0.999)[0]
+            first_full = int(idx_full[0]) if idx_full.size > 0 else None
+            active = bool(arr[0] < 0.999)
+            return {
+                'active': active,
+                'k0': round(float(arr[0]), 3),
+                'k1': round(float(arr[1]), 3) if arr.shape[0] > 1 else None,
+                'k2': round(float(arr[2]), 3) if arr.shape[0] > 2 else None,
+                'first_full_k': first_full,
+                'K_entry': first_full,
+            }
+        except Exception:
+            return {'active': False, 'k0': None, 'k1': None, 'k2': None,
+                    'first_full_k': None, 'K_entry': None}
+    ### HJ : end
+
     ### HJ : 2026-04-26 (A4-c) — graceful corridor entry ramp.
     ###      Detects if ego is inside the wall_buf cushion or outside the
     ###      hard corridor. Sets `wall_ramp[k]` so J_wall and J_slack costs
@@ -3459,6 +3506,21 @@ class MPCPlannerStateNode:
                 round(float(getattr(self, '_last_applied_weight_alpha', 0.0)), 3)
                 if getattr(self, '_last_applied_weight_alpha', None) is not None else None),
             'q_n_near_boost_applied': round(float(getattr(self, '_last_q_n_boost_applied', 0.0)), 3),
+            ### HJ : 2026-04-26 — A1-A6 debug fields.
+            'a1_vmax': self._build_a1_vmax_debug(),
+            'a4_wall_ramp': self._build_a4_wall_ramp_debug(),
+            'a5_a6_transition': {
+                'post_ot_boost_ticks_left': int(getattr(self, '_post_ot_boost_ticks_left', 0)),
+                'post_ot_boost_total_ticks': int(getattr(self, '_post_ot_boost_total_ticks', 0)),
+                'post_ot_boost_amount': round(float(getattr(self, '_post_ot_boost_amount', 0.0)), 2),
+                # Decay value at this tick (active boost contribution to q_n)
+                'post_ot_boost_active': round(
+                    float(self._post_ot_boost_amount
+                          * self._post_ot_boost_ticks_left
+                          / max(self._post_ot_boost_total_ticks, 1))
+                    if self._post_ot_boost_ticks_left > 0 else 0.0, 3),
+            },
+            ### HJ : end
             'painter': {
                 'seam_idx': int(getattr(self, '_last_painter_seam_idx', -1)),
                 'blend_applied': bool(getattr(self, '_last_painter_blend_applied', False)),
