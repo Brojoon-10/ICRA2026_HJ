@@ -212,6 +212,12 @@ class OvertakingIYNode:
 
     ## IY : dynamic_reconfigure callback — live parameter tuning
     def _dyn_reconfigure_cb(self, config, level):
+        ## IY : reload GGV from disk when checkbox checked
+        if getattr(config, 'reload_ggv', False):
+            rospy.loginfo('[OvertakingIY] reload_ggv triggered — reloading from disk')
+            self._load_ggv()
+            config.reload_ggv = False
+        ## IY : end
         if config.velocity_mode != self.velocity_mode:
             rospy.loginfo('[OvertakingIY] velocity_mode: %s → %s',
                           self.velocity_mode, config.velocity_mode)
@@ -680,15 +686,16 @@ class OvertakingIYNode:
         del_mrk.ns = 'rolling_path'
         del_mrk.action = Marker.DELETEALL
         mrks.markers.append(del_mrk)
-        vmax = self.scaled_vmax if self.scaled_vmax else 1.0
+        scale_factor = 0.1317  ## IY : match vel_markers_tuned scale
         ttl = rospy.Duration(max(0.2, 3.0 / self.rate_hz))
         for i in range(len(s_arr)):
+            height = v_arr[i] * scale_factor
             m = Marker(header=Header(stamp=rospy.Time.now(), frame_id='map'))
             m.ns = 'rolling_path'
             m.type = m.CYLINDER
             m.scale.x = 0.1
             m.scale.y = 0.1
-            m.scale.z = max(v_arr[i] / vmax, 0.05)
+            m.scale.z = max(height, 0.05)
             m.color.a = 0.45 if dry_run else 1.0
             if dry_run:
                 m.color.r, m.color.g, m.color.b = 1.0, 0.55, 0.0   # orange ghost
@@ -697,7 +704,7 @@ class OvertakingIYNode:
             m.id = i
             m.pose.position.x = x_arr[i]
             m.pose.position.y = y_arr[i]
-            m.pose.position.z = v_arr[i] / vmax / 2.0
+            m.pose.position.z = height / 2.0
             m.pose.orientation.w = 1.0
             m.lifetime = ttl
             mrks.markers.append(m)
