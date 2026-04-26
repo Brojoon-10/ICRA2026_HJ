@@ -1,212 +1,317 @@
-# ============================================================
-# ### HJ : state_overtake.yaml
-# MPC planner — `~state:=overtake` preset.
+# =============================================================================
+#  state_overtake.yaml  —  MPC planner preset for ~state:=overtake
+# =============================================================================
 #
-# Purpose:
-#   Replaces spliner / SQP / static_avoidance / lane_change. Reference is
-#   raceline (/global_waypoints); avoidance emerges from NLP itself under
-#   the soft repulsive obstacle cost (Phase 3.5 Stage-1). Output topic
-#   (via launch remap): /planner/avoidance/otwpnts_observation
-#   (attach_to_statemachine:=false keeps it debug-only).
+#  Backend   : FrenetKinMPC v3c (src/frenet_kin_solver.py)
+#  Role      : Raceline-following MPC with soft obstacle/wall cushions.
+#              Output is remapped to /planner/avoidance/otwpnts_observation
+#              (observation-only; state_machine is not wired in yet).
+#  Reference : /global_waypoints (raceline). Avoidance direction is picked
+#              by the external SideDecider (LEFT / RIGHT / TRAIL / CLEAR);
+#              the NLP only sees a one-sided soft bias.
 #
-# Design deltas vs. observe:
-#   - w_contour ↓  — raceline pull is weakened so the solver can swing wide
-#                    for avoidance.
-#   - w_dsteering ↑ — lane-change must stay smooth.
-#   - boundary_inflation ↓ — corridor usable closer to edges.
-#   - ipopt_max_iter ↑     — NLP harder with obstacle terms, need more iters.
-#   - w_velocity will be dropped to 0.1 in Phase 4 (shape-first). For now
-#     the original 3.0 is kept so Phase 3 changes are isolated to cost
-#     reshaping + obstacle stubs.
+#  Cost hierarchy kept across every tuning change:
+#       w_slack ( 5000 )  >  w_wall_buf ( 2500 )  >  w_obs ( 180 )
+#    -> "corridor is hard, wall is absolute, obstacle is a preference."
 #
-# Obstacle terms (collision_mode / w_obstacle / obstacle_sigma / n_obs_max /
-# w_wall / wall_safe) become active once Phase 3.5 injects the repulsive cost into the
-# solver. Before then the node reads them but the solver ignores them.
-# ============================================================
+#  See HJ_docs/mpc_design.md for a full derivation and per-term walkthrough.
+# =============================================================================
 
-planner_freq: 30
 
-# Horizon
-N: 20
-dT: 0.05
+# ---- Plan loop ---------------------------------------------------------------
+planner_freq: 30          # Hz. Tick rate of the plan loop; solve_ms p99 ~32 ms
+                          # @ ma27+JIT, so up to ~100 Hz is feasible, but 30 Hz
+                          # matches the predictor freshness and the controller.
 
-# Vehicle
-vehicle_L: 0.33
+# ---- Horizon -----------------------------------------------------------------
+N: 20                     # prediction steps
+dT: 0.05                  # s per step  ->  1.0 s look-ahead
 
-# Limits
-# ### HJ : Phase 4 — min_speed=0 허용. velocity planner가 덮어쓰는 "형상 우선"
-# 솔버이므로 MPC 내부 속도 하한은 의미가 옅음. degeneracy 는 solver의
-# kinematic_v_eps + w_steer_reg 로 방어.
-max_speed: 10.0
-min_speed: 0.0
-max_steering: 0.6
+# ---- Vehicle -----------------------------------------------------------------
+vehicle_L: 0.33           # wheelbase [m] (1:10 F1Tenth)
 
-# Cost weights
-# ### HJ : Phase 4 — w_velocity ↓ (3.0→0.1), v_bias_max ↑ (1.5→3.0).
-# 속도는 2.5d vel planner가 덮어쓰니 tiny anchor만 유지. 형상 중심 cost.
-w_contour: 2.0       # ↓ (allow lateral deviation for avoidance)
-w_lag: 0.8
-w_velocity: 0.1
-v_bias_max: 3.0
+# ---- Kinematic bounds --------------------------------------------------------
+max_speed: 10.0           # hard upper v bound [m/s]
+min_speed: 0.0            # hard lower v bound. 0 is safe because the solver's
+                          # kinematic_v_eps + steer regulariser prevent the
+                          # degenerate v=0 fixed point; the outer velocity
+                          # planner overrides speed anyway (shape-first solver).
+max_steering: 0.6         # |delta| max [rad]  (~34 deg)
 
-# ### HJ : v3 — stage ramps OFF (1.0 = flat). v2c's 0.4/0.6 made near-car
-# contour weight ~0.8 vs late-horizon ~2.0 → U-shape pull → "only trajectory
-# end leaves the wall" with straight-line kinks mid-horizon. v3 uses uniform
-# q_n over the horizon + terminal q_n_term (see below) to shape return to
-# raceline; legacy MPCC still honours the ramp knobs.
-contour_ramp_start: 1.0
-lag_ramp_start: 1.0
 
-# Smoothness
-w_dv: 9.5
-w_dsteering: 20.0    # ↑ (smooth lane change)
+# =============================================================================
+#  Running cost weights
+# =============================================================================
 
-# Boundary
-# ### HJ : v2c — w_slack 2000→5000. v2b capture showed solver preferred
-# wall penetration (margin_R_min=-0.139, slack≈0.22m) over obstacle
-# avoidance (cost_obs=500-663) because cost_slack=450-556 was cheaper.
-# Raising w_slack ×2.5 makes corridor violation strictly more expensive
-# than even max obstacle pushback.
-# ### HJ : v3b — wall_safe is a BODY-EDGE safety requirement, NOT a
-# centroid one. Solver.wall_safe + inflation + ego_half_width together
-# form the hard corridor for the centroid; the body edge is guaranteed
-# to stay ≥ wall_safe + inflation = 0.20 m from the wall regardless of
-# solver tricks. If corridor is too narrow to pass a side, side_decider
-# MUST force SIDE_TRAIL instead of relaxing this margin — the v_max cap
-# in _build_vmax then produces a safe trailing trajectory.
-boundary_inflation: 0.05
-w_slack: 5000.0
+# ---- Raceline contour --------------------------------------------------------
+q_n: 3.0                  # Sum n_k^2  running contour weight (constant across k).
 
-# IPOPT
-# ### HJ : v3b — 1000→200. 210ms infeasible solves = IPOPT burning the full
-# iter budget before declaring failure. Typical successful solve is ~15 iter,
-# so 200 is >10× headroom. Clips worst-case fail to ~40ms → fallback ladder
-# engages 5× faster, total "solver dead" gap 0.87s → ~0.17s.
-ipopt_max_iter: 200
-ipopt_print_level: 0
-# ### HJ : v3c+ — HSL ma27 (2~3× faster than MUMPS on our sparsity).
-# libhsl.so path: /usr/local/lib/python3.8/dist-packages/casadi/libhsl.so
-# (symlink to fast_ggv_gen/solver/install/.../libcoinhsl.so, built by
-# setup_hsl.sh). Auto-falls back to 'mumps' with warning if libhsl.so not
-# loadable (see _resolve_linear_solver in frenet_kin_solver.py).
-linear_solver: ma27
+# ### HJ : 2026-04-24 — stage n k-ramp. Effective q_n at step k is
+#   q_n_k = q_n + q_n_ramp · (k / N)
+# Early k (close to ego) uses q_n (low → solver free to deviate around
+# obstacles). Late k progressively enforces n→0 via q_n + q_n_ramp,
+# so the horizon tail converges to raceline before the terminal cost
+# kicks in. Recovery mode overrides this in no_obs_profile (larger ramp).
+q_n_ramp: 8.0             # WITH_OBS: gentle ramp (k=N stage weight = 11)
+                          # Higher -> tighter raceline pull (narrower avoidance);
+                          # lower  -> freer swing for overtake.
+w_contour: 2.0            # legacy MPCC weight (ignored by frenet_kin solver)
+w_lag: 0.8                # legacy MPCC weight (ignored by frenet_kin solver)
 
-# ### HJ : v3c+ — CasADi JIT. Compiles IPOPT's symbolic functions
-# (objective / constraints / Jacobian / Hessian) to native C at solver
-# construction. Cold-start: +10-20s one-time compile. Runtime: extra
-# function-eval gain on top of HSL. Set 'ipopt_jit: false' to skip compile.
-ipopt_jit: true
+contour_ramp_start: 1.0   # legacy MPCC stage-ramp (flat=off). Kept for the
+lag_ramp_start: 1.0       # legacy backend; v3 uses uniform q_n + terminal q_n_term.
 
-# Obstacle cost (Phase 3.5 Stage-1)
-# ### HJ : tuning 이력
-#   - σ=0.35 (초기): d=1m 에서 cost=8.4 (무의미). 궤적이 observe와 거의
-#     동일. σ 너무 좁음.
-#   - σ=0.7, w=800 (시도): horizon 전체가 장애물 영향권에 들어가서 여러
-#     방향 밀어내기 충돌 → 궤적 꼬불거림 발생. σ 너무 넓음.
-#   - σ=0.5, w=400 (현재): d=1m 에서 54, d=0.5m 에서 242, d=0.35m 에서
-#     312. 1m 이내 근거리에서만 확실히 밀어내고 원거리는 자연 감쇠.
-collision_mode: soft
-w_obstacle: 400.0
-obstacle_sigma: 0.5
-n_obs_max: 2
-# ### HJ : Convex wall-buffer soft cost — pushes n_k off the corridor edge
-# by `wall_safe` when it hugs within that margin. Quadratic one-sided
-# hinge, so solver stays convex locally (unlike the elliptical hinge that
-# caused warm-start local-min lockups).
-w_wall: 150.0         # legacy MPCC only — FrenetKin uses w_wall_buf below
-# ### HJ : v3c — wall_safe is BODY-EDGE hard-survival margin.
-# Hard solver bound: |n| ≤ d_wall - ego_half(0.15) - wall_safe - inflation.
-# 0.08 → body-edge ≥ 0.13 m hard. Tight but feasible even on 0.8 m-wide
-# sections. Real safety goal (0.20 m body-edge) is enforced by the soft
-# wall_buf cushion below, which has w_wall_buf=2500 to dominate obstacle
-# pushback in normal conditions.
-wall_safe: 0.08
+# ---- Progress ----------------------------------------------------------------
+gamma_progress: 10.0      # -gamma * Sum v_k cos(mu_k) dT  (minimise negative
+                          # arc-length progress). The racing drive term; raising
+                          # it pushes the solver to saturate vmax/corridor.
 
-# ============================================================
-# ### HJ : FrenetKinMPC (solver_backend=frenet_kin) params
-# 2026-04-21 redesign v2: soft obstacle cost + hard corridor on walls only.
-# Corridor now stays the same across LEFT/RIGHT side flips → warm-start
-# survives → trajectory deforms continuously instead of jumping.
-# ============================================================
-# Cost weights (state [n, mu, v], control [a, delta])
-q_n: 3.0              # n^2 contour weight
-gamma_progress: 10.0  # progress (-v) pull
-r_a: 0.5              # Δa smoothness
-r_delta: 1.5          # steer-rate smoothness (5→1.5 made shape less stiff)
-r_steer_reg: 0.1      # steering magnitude regulariser
+# ---- Velocity anchor (legacy only) -------------------------------------------
+w_velocity: 0.1           # tiny anchor to the reference speed profile. The
+                          # external velocity planner overwrites v downstream,
+                          # so this only breaks degeneracy on straights.
+v_bias_max: 3.0           # saturation of the speed-anchor deadband (legacy).
 
-# Soft obstacle bubble (replaces v1 hard half-plane).
-# Bubble is Gaussian in both (s, n). The s-envelope (exp(-ds²/σ_s²)) also
-# gates the side bias, so bias only fires where the obstacle is — corridor
-# stays free away from obstacles (fixes "wall hugging" observed in v2a).
-w_obs: 180.0          # ### HJ : v2c — 300→180. Obstacle push-away must NOT
-                      # outrun wall cushion; wall is absolute, obstacle is
-                      # a preference. Lower w_obs + higher w_wall_buf forces
-                      # solver to pick "wall-respecting detour" even when it
-                      # means passing the obstacle closer than it'd like.
-sigma_s_obs: 0.7      # ~ 2 × car length
-sigma_n_obs: 0.18     # ### HJ : 0.30→0.18 (v2a→v2b). 0.30 swallowed the
-                      # full corridor width (0.9m) and drove slack active.
+# ---- Smoothness --------------------------------------------------------------
+w_dv: 9.5                 # legacy (Delta v)^2 weight for MPCC backend
+w_dsteering: 20.0         # legacy (Delta delta)^2 weight for MPCC backend
 
-# Side bias: proximity-gated one-sided quadratic penalty. Direction flips
-# on side change but COST MAGNITUDE is near-zero outside the obstacle's
-# s-envelope, so LEFT↔RIGHT flips affect only the local neighborhood —
-# trajectory far from the obstacle doesn't wobble.
-w_side_bias: 25.0     # ### HJ : 80→25 (v2a→v2b). 80 + global bias (v2a) drove
-                      # mean bias cost 106 (max 551) >> w_contour — solver
-                      # was chasing bias instead of racing line.
-gap_lat: 0.25         # lateral clearance to obstacle for bias zero-line
-gap_long: 0.8         # (legacy knob; no longer gates any constraint in v2)
+r_a: 0.5                  # (a_{k+1}-a_k)^2  accel-jerk smoothness
+r_steer_reg: 0.1          # delta^2 weak zero-bias (numerical degeneracy guard)
+r_dd: 5.0                 # delta_dot^2  steer-rate penalty  -> curvature is C^1
+r_dd_rate: 1.0            # (delta_dot_{k+1}-delta_dot_k)^2  jerk-like penalty;
+                          # keeps kappa_dot continuous across knots.
+delta_rate_max: 3.0       # hard |delta_dot| bound [rad/s]
 
-# Soft wall cushion — quadratic hinge fires `wall_buf` inside the raw wall.
-# ### HJ : v3 — w_wall_buf 400→2500 (×6). The "boundary-layer glue" that
-# caused straight-line kinks near the wall came from the hard corridor
-# constraint becoming active when the cushion pressure was insufficient.
-# At 2500, hitting the cushion is ~35× more expensive than the obstacle
-# bubble peak, so the solver NEVER approaches the hard bound → trajectory
-# stays smooth all the way to the wall edge.
-w_wall_buf: 2500.0
-wall_buf: 0.30        # > wall_safe(0.10) so soft cushion kicks in first
 
-# ### HJ : v3 — C^1 curvature (δ as state, δ̇ as input). Solver-level
-# smoothness guarantee. r_dd penalises steering-rate, r_dd_rate penalises
-# steering-jerk. Combined → κ(s) continuous AND differentiable.
-r_dd: 5.0
-r_dd_rate: 1.0
-delta_rate_max: 3.0   # rad/s steer-rate limit (hard input bound)
+# =============================================================================
+#  Corridor (hard wall) + soft wall cushion
+# =============================================================================
 
-# ### HJ : v3 — tick-to-tick solution continuity. On each tick the solver
-# pulls n_k toward prev solve's n_{k+1} (shifted). Makes the trajectory
-# morph continuously instead of snapping to a new optimum.
-# ### HJ : v3b — 20→200 (×10). 41-tick capture showed jitter_rms_m p95=0.281
-# (target <0.10). cost.cont was 0.14 mean, way below contour(1.33)/term(0.48),
-# so the solver happily let each step drift ~4cm/tick → √21 × 4cm ≈ 18cm
-# trajectory jitter. Raising w_cont to 200 makes continuity the dominant
-# cost, locking tick-to-tick shape unless a real obstacle/wall forces a move.
-w_cont: 200.0
+# Hard corridor is built as:
+#     |n_k|  <=  d_wall(s_k)  -  ego_half(0.15)  -  inflation  -  wall_safe
+# i.e. the CAR BODY EDGE stays at least (inflation + wall_safe) away from
+# the raw wall, regardless of solver tricks. If no side has that room the
+# SideDecider must force TRAIL; do not relax these two margins.
 
-# ### HJ : v3 — terminal stability cost. Replaces the "only end leaves
-# wall" stage-ramp hack. q_n_term pulls n[N]→0 (raceline), q_v_term
-# pulls v[N]→ref_v.
-q_n_term: 10.0
-q_v_term: 0.5
+boundary_inflation: 0.05  # extra centroid inset on top of wall_safe [m]
+wall_safe: 0.08           # body-edge hard safety margin [m]
+w_slack: 5000.0           # corridor slack cost. Large enough that penetrating
+                          # the hard corridor is strictly more expensive than
+                          # the peak obstacle bubble.
 
-# Side decider hysteresis + feasibility gate (v3).
-side_hold_ticks: 10
-# ### HJ : v3 — feasibility-aware side decision. d_free side slot must
-# clear (ego_half + gap_lat + min_pass_margin) before SideDecider picks it;
-# otherwise forces TRAIL. Prevents "squeeze into 5cm slot" failures.
-min_pass_margin: 0.10
-trail_entry_ticks: 3  # TRAIL fires fast (~0.1s) — "못 갈 것 같으면 바로 감속"
+# Soft wall cushion -- quadratic hinge engaged when the body gets within
+# wall_buf of the raw wall. Dominates the obstacle bubble in normal conditions
+# so the solver picks "wall-respecting detour" even when tempted to hug.
+w_wall_buf: 2500.0        # cushion weight (v3: 400 -> 2500, x6 stiffer)
+wall_buf: 0.30            # cushion thickness [m]  (> wall_safe so it fires first)
 
-# ### HJ : v3 — obstacle s/n EMA filter. Opponent predictor jitter was
-# shaking the bubble centre tick-to-tick and rattling the cost landscape.
-# α=0.30 gives ~3-tick time constant — filtered fast enough that real
-# obstacle motion still tracks.
+# Legacy MPCC wall weight (frenet_kin solver uses w_wall_buf above).
+w_wall: 150.0
+
+
+# =============================================================================
+#  Obstacle avoidance (soft)
+# =============================================================================
+
+collision_mode: soft      # legacy knob; frenet_kin always uses the soft bubble
+n_obs_max: 2              # NLP slots allocated for obstacles. Unused slots are
+                          # masked by obs_active=0.  TODO: revisit vs. actual
+                          # runtime opponent count.
+
+# ### HJ : 2026-04-24 — obstacle SLOT ACTIVATION gate. Different from
+# `w_obs` (solver cost magnitude, below). `_build_obstacle_array_frenet`
+# gates the whole pipeline on `w_obstacle > 0`:
+#   if collision_mode=='none' or w_obstacle<=0: return 'disabled' (no obs slots active)
+# Previously missing from this YAML → defaulted to 0.0 → obstacles were
+# silently dropped even when /opponent_prediction/obstacles published at
+# 1+ kHz. Setting to 1.0 activates the slots; the actual cost magnitude
+# per-step is w_obs * obs_arr[o,k,2] = 180 * 1.0 = 180.
+w_obstacle: 1.0
+
+# Gaussian bubble on both (s, n). The s-envelope exp(-(ds/sigma_s)^2) gates
+# the per-k cost so far-away obstacles do not push the whole horizon.
+w_obs: 260.0              # ### HJ 2026-04-24: 180→260. bubble peak. User obs:
+                          #   "장애물 옆 나란히 떨어지는 무브먼트 없음" — strengthen.
+                          #   Must stay below w_wall_buf=2500 so wall wins.
+sigma_s_obs: 0.7          # longitudinal scale ~ 2 x car length
+sigma_n_obs: 0.35         # ### HJ 2026-04-24: 0.18→0.35. lateral bubble doubled so
+                          #   obs push felt at 0.3 m lateral gap (was 0.06 weak).
+obstacle_sigma: 0.5       # legacy MPCC scalar (single-axis bubble)
+
+# Side bias -- one-sided quadratic hinge, direction set by SideDecider.
+# prox_s gates it so flips only perturb the region near the obstacle.
+w_side_bias: 55.0         # ### HJ 2026-04-24: 25→55. commit side stronger so
+                          #   solver stays on chosen LEFT/RIGHT during pass.
+gap_lat: 0.35             # ### HJ 2026-04-24: 0.25→0.35. hinge zero moved out so
+                          #   the solver's "stay past this n" region is wider during pass.
+gap_long: 0.8             # legacy knob (no constraint uses it anymore)
+
+
+# =============================================================================
+#  Solver continuity & terminal stability
+# =============================================================================
+
+# Tick-to-tick continuity -- pulls n_k toward the prev solve's n_{k+1}-shifted.
+# Keeps the trajectory locked unless a real obstacle/wall forces motion.
+w_cont: 200.0             # v3b raised 20 -> 200 after jitter_rms p95=0.28 m.
+
+# Terminal cost -- replaces the v2 stage ramp. Pulls horizon end back to the
+# raceline and near the reference speed, no matter the mid-horizon shape.
+q_n_term: 10.0            # n_N^2 terminal weight
+q_v_term: 0.5             # (v_N - v_ref_N)^2 terminal weight
+
+
+# =============================================================================
+#  External SideDecider (src/side_decider.py)
+# =============================================================================
+
+side_hold_ticks: 10       # LEFT<->RIGHT flip hysteresis (~0.33 s @ 30 Hz)
+trail_entry_ticks: 3      # ANY -> TRAIL fires in ~0.1 s
+                          # ("못 갈 것 같으면 바로 감속" semantics)
+min_pass_margin: 0.10     # feasibility gate [m]. A side is viable only if
+                          # d_free >= ego_half + gap_lat + min_pass_margin;
+                          # otherwise TRAIL is forced.
+
+### HJ : obstacle half_width source for SideDecider feasibility math.
+###      "fixed" — always use obstacle_half_width_fixed (current behaviour, conservative)
+###      "msg"   — use obstacle.size / 2 from prediction/tracking (per-obstacle).
+###      Switch in real-time by editing this yaml + reload (no rebuild).
+obstacle_size_source: "fixed"
+obstacle_half_width_fixed: 0.15   # used when obstacle_size_source == "fixed"
+obstacle_half_min: 0.05           # safety floor when source == "msg" and obs.size is tiny/zero
+### HJ : end
+
+
+# =============================================================================
+#  Predictor / obstacle filtering
+# =============================================================================
+
+# EMA on the obstacle's (s, n) before injection. alpha=0.30 gives a ~3-tick
+# time constant -- fast enough to track real motion, slow enough to damp
+# predictor jitter that was otherwise rattling the bubble centre.
 obs_ema_alpha: 0.30
 
-# ### HJ : v3 — TRAIL velocity ramp. On TRAIL commit, v_max cap is ramped
-# in over 8 ticks (~0.27s) rather than snapping. Node-side param.
+
+# =============================================================================
+#  TRAIL velocity ramp (node-side)
+# =============================================================================
+
+# On TRAIL commit the v_max cap is reached by ramping from v0 at a_dec_ramp
+# m/s^2 so v[0]=v0 stays feasible (the alternative snap to cap breaks the
+# v[0]==v0 equality and IPOPT returns Infeasible_Problem_Detected).
 trail_vel_ramp_ticks: 8
 
-# (ipopt_max_iter 200 above — iter=15 typical, 200 caps worst-case fail ~40ms)
+
+# =============================================================================
+#  IPOPT
+# =============================================================================
+
+ipopt_max_iter: 200       # Typical successful solve converges in ~15 iters.
+                          # 200 caps worst-case failure to ~40 ms so the
+                          # fallback ladder engages quickly.
+ipopt_print_level: 0
+
+# Linear solver. HSL ma27 is ~2x faster than MUMPS on this sparsity pattern.
+# libhsl.so is provided by planner/3d_gb_optimizer/fast_ggv_gen/solver/setup_hsl.sh
+# (symlinked into CasADi's dist-packages). If HSL is not loadable, the solver
+# auto-falls back to 'mumps' with a warnings.warn, so this value is safe for
+# teammates without HSL installed.
+linear_solver: ma27
+
+# CasADi JIT. Compiles IPOPT's symbolic objective / constraint / Jacobian /
+# Hessian to native C on construction (cold-start +10-20 s). Combined with
+# ma27, solve_ms drops p50 45.5 -> 9.3 (4.9x) and p99 91.1 -> 32.5 (2.8x).
+# Set to false to skip the compile step entirely.
+ipopt_jit: true
+
+
+# =============================================================================
+#  ### HJ : Phase X (refactored) — 2-state FSM (WITH_OBS / NO_OBS)
+# =============================================================================
+# Only consumed under ~state:=auto. Legacy overtake/recovery/observe launches
+# pin _mpc_mode at init and ignore runtime transitions.
+#
+# The MPC always solves a single NLP. Obstacle-presence toggles the cost
+# profile between the top-level YAML (WITH_OBS, "avoid + trail mix") and
+# no_obs_profile (NO_OBS, "pure GB convergence"). A smooth alpha ramp over
+# K_trans ticks interpolates the two profiles on mode flip so the output
+# trajectory stays continuous even though obstacle presence is discrete.
+
+# --- Dwell / transition shape ---
+mode_dwell_min_ticks: 2   # minimum dwell per mode (anti-chatter at horizon edge)
+K_trans:              8   # alpha ramp length between WITH_OBS (0) and NO_OBS (1)
+
+# --- Obstacle horizon scope for FSM ---
+horizon_s_pred: 8.0       # (legacy single threshold; kept for backward compat but no longer
+                          #  used by mode FSM — see obs_enter_dist_m / obs_exit_dist_m below)
+
+# ### HJ : 2026-04-24 — asymmetric enter/exit hysteresis on WITH_OBS/NO_OBS.
+# Approach: stays NO_OBS (GB-like) until obs is inside obs_enter_dist_m.
+# Recede:   stays WITH_OBS (OT-style) until obs passes obs_exit_dist_m.
+# Stale / no-obstacle: NO_OBS automatically (min_obs_ds = inf).
+# In the 5-10 m band the mode is determined by history (last state holds).
+obs_enter_dist_m: 5.0     # NO_OBS → WITH_OBS trigger
+obs_exit_dist_m:  10.0    # WITH_OBS → NO_OBS trigger (must be > enter)
+
+# ### HJ : 2026-04-24 — adaptive recovery q_n boost (NO_OBS mode only).
+# When ego is close to GB, the k-ramp alone only pulls the terminal tight;
+# user directive: "가까워질수록 가까운 곳부터도 gb에 빨리 수렴". Add a
+# |ego_n|-driven boost on the stage q_n so the early horizon also snaps:
+#   q_n_effective = q_n_blended + q_n_near_boost · max(0, 1 - |ego_n|/thresh)
+# At |ego_n| = 0: full boost (snap immediately). At |ego_n| >= thresh: no
+# boost (smooth curve for larger deviations so steering stays calm).
+q_n_near_boost:  30.0     # added to q_n when ego on GB line
+q_n_near_thresh: 0.15     # |ego_n| above this → no boost (smooth recovery)
+
+# --- Output densify step (matches GB waypoint_dist for SM slicer symmetry) ---
+mpc_output_ds: 0.1        # linear-interp wpnts to this s step before publish
+
+# --- Speed painter ---
+painter_enable:  true
+painter_n_near:  0.15     # |d_m| < this → seam blend starts (WITH_OBS → GB stitch)
+painter_K_blend: 10       # blend window (waypoints; ~0.5 s @ 20 Hz tick)
+painter_a_max:   3.0      # forward accel limit for vx continuity (m/s²)
+
+# --- Path continuity guard (tick-to-tick L2 blend) ---
+continuity_guard_enable:   true
+continuity_K_guard:        5
+continuity_threshold_m:    0.15
+
+
+# =============================================================================
+#  ### HJ : Phase X (refactored) — NO_OBS weight profile
+# =============================================================================
+# Applied via FrenetKinMPC.update_weights() each tick at `alpha_ramp` →
+# blend = (1-α)·WITH_OBS_baseline + α·no_obs_profile.  α is 1.0 when
+# mpc_mode == NO_OBS and ramps linearly during transitions.
+#
+# GOAL: when no obstacle, solver output should track GB line tightly.
+#  - obstacle cost fully off
+#  - strong terminal + stage n→0 pull  (q_n, q_n_term both up)
+#  - softer continuity so a mistake from previous tick doesn't compound
+#    (the user-reported "꼬불거림" is this compounding)
+#  - gentle progress (no aggressive sprint that pulls n off raceline)
+
+no_obs_profile:
+  w_obs:          0.0      # obstacle cost fully off
+  ### HJ : 2026-04-26 v3 — early-front-loaded ramp ("snap-near-GB" shape).
+  ###      User insight: recovery should pull HARDER as ego approaches GB,
+  ###      not weaker. Quadratic q_n·n^2 has gradient ∝ n → weakest near 0,
+  ###      so ego "glides" parallel near raceline instead of snapping.
+  ###      Without changing solver structure, we can REVERSE the ramp:
+  ###      q_n_k = q_n + q_n_ramp · (k/N).  With q_n_ramp NEGATIVE, early k
+  ###      gets the heavy weight, late k decays. Terminal q_n_term then re-pins
+  ###      at k=N (added separately by solver as J_term = q_n_term · n[N]^2).
+  q_n:            200.0    # was 120 — push higher, esp. for big-corner case
+  q_n_ramp:       -150.0   # was -90 — front-load harder; stage at k=N = 50
+  q_n_term:       600.0    # was 400 — terminal pin (J_term separate)
+  w_cont:         0.0      # was 5.0 — no continuity bias in recovery
+  w_wall_buf:     2500.0   # unchanged — wall safety
+  gamma_progress: 1.0      # was 4.0 — converge first, sprint after
+  r_dd:           2.0      # was 5.0 — agile transient
+  r_dd_rate:      1.0
+  r_a:            0.5
+  r_reg:          0.0      # was 0.1 — no absolute δ penalty (recovery only)
+  w_slack:        2000.0
+  w_side_bias:    0.0      # no side commit meaningful when no obstacle

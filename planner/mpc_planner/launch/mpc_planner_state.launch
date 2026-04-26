@@ -21,7 +21,9 @@
 -->
 <launch>
   <arg name="state"                 default="observe"
-       doc="overtake | recovery | observe"/>
+       doc="overtake | recovery | observe | auto  (auto = Phase X refactored 2-state FSM)"/>
+  <arg name="use_pred_variance"     default="True"
+       doc="When true, inflate sigma_s_obs/sigma_n_obs per tick using the predictor's vs_var/vd_var over horizon. Makes the bubble wider when prediction is uncertain."/>
   <!-- ### HJ : Default includes an `mpc_` prefix so standalone launch does
        NOT collide with other backends (sampling_planner_state.launch uses
        /overtake as well — same default would kick each other off the master
@@ -29,9 +31,15 @@
        instance_name explicitly inside <group ns="mpc_planner"> so node
        names there still become /mpc_planner/overtake etc. -->
   <arg name="instance_name"         default="mpc_$(arg state)"/>
+  <!-- ### HJ : Phase X — state:=auto reuses state_overtake.yaml by default
+       (it is a superset of OVERTAKE tuning; RECOVERY currently uses quintic
+       primary so NLP-side tuning is shared). Override for NLP recovery tuning.  -->
   <arg name="config_file"           default="$(find mpc_planner)/config/state_$(arg state).yaml"
+       if="$(eval arg('state') != 'auto')"
        doc="Default resolves to state_{overtake,recovery,observe}.yaml. Override with an absolute path to run, e.g., the overtake preset in observe-mode for safe tuning:
             config_file:=$(find mpc_planner)/config/state_overtake.yaml state:=observe"/>
+  <arg name="config_file"           default="$(find mpc_planner)/config/state_overtake.yaml"
+       if="$(eval arg('state') == 'auto')"/>
   <arg name="attach_to_statemachine" default="false"
        doc="Phase X gate. false (default) → role output remapped to *_observation; true → real topic."/>
   <arg name="output_topic"          default=""
@@ -66,6 +74,7 @@
     <rosparam command="load" file="$(arg config_file)"/>
     <param name="state" value="$(arg state)"/>
     <param name="solver_backend" value="$(arg solver_backend)"/>
+    <param name="use_pred_variance" value="$(arg use_pred_variance)"/>
     <param name="debug_log_enable"            value="$(arg debug_log_enable)"/>
     <param name="debug_log_dir"               value="$(arg debug_log_dir)"/>
     <param name="debug_log_tier_b"            value="$(arg debug_log_tier_b)"/>
@@ -92,5 +101,14 @@
            if="$(eval arg('output_topic') == '' and arg('state') == 'overtake' and not arg('attach_to_statemachine'))"/>
     <remap from="~out/wpnts"   to="/planner/recovery/wpnts_observation"
            if="$(eval arg('output_topic') == '' and arg('state') == 'recovery' and not arg('attach_to_statemachine'))"/>
+
+    <!-- ### HJ : Phase X (refactored) — unified MPC output topic.
+         One pub for all roles (overtake / recovery / auto). attach_to_statemachine
+         toggles between the real and _observation suffix. SM fork subscribes
+         to /planner/mpc/wpnts; legacy SM nodes are untouched. -->
+    <remap from="~out/mpc_wpnts" to="/planner/mpc/wpnts"
+           if="$(arg attach_to_statemachine)"/>
+    <remap from="~out/mpc_wpnts" to="/planner/mpc/wpnts_observation"
+           unless="$(arg attach_to_statemachine)"/>
   </node>
 </launch>
