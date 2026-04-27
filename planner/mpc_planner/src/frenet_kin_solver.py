@@ -377,6 +377,14 @@ class FrenetKinMPC:
             opti.subject_to(n_[k] >= P_nlb[k] - slk[k])
             opti.subject_to(n_[k] <= P_nub[k] + slk[k])
             opti.subject_to(slk[k] >= 0.0)
+            ### HJ : 2026-04-27 — slack upper bound. Without it, ipopt's
+            ###      barrier method can settle at slk≈99999 sentinel even
+            ###      on Solve_Succeeded ticks (observed in bag analysis).
+            ###      Cap at 1.0m — anything more means corridor genuinely
+            ###      can't be satisfied → solver should fail and tier-1
+            ###      hold-last takes over.
+            opti.subject_to(slk[k] <= 1.0)
+            ### HJ : end
 
         # ---- cost ----
         # All cost weights reference opti.parameter() handles so live
@@ -863,6 +871,13 @@ class FrenetKinMPC:
         opti.set_initial(V['de'], Xw[:, 3])
         opti.set_initial(V['a'],  Uw[:, 0])
         opti.set_initial(V['dd'], Uw[:, 1])
+        ### HJ : 2026-04-27 — explicit slk seed = 0 so ipopt doesn't keep
+        ###      a stale 99999 sentinel from previous solver state. Slack
+        ###      should be 0 (or small forced value at k=0 only). Combined
+        ###      with the slk[k] <= 1.0 upper bound, this keeps slack
+        ###      reporting numerically sane.
+        opti.set_initial(V['slk'], np.zeros(self.N + 1, dtype=np.float64))
+        ### HJ : end
 
         # Capture input snapshot for every pass (overwritten; only the
         # LAST pass's input survives on failure — the most revealing one).
