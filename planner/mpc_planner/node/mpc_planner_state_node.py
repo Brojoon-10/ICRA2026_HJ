@@ -2973,18 +2973,16 @@ class MPCPlannerStateNode:
                     g_dright=self.lifter.g_dright,
                     g_kappa=getattr(self, 'g_kappa', None),
                     inflection_points=getattr(self, '_inflection_points', None),
-                    ### HJ : 2026-04-27 — was 20 (= 2m at wpnt_dist=0.1).
-                    ###      User: "fallback 루트 왜케 짧아. global이랑 좀
-                    ###      이어야지". Bump to 50 (5m) so spline portion
-                    ###      always has enough length to smoothly join GB.
-                    ###      Inflection-based lookahead overrides upward;
-                    ###      this is the floor.
+                    ### HJ : 2026-04-27 v2 — user wants LONG path.
+                    ###      Spline floor: 100 idx (= 10m at wpnt_dist=0.1).
+                    ###      GB suffix: 200 idx (= 20m). Total ≥ 30m.
+                    ###      Inflection-based lookahead overrides upward.
                     min_candidates_lookahead_n=int(rospy.get_param(
-                        '~recovery_min_candidates_lookahead_n', 50)),
+                        '~recovery_min_candidates_lookahead_n', 100)),
                     num_kappas=int(rospy.get_param(
                         '~recovery_num_kappas', 20)),
                     n_additional=int(rospy.get_param(
-                        '~recovery_n_additional', 80)),
+                        '~recovery_n_additional', 200)),
                     delta_s=delta_s, n_samples=int(n_samples),
                     wall_safe=float(getattr(self.solver, 'wall_safe', 0.15)),
                     spline_scale=float(rospy.get_param(
