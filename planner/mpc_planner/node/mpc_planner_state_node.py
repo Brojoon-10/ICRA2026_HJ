@@ -2817,35 +2817,39 @@ class MPCPlannerStateNode:
             # stays inside. (Clipping is a 1-D numpy op; re-lift is K calls
             # of lifter.sn_to_xy — ~1 ms @ K=81.)
             if clip_walls:
+                ### HJ : 2026-04-27 — recovery_spliner-style validation.
+                ###      Drop "clip every sample to corridor edge" (which
+                ###      caused the path to visually start at the wall).
+                ###      Now: validate the quintic against d_left/d_right.
+                ###      If any k>=1 sample is outside corridor (with
+                ###      wall_safe margin), DECLARE THE QUINTIC INVALID
+                ###      and return None — caller will fall through to
+                ###      tier-3 (raceline slice). This matches the
+                ###      recovery_spliner Track3DValidator behaviour:
+                ###      "publish a clean valid path or none at all".
+                ###      k=0 is ego's actual position — never validated.
                 wall_safe = float(getattr(self.solver, 'wall_safe', 0.15))
-                xy_relifted = np.zeros_like(xy_traj)
-                for i in range(N1):
+                invalid = False
+                for i in range(1, N1):
                     s_i = float(sn_traj[i, 0])
                     d_L = float(self.lifter._interp(s_i, self.lifter.g_dleft))
                     d_R = float(self.lifter._interp(s_i, self.lifter.g_dright))
                     n_lo = -(d_R - wall_safe)
                     n_hi = +(d_L - wall_safe)
-                    if n_lo > n_hi:  # degenerate corridor — skip clip
-                        n_lo, n_hi = -wall_safe, +wall_safe
-                    ### HJ : 2026-04-27 — preserve k=0 at ego's actual n.
-                    ###      Previously clipped every i including k=0, so when
-                    ###      ego was past the corridor (n0=0.5, n_hi=0.20) the
-                    ###      first sample was forced to 0.20 (corridor edge ≈
-                    ###      "wall boundary"). Path then visually started at
-                    ###      the wall instead of at ego. Now k=0 = real ego_n,
-                    ###      k>=1 clipped to corridor — path starts where ego
-                    ###      actually is and converges back inside.
-                    if i == 0:
-                        n_clip = float(sn_traj[i, 1])
-                    else:
-                        n_clip = float(np.clip(sn_traj[i, 1], n_lo, n_hi))
-                    ### HJ : end
-                    sn_traj[i, 1] = n_clip
-                    x, y = self.lifter.sn_to_xy(s_i, n_clip)
-                    xy_relifted[i, 0] = x
-                    xy_relifted[i, 1] = y
-                    xy_relifted[i, 2] = xy_traj[i, 2]  # psi (tangent)
-                xy_traj = xy_relifted
+                    if n_lo > n_hi:
+                        continue  # degenerate corridor — skip
+                    n_i = float(sn_traj[i, 1])
+                    if n_i < n_lo or n_i > n_hi:
+                        invalid = True
+                        break
+                if invalid:
+                    rospy.logwarn_throttle(
+                        1.0,
+                        '[mpc fallback tier2][%s] quintic invalid (sample past corridor) — dropping; '
+                        'caller falls through to tier-3',
+                        rospy.get_name())
+                    return None, None
+                ### HJ : end
 
             # Augment xy_traj (K,3) → (K,5) with carried [s, z] so the
             # downstream viz/publish path uses 3D-safe z instead of the
