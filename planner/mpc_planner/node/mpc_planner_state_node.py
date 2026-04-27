@@ -2909,20 +2909,60 @@ class MPCPlannerStateNode:
         if s_cur < self._recovery_cache_s_start - 1.0:
             self._invalidate_recovery_cache('s underflow')
             return None, None
-        # Sample: find idx where cached s ~ ego_s, take K points forward
+        ### HJ : 2026-04-27 — return ALL remaining cached samples from
+        ###      current ego_s onwards (plus GB blend after cache end).
+        ###      User: cache has 30m of path but I was returning only N+1=21
+        ###      samples (= 2m). Now return cached[idx:] + GB suffix beyond
+        ###      s_end so controller lookahead never runs out.
         s_arr = self._recovery_cache_sn[:, 0]
-        K = self.N + 1
         idx = int(np.searchsorted(s_arr, s_cur))
         idx = max(0, min(idx, len(s_arr) - 1))
         cached_xy = self._recovery_cache_xy
         cached_sn = self._recovery_cache_sn
-        out_xy = np.zeros((K, cached_xy.shape[1]), dtype=np.float64)
-        out_sn = np.zeros((K, cached_sn.shape[1]), dtype=np.float64)
-        for k in range(K):
-            src = min(idx + k, len(s_arr) - 1)
-            out_xy[k] = cached_xy[src]
-            out_sn[k] = cached_sn[src]
+        K_remaining = len(s_arr) - idx
+        # GB blend tail: extra samples beyond cache end at wpnt_dist spacing
+        wpnt_dist = float(self.g_s[1] - self.g_s[0]) if (
+            self.g_s is not None and len(self.g_s) > 1) else 0.10
+        K_gb_tail = int(rospy.get_param('~recovery_cache_gb_tail_n', 100))
+        K_total = K_remaining + K_gb_tail
+        out_xy = np.zeros((K_total, cached_xy.shape[1]), dtype=np.float64)
+        out_sn = np.zeros((K_total, cached_sn.shape[1]), dtype=np.float64)
+        # 1) cached portion
+        for k in range(K_remaining):
+            out_xy[k] = cached_xy[idx + k]
+            out_sn[k] = cached_sn[idx + k]
+        # 2) GB blend after cache s_end (n=0 raceline, raceline tangent)
+        s_end = float(self._recovery_cache_s_end)
+        for k in range(K_gb_tail):
+            s_w = (s_end + (k + 1) * wpnt_dist) % self.track_length
+            try:
+                x, y = self.lifter.sn_to_xy(s_w, 0.0)
+                psi = self.lifter._interp_psi(s_w)
+                z = float(self.lifter._interp(s_w, self.lifter.g_z))
+            except Exception:
+                x = y = psi = z = 0.0
+            j = K_remaining + k
+            # xy_traj layout: [x, y, psi, s, z]
+            out_xy[j, 0] = x
+            out_xy[j, 1] = y
+            out_xy[j, 2] = psi
+            if cached_xy.shape[1] > 3:
+                out_xy[j, 3] = s_w
+            if cached_xy.shape[1] > 4:
+                out_xy[j, 4] = z
+            # sn_traj layout: [s, n, mu, v]
+            out_sn[j, 0] = s_w
+            out_sn[j, 1] = 0.0
+            if cached_sn.shape[1] > 2:
+                out_sn[j, 2] = 0.0
+            if cached_sn.shape[1] > 3:
+                # placeholder velocity = lifter's GB vx at this s
+                try:
+                    out_sn[j, 3] = float(self.lifter._interp(s_w, self.lifter.g_vx))
+                except Exception:
+                    out_sn[j, 3] = 0.0
         return out_xy, out_sn
+        ### HJ : end
     ### HJ : end
 
     # ---- Tier 2 ------------------------------------------------------------
