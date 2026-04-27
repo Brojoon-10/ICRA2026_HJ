@@ -316,7 +316,9 @@ class MPCPlannerStateNode:
         self._last_good_u = None       # (N, 2)    [v, δ]
         self._last_good_s = None       # s at which it was anchored
         self._last_good_time = None    # rospy.Time
-        self._quintic_delta_s = float(rospy.get_param('~quintic_delta_s', 8.0))
+        ### HJ : 2026-04-27 — was 8.0m (too long, user feedback). 3.0m
+        ###      gives a tight, snappy recovery curve.
+        self._quintic_delta_s = float(rospy.get_param('~quintic_delta_s', 3.0))
         self._last_status = None       # for recovery log
         # ### HJ : v3c — track fallback tier so RViz marker colors stay in
         # sync with solver health. _publish_debug_markers picks the colour
@@ -2817,7 +2819,7 @@ class MPCPlannerStateNode:
                     delta_s=delta_s, n_samples=int(n_samples),
                     wall_safe=float(getattr(self.solver, 'wall_safe', 0.15)),
                     wall_pull_thr=float(rospy.get_param(
-                        '~recovery_wall_pull_thr', 0.08)),
+                        '~recovery_wall_pull_thr', 0.1)),
                     wall_pull_alpha=float(rospy.get_param(
                         '~recovery_wall_pull_alpha', 0.6)),
                     smooth_window=int(rospy.get_param(

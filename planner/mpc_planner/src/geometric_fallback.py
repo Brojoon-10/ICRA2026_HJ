@@ -34,7 +34,7 @@ import numpy as np
 def build_recovery_path(lifter, s0, n0, ego_x, ego_y, ego_yaw,
                          g_psi=None, g_s=None, g_x=None, g_y=None, g_z=None,
                          g_dleft=None, g_dright=None,
-                         delta_s=8.0, n_samples=21,
+                         delta_s=3.0, n_samples=21,
                          wall_safe=0.15, wall_pull_thr=0.08,
                          wall_pull_alpha=0.6, smooth_window=5,
                          spline_scale=0.8, return_frenet=False):
@@ -237,7 +237,7 @@ def evaluate_poly(coeffs, s):
     return float(n), float(ndot)
 
 
-def build_quintic_fallback(lifter, s0, n0, psi_delta, delta_s=8.0, n_samples=21,
+def build_quintic_fallback(lifter, s0, n0, psi_delta, delta_s=3.0, n_samples=21,
                            n0_d_hint=None, return_frenet=False):
     """### HJ : Phase 4 Tier-2 entry.
 
