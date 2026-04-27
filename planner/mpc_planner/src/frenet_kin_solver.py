@@ -459,7 +459,15 @@ class FrenetKinMPC:
 
         J_slack = 0
         for k in range(N + 1):
-            J_slack = J_slack + P_wall_ramp[k] * P_w_slack * slk[k] ** 2
+            ### HJ : 2026-04-27 — J_slack NOT ramped. Reverted from A4-b
+            ###      where wall_ramp scaled both J_wall AND J_slack — that
+            ###      removed the corridor-violation pressure entirely at
+            ###      k=0..K_entry, allowing the solver to plan paths that
+            ###      went FURTHER outside the corridor (punching through
+            ###      the wall in xy). Now only J_wall (cushion) is relaxed
+            ###      at entry; J_slack stays full so ego is always pushed
+            ###      back inside hard corridor as fast as kinematics allow.
+            J_slack = J_slack + P_w_slack * slk[k] ** 2
 
         J = (J_contour + J_reg + J_dd + J_dd_rate + J_smooth_a
              + J_progress + J_obs + J_bias + J_wall
