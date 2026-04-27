@@ -2827,7 +2827,19 @@ class MPCPlannerStateNode:
                     n_hi = +(d_L - wall_safe)
                     if n_lo > n_hi:  # degenerate corridor — skip clip
                         n_lo, n_hi = -wall_safe, +wall_safe
-                    n_clip = float(np.clip(sn_traj[i, 1], n_lo, n_hi))
+                    ### HJ : 2026-04-27 — preserve k=0 at ego's actual n.
+                    ###      Previously clipped every i including k=0, so when
+                    ###      ego was past the corridor (n0=0.5, n_hi=0.20) the
+                    ###      first sample was forced to 0.20 (corridor edge ≈
+                    ###      "wall boundary"). Path then visually started at
+                    ###      the wall instead of at ego. Now k=0 = real ego_n,
+                    ###      k>=1 clipped to corridor — path starts where ego
+                    ###      actually is and converges back inside.
+                    if i == 0:
+                        n_clip = float(sn_traj[i, 1])
+                    else:
+                        n_clip = float(np.clip(sn_traj[i, 1], n_lo, n_hi))
+                    ### HJ : end
                     sn_traj[i, 1] = n_clip
                     x, y = self.lifter.sn_to_xy(s_i, n_clip)
                     xy_relifted[i, 0] = x
