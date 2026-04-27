@@ -377,32 +377,24 @@ class FrenetKinMPC:
             opti.subject_to(n_[k] >= P_nlb[k] - slk[k])
             opti.subject_to(n_[k] <= P_nub[k] + slk[k])
             opti.subject_to(slk[k] >= 0.0)
-            ### HJ : 2026-04-27 v3 — slack cap = inflation only.
-            ###      Previous v2 (wall_safe + inflation = 0.13) was wrong
-            ###      arithmetic. Correct derivation:
-            ###        nub[k] = d_L[k] - (ego_half + wall_safe + inflation)
-            ###                            = d_L - 0.28
-            ###        n[k]_max = nub + slk_cap
-            ###        path_edge_max = n[k]_max + ego_half = d_L - 0.13
-            ###        gap_to_wall = d_L - path_edge_max = 0.13
-            ###      So slk_cap=0.13 → path edge 0.13m from wall (not 0!).
-            ###      Re-derive: we want path_edge ≤ d_L - wall_safe (so
-            ###      car edge stays at least wall_safe=0.08 from actual
-            ###      wall). Then:
-            ###        n[k]_max ≤ d_L - ego_half - wall_safe = d_L - 0.23
-            ###        nub + slk_cap = (d_L - 0.28) + slk_cap ≤ d_L - 0.23
-            ###        slk_cap ≤ 0.05  =  inflation
-            ###      So correct cap = inflation.
-            ###      k=0 stays lenient since ego_n is forced (possibly past
-            ###      corridor on spawn). When solver can't satisfy with
-            ###      slk[k>=1] <= inflation, it should fail → tier-1 →
-            ###      tier-2 recovery_spliner-style path with wall pull-in.
-            slk_cap = self.inflation                    # = 0.05 typical
-            slk_cap_k0 = max(slk_cap, 1.0)              # k=0 lenient
+            ### HJ : 2026-04-27 v4 — slack cap = 0 for k>=1 (truly HARD
+            ###      corridor). User pushed back on giving any "여유"
+            ###      (relaxation) via slack — solver must satisfy the
+            ###      pre-margin'd corridor or fail outright.
+            ###      Effect:
+            ###        n[k] ≤ nub[k]  with nub = d_L - (ego_half +
+            ###          wall_safe + inflation) = d_L - 0.28
+            ###        path_edge_max = nub + ego_half = d_L - 0.13
+            ###        gap_to_wall = wall_safe + inflation (= 0.13m)
+            ###      So car edge always ≥ 13cm from actual wall.
+            ###      k=0 still lenient (slk allowed up to 1.0m) — ego_n
+            ###      is forced from /odom_frenet, may legitimately be
+            ###      past corridor at spawn. Tier-1 / tier-2 absorb
+            ###      infeasibility on subsequent ticks.
             if k == 0:
-                opti.subject_to(slk[k] <= slk_cap_k0)
+                opti.subject_to(slk[k] <= 1.0)
             else:
-                opti.subject_to(slk[k] <= slk_cap)
+                opti.subject_to(slk[k] <= 0.0)
             ### HJ : end
 
         # ---- cost ----
