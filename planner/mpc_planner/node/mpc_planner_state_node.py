@@ -695,6 +695,14 @@ class MPCPlannerStateNode:
         self.g_z = np.array([getattr(w, 'z_m', 0.0) for w in wpnts], dtype=float)
         self.g_psi = np.array([w.psi_rad for w in wpnts], dtype=float)
         self.g_kappa = np.array([getattr(w, 'kappa_radpm', 0.0) for w in wpnts], dtype=float)
+        ### HJ : 2026-04-27 — inflection points (sign change of g_kappa) for
+        ###      recovery_spliner-style lookahead in fallback.
+        try:
+            self._inflection_points = np.where(
+                np.diff(np.sign(self.g_kappa)) != 0)[0]
+        except Exception:
+            self._inflection_points = np.array([], dtype=int)
+        ### HJ : end
         self.g_dleft = np.array([w.d_left for w in wpnts], dtype=float)
         self.g_dright = np.array([w.d_right for w in wpnts], dtype=float)
         ### HJ : centerline tangent at the foot used to measure d_left/d_right.
@@ -2938,14 +2946,16 @@ class MPCPlannerStateNode:
                     ego_yaw=float(self.car_yaw),
                     g_dleft=self.lifter.g_dleft,
                     g_dright=self.lifter.g_dright,
+                    g_kappa=getattr(self, 'g_kappa', None),
+                    inflection_points=getattr(self, '_inflection_points', None),
+                    min_candidates_lookahead_n=int(rospy.get_param(
+                        '~recovery_min_candidates_lookahead_n', 20)),
+                    num_kappas=int(rospy.get_param(
+                        '~recovery_num_kappas', 20)),
+                    n_additional=int(rospy.get_param(
+                        '~recovery_n_additional', 80)),
                     delta_s=delta_s, n_samples=int(n_samples),
                     wall_safe=float(getattr(self.solver, 'wall_safe', 0.15)),
-                    wall_pull_thr=float(rospy.get_param(
-                        '~recovery_wall_pull_thr', 0.1)),
-                    wall_pull_alpha=float(rospy.get_param(
-                        '~recovery_wall_pull_alpha', 0.6)),
-                    smooth_window=int(rospy.get_param(
-                        '~recovery_smooth_window', 5)),
                     spline_scale=float(rospy.get_param(
                         '~recovery_spline_scale', 0.8)),
                     return_frenet=True)
