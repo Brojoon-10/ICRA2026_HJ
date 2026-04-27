@@ -377,22 +377,27 @@ class FrenetKinMPC:
             opti.subject_to(n_[k] >= P_nlb[k] - slk[k])
             opti.subject_to(n_[k] <= P_nub[k] + slk[k])
             opti.subject_to(slk[k] >= 0.0)
-            ### HJ : 2026-04-27 v2 — slack cap = (wall_safe + inflation).
-            ###      The hard corridor is set at d_L - margin where
-            ###      margin = wall_safe + inflation + ego_half. Slack
-            ###      relaxes corridor → effective limit n[k] ≤ nub + slk.
-            ###      To NEVER cross actual wall, slk cap must be ≤
-            ###      (wall_safe + inflation), because:
-            ###         nub + slk_max = (d_L - margin) + (wall_safe+infl)
-            ###                       = d_L - ego_half  ← still ego_half
-            ###                                            inside wall.
-            ###      With wall_safe=0.08, inflation=0.05, cap = 0.13. So
-            ###      path can never come within 0.15m (= ego_half) of
-            ###      actual wall. If solver can't satisfy with slk<=0.13,
-            ###      it fails → tier-1 hold-last → tier-2 recovery path.
-            ###      k=0 has its own forced slack (from n[0]==ego_n
-            ###      possibly outside corridor); cap looser there.
-            slk_cap = self.wall_safe + self.inflation  # = 0.13 typical
+            ### HJ : 2026-04-27 v3 — slack cap = inflation only.
+            ###      Previous v2 (wall_safe + inflation = 0.13) was wrong
+            ###      arithmetic. Correct derivation:
+            ###        nub[k] = d_L[k] - (ego_half + wall_safe + inflation)
+            ###                            = d_L - 0.28
+            ###        n[k]_max = nub + slk_cap
+            ###        path_edge_max = n[k]_max + ego_half = d_L - 0.13
+            ###        gap_to_wall = d_L - path_edge_max = 0.13
+            ###      So slk_cap=0.13 → path edge 0.13m from wall (not 0!).
+            ###      Re-derive: we want path_edge ≤ d_L - wall_safe (so
+            ###      car edge stays at least wall_safe=0.08 from actual
+            ###      wall). Then:
+            ###        n[k]_max ≤ d_L - ego_half - wall_safe = d_L - 0.23
+            ###        nub + slk_cap = (d_L - 0.28) + slk_cap ≤ d_L - 0.23
+            ###        slk_cap ≤ 0.05  =  inflation
+            ###      So correct cap = inflation.
+            ###      k=0 stays lenient since ego_n is forced (possibly past
+            ###      corridor on spawn). When solver can't satisfy with
+            ###      slk[k>=1] <= inflation, it should fail → tier-1 →
+            ###      tier-2 recovery_spliner-style path with wall pull-in.
+            slk_cap = self.inflation                    # = 0.05 typical
             slk_cap_k0 = max(slk_cap, 1.0)              # k=0 lenient
             if k == 0:
                 opti.subject_to(slk[k] <= slk_cap_k0)
