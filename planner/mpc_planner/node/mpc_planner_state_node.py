@@ -319,6 +319,20 @@ class MPCPlannerStateNode:
         ### HJ : 2026-04-27 — was 8.0m (too long, user feedback). 3.0m
         ###      gives a tight, snappy recovery curve.
         self._quintic_delta_s = float(rospy.get_param('~quintic_delta_s', 3.0))
+        ### HJ : 2026-04-27 — recovery path caching. Once tier-2 succeeds,
+        ###      cache the path in world s-coordinates. Subsequent fallback
+        ###      ticks SAMPLE the cache instead of recomputing — solves the
+        ###      "goalpost moves with ego, never converges" issue user
+        ###      flagged. Cache invalidates on WITH_OBS entry, ego past
+        ###      s_end, or |ego_n| < exit threshold.
+        self._recovery_cache_xy = None      # (K, 5)
+        self._recovery_cache_sn = None      # (K, 4)
+        self._recovery_cache_s_start = None
+        self._recovery_cache_s_end = None
+        self._recovery_cache_committed_at = None
+        self._recovery_cache_exit_n = float(
+            rospy.get_param('~recovery_cache_exit_n', 0.10))
+        ### HJ : end
         self._last_status = None       # for recovery log
         # ### HJ : v3c — track fallback tier so RViz marker colors stay in
         # sync with solver health. _publish_debug_markers picks the colour
@@ -1650,6 +1664,11 @@ class MPCPlannerStateNode:
             self._prev_mpc_mode = prev
             self._mpc_mode = target
             self._mode_dwell = 0
+            ### HJ : 2026-04-27 — invalidate recovery cache on mode flip
+            ###      to WITH_OBS (obstacle near, need real planning).
+            if target == MPC_MODE_WITH_OBS and prev == MPC_MODE_NO_OBS:
+                self._invalidate_recovery_cache('NO_OBS→WITH_OBS')
+            ### HJ : end
             ### HJ : 2026-04-26 (A5) — warm-start reset on WITH_OBS → NO_OBS.
             ###      Right after overtake, the warm-start carries the OT
             ###      avoidance shape (n[k] biased to one side around obstacle
@@ -2484,6 +2503,26 @@ class MPCPlannerStateNode:
             )
             return
 
+        # ### HJ : 2026-04-27 — cache-first recovery dispatch.
+        ###      Try the cached recovery path FIRST. If valid (in s-window,
+        ###      no obstacle, not converged), sample from it and skip the
+        ###      tier-2 rebuild — keeps the goalpost stationary.
+        cached_xy, cached_sn = self._sample_recovery_cache(s_cur, ego_n)
+        if cached_xy is not None:
+            self._handle_tier2_geometric(
+                cached_xy, cached_sn, ego_n, status, solve_ms,
+                obs_tag + ':cached')
+            self._debug_log(
+                tier=2, status='RECOVERY_CACHED', ipopt_status=status,
+                iter_count=iter_count, solve_ms=solve_ms, slack_max=slack_max,
+                trajectory=cached_xy, u_sol=None, obs_arr=obs_arr,
+                obs_tag=obs_tag + ':cached', ref_slice=ref_slice,
+                initial_state=initial_state, ego_s=s_cur, ego_n=ego_n,
+                warm_used=warm_used,
+            )
+            return
+        ### HJ : end
+
         # ### HJ : v3b — tier2 gets (s_cur, ego_n) from /odom_frenet directly.
         # Previously `_try_quintic_fallback(s_cur)` re-projected (car_x, car_y)
         # via lifter.project_xy_to_sn — 2D nearest that aliases overpass
@@ -2493,6 +2532,9 @@ class MPCPlannerStateNode:
         traj_fb, frenet_fb = self._try_quintic_fallback(
             s_cur, ego_n, delta_s=self._quintic_delta_s, clip_walls=True)
         if traj_fb is not None:
+            ### HJ : 2026-04-27 — cache the freshly-built recovery path.
+            self._cache_recovery_path(traj_fb, frenet_fb)
+            ### HJ : end
             self._handle_tier2_geometric(
                 traj_fb, frenet_fb, ego_n, status, solve_ms, obs_tag)
             self._debug_log(
@@ -2726,6 +2768,17 @@ class MPCPlannerStateNode:
         self._viz_tier = 0
         self._viz_status = 'OK'
         self._viz_pass = int(getattr(self.solver, 'last_pass', 1) or 1)
+        ### HJ : 2026-04-27 — clear recovery cache when ego converged & NLP works.
+        ###      NLP success in NO_OBS with ego_n small means recovery is over.
+        if (self._mpc_mode == MPC_MODE_NO_OBS
+                and self._recovery_cache_sn is not None):
+            try:
+                ego_n = float(getattr(self, 'ego_n', 0.0) or 0.0)
+                if abs(ego_n) < self._recovery_cache_exit_n:
+                    self._invalidate_recovery_cache('tier0+converged')
+            except Exception:
+                pass
+        ### HJ : end
 
         self._publish_outputs(trajectory)
         self._last_good_traj = np.array(trajectory, copy=True)
@@ -2769,6 +2822,75 @@ class MPCPlannerStateNode:
             '[mpc fallback tier1][%s] HOLD_LAST streak=%d ipopt=%s solve=%.1fms obs=%s',
             rospy.get_name(), self._fail_streak, ipopt_status, solve_ms, obs_tag,
         )
+
+    ### HJ : 2026-04-27 — Recovery path cache (commit-once).
+    def _cache_recovery_path(self, xy_traj, sn_traj):
+        """Cache a tier-2 recovery path. Subsequent fallback ticks sample
+        from this cache rather than recompute, so the goalpost stays
+        s-fixed instead of moving with ego."""
+        if xy_traj is None or sn_traj is None:
+            return
+        self._recovery_cache_xy = np.array(xy_traj, copy=True)
+        self._recovery_cache_sn = np.array(sn_traj, copy=True)
+        self._recovery_cache_s_start = float(sn_traj[0, 0])
+        self._recovery_cache_s_end = float(sn_traj[-1, 0])
+        self._recovery_cache_committed_at = rospy.Time.now()
+        rospy.loginfo_throttle(
+            1.0,
+            '[mpc][%s] recovery path CACHED: s=[%.2f, %.2f] L=%.2f',
+            rospy.get_name(),
+            self._recovery_cache_s_start, self._recovery_cache_s_end,
+            self._recovery_cache_s_end - self._recovery_cache_s_start)
+
+    def _invalidate_recovery_cache(self, reason='unspecified'):
+        if self._recovery_cache_sn is None:
+            return
+        rospy.loginfo_throttle(
+            1.0, '[mpc][%s] recovery cache cleared (%s)',
+            rospy.get_name(), reason)
+        self._recovery_cache_xy = None
+        self._recovery_cache_sn = None
+        self._recovery_cache_s_start = None
+        self._recovery_cache_s_end = None
+        self._recovery_cache_committed_at = None
+
+    def _sample_recovery_cache(self, s_cur, ego_n):
+        """If cache valid, sample at current s_cur. Returns (xy, sn) of
+        shape (N+1, ...) or (None, None) if cache should be ignored.
+        """
+        if self._recovery_cache_sn is None:
+            return None, None
+        # Invalidate if mode flipped to WITH_OBS (obstacle near)
+        if self._mpc_mode == MPC_MODE_WITH_OBS:
+            self._invalidate_recovery_cache('mode→WITH_OBS')
+            return None, None
+        # Invalidate if ego converged
+        if abs(float(ego_n)) < self._recovery_cache_exit_n:
+            self._invalidate_recovery_cache('converged')
+            return None, None
+        # Invalidate if ego went past cache end (path exhausted)
+        if s_cur > self._recovery_cache_s_end - 0.3:
+            self._invalidate_recovery_cache('s past end')
+            return None, None
+        # Invalidate if ego went backward unreasonably
+        if s_cur < self._recovery_cache_s_start - 1.0:
+            self._invalidate_recovery_cache('s underflow')
+            return None, None
+        # Sample: find idx where cached s ~ ego_s, take K points forward
+        s_arr = self._recovery_cache_sn[:, 0]
+        K = self.N + 1
+        idx = int(np.searchsorted(s_arr, s_cur))
+        idx = max(0, min(idx, len(s_arr) - 1))
+        cached_xy = self._recovery_cache_xy
+        cached_sn = self._recovery_cache_sn
+        out_xy = np.zeros((K, cached_xy.shape[1]), dtype=np.float64)
+        out_sn = np.zeros((K, cached_sn.shape[1]), dtype=np.float64)
+        for k in range(K):
+            src = min(idx + k, len(s_arr) - 1)
+            out_xy[k] = cached_xy[src]
+            out_sn[k] = cached_sn[src]
+        return out_xy, out_sn
+    ### HJ : end
 
     # ---- Tier 2 ------------------------------------------------------------
     def _try_quintic_fallback(self, s_cur, ego_n, delta_s=None,
