@@ -65,7 +65,7 @@ from frenet_kin_solver import (FrenetKinMPC,  # noqa: E402 — new frenet-kin ba
                                SIDE_CLEAR, SIDE_LEFT, SIDE_RIGHT, SIDE_TRAIL)
 from side_decider import SideDecider  # noqa: E402 — rule-based side selection
 from mpc_raceline_lifter import MPCRacelineLifter  # noqa: E402
-from geometric_fallback import build_quintic_fallback  # noqa: E402
+from geometric_fallback import build_quintic_fallback, build_recovery_path  # noqa: E402
 
 # ### HJ : debug_log — optional structured logger (CSV + NPZ per tick).
 _dbg_dir = os.path.normpath(os.path.join(_this_dir, '..', 'debug_log'))
@@ -2800,15 +2800,52 @@ class MPCPlannerStateNode:
         if n_samples is None:
             n_samples = self.N + 1
         try:
-            psi_track = self.lifter._interp_psi(s_cur)
-            psi_delta = float(np.arctan2(
-                np.sin(self.car_yaw - psi_track),
-                np.cos(self.car_yaw - psi_track)))
-            xy_traj, sn_traj = build_quintic_fallback(
-                self.lifter, s_cur, ego_n, psi_delta,
-                delta_s=delta_s, n_samples=int(n_samples),
-                return_frenet=True)
-            N1 = xy_traj.shape[0]
+            ### HJ : 2026-04-27 — tier-2 algorithm switch.
+            ###      Old: pure quintic with optional clip. Visually started
+            ###      at "wall edge" when ego was past corridor, no smoothing.
+            ###      New (default): build_recovery_path — recovery_spliner
+            ###      style BPoly + GB-tangent lookahead + wall-aware pull-in
+            ###      + savgol smoothing. clip_walls=True triggers it; False
+            ###      keeps the legacy pure-quintic path.
+            if clip_walls:
+                xy_traj, sn_traj = build_recovery_path(
+                    self.lifter, s_cur, ego_n,
+                    ego_x=float(self.car_x), ego_y=float(self.car_y),
+                    ego_yaw=float(self.car_yaw),
+                    g_dleft=self.lifter.g_dleft,
+                    g_dright=self.lifter.g_dright,
+                    delta_s=delta_s, n_samples=int(n_samples),
+                    wall_safe=float(getattr(self.solver, 'wall_safe', 0.15)),
+                    wall_pull_thr=float(rospy.get_param(
+                        '~recovery_wall_pull_thr', 0.08)),
+                    wall_pull_alpha=float(rospy.get_param(
+                        '~recovery_wall_pull_alpha', 0.6)),
+                    smooth_window=int(rospy.get_param(
+                        '~recovery_smooth_window', 5)),
+                    spline_scale=float(rospy.get_param(
+                        '~recovery_spline_scale', 0.8)),
+                    return_frenet=True)
+                if xy_traj is None:
+                    rospy.logwarn_throttle(
+                        1.0, '[mpc fallback tier2][%s] recovery path invalid '
+                        '(corridor punch even after pull-in) — drop',
+                        rospy.get_name())
+                    return None, None
+                N1 = xy_traj.shape[0]
+                # Skip the legacy clip_walls block below by setting flag off
+                clip_walls_already_done = True
+            else:
+                psi_track = self.lifter._interp_psi(s_cur)
+                psi_delta = float(np.arctan2(
+                    np.sin(self.car_yaw - psi_track),
+                    np.cos(self.car_yaw - psi_track)))
+                xy_traj, sn_traj = build_quintic_fallback(
+                    self.lifter, s_cur, ego_n, psi_delta,
+                    delta_s=delta_s, n_samples=int(n_samples),
+                    return_frenet=True)
+                N1 = xy_traj.shape[0]
+                clip_walls_already_done = False
+            ### HJ : end
 
             # ### HJ : Phase X — wall-bound clip (auto RECOVERY only).
             # Quintic is pure BC fit; without clipping it can punch through
@@ -2816,7 +2853,7 @@ class MPCPlannerStateNode:
             # wall_safe buffer, then re-lift xy so the published trajectory
             # stays inside. (Clipping is a 1-D numpy op; re-lift is K calls
             # of lifter.sn_to_xy — ~1 ms @ K=81.)
-            if clip_walls:
+            if clip_walls and not locals().get('clip_walls_already_done', False):
                 ### HJ : 2026-04-27 — recovery_spliner-style validation.
                 ###      Drop "clip every sample to corridor edge" (which
                 ###      caused the path to visually start at the wall).
