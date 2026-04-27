@@ -21,10 +21,15 @@
 import rospy
 import numpy as np
 import copy
-from geometry_msgs.msg import PointStamped, PoseArray
+from geometry_msgs.msg import PoseArray, Pose
 from std_msgs.msg import Float64MultiArray
 from f110_msgs.msg import ObstacleArray, Obstacle, WpntArray, Wpnt, OpponentTrajectory, OppWpnt
-from visualization_msgs.msg import Marker, MarkerArray
+from visualization_msgs.msg import (
+    Marker, MarkerArray,
+    InteractiveMarker, InteractiveMarkerControl, InteractiveMarkerFeedback,
+)
+from interactive_markers.interactive_marker_server import InteractiveMarkerServer
+from interactive_markers.menu_handler import MenuHandler
 from frenet_conversion.srv import Glob2FrenetArr, Frenet2GlobArr
 from nav_msgs.msg import Odometry
 
@@ -117,12 +122,29 @@ class ObstaclePublisher3D:
         self._ego_s = 0.0
         self._ego_d = 0.0
 
-        ### HJ : RViz "Publish Point" → respawn obstacle at nearest s on opponent line
-        # RViz Publish Point tool publishes PointStamped on /clicked_point.
-        # Click xyz is passed to glob2frenet, then dynamic_obstacle.s_center jumps there.
-        # Nav Goal (/goal) is left to obstacle_spawner; we don't share that channel.
+        ### HJ : pending respawn s set by interactive-marker "Spawn" menu;
+        # consumed at the top of each tick before s advances.
         self._pending_respawn_s = None
-        rospy.Subscriber("/clicked_point", PointStamped, self.nav_goal_cb, queue_size=1)
+        ### HJ : end
+
+        ### HJ : RViz Interactive Marker for spawn/delete buttons
+        # Single interactive marker in "map" frame, MOVE_PLANE on xy + right-click menu:
+        #   "Spawn dynamic obstacle here" → reads marker xyz, glob2frenet, sets pending
+        #                                    respawn s and re-activates publishing
+        #   "Delete dynamic obstacle"     → deactivates dyn-obs publishing on both
+        #                                    /tracking/obstacles and /tracking/obstacles_truth
+        self._dyn_obs_active = True
+        self._marker_xyz = None  # (x, y, z) latest marker pose; None until first feedback
+        self._marker_seeded = False  # marker is INSERTED into the server lazily
+        self._marker_server = InteractiveMarkerServer("dynamic_obstacle_control")
+        self._menu_handler = MenuHandler()
+        self._menu_id_spawn  = self._menu_handler.insert(
+            "Spawn dynamic obstacle here", callback=self._marker_menu_cb)
+        self._menu_id_delete = self._menu_handler.insert(
+            "Delete dynamic obstacle", callback=self._marker_menu_cb)
+        # Don't insert the marker here — only after first tick gives us a real
+        # obstacle xyz. Inserting at (0,0,0) and later setPose'ing was racing
+        # with RViz right-click → menu and crashing the GUI.
         ### HJ : end
 
         self.obstacle_pub = rospy.Publisher("/tracking/obstacles", ObstacleArray, queue_size=10)
@@ -188,8 +210,12 @@ class ObstaclePublisher3D:
 
     ### CALLBACKS ###
     def wpnts_cb(self, data: WpntArray):
+        # Last wpnt is a duplicate of the first (closes the loop), with s_m equal
+        # to the actual lap length L. Use it for max_s before dropping; otherwise
+        # max_s would underestimate L by one waypoint spacing and frenet service
+        # output near s≈L would slip past every `% max_s` wrap downstream.
+        max_s = data.wpnts[-1].s_m
         wpnts = data.wpnts[:-1]
-        max_s = wpnts[-1].s_m
         return wpnts, max_s
 
     def odom_cb(self, data: Odometry):
@@ -200,18 +226,108 @@ class ObstaclePublisher3D:
         self._ego_d = data.pose.pose.position.y
         ### HJ : end
 
-    ### HJ : clicked-point respawn callback
-    def nav_goal_cb(self, data: PointStamped):
-        """RViz Publish Point → 가장 가까운 opponent line의 s로 장애물을 재배치."""
-        try:
-            # Glob2FrenetArr expects (x, y, z) for 3D service
-            resp = self.glob2frenet([data.point.x], [data.point.y], [data.point.z])
-            s_new = float(resp.s[0])
+    ### HJ : Interactive marker setup + callbacks (spawn/delete buttons)
+    def _make_visual_marker(self):
+        """Cyan sphere — both the visual body AND the click target for menu/drag."""
+        m = Marker()
+        m.type = Marker.SPHERE
+        m.scale.x = 0.6
+        m.scale.y = 0.6
+        m.scale.z = 0.6
+        m.color.r = 0.0
+        m.color.g = 0.9
+        m.color.b = 1.0
+        m.color.a = 0.85
+        return m
+
+    def _build_int_marker(self, x, y, z):
+        """Build an InteractiveMarker rooted at (x, y, z), RViz basic_controls
+        style: one MOVE_PLANE control that *contains* the visual sphere. Menu
+        is attached at marker level so right-click anywhere opens it."""
+        int_marker = InteractiveMarker()
+        int_marker.header.frame_id = "map"
+        int_marker.name = "dynamic_obstacle_ctrl"
+        int_marker.description = "Dynamic Obstacle"
+        # Auto-drawn drag-handle size (square indicator + arrows). 1.2 keeps it
+        # noticeable but not so big it covers half the track.
+        int_marker.scale = 1.2
+        int_marker.pose.position.x = float(x)
+        int_marker.pose.position.y = float(y)
+        int_marker.pose.position.z = float(z)
+        int_marker.pose.orientation.w = 1.0
+
+        # Single combined control: MOVE_PLANE on xy AND houses the visual sphere.
+        # Orientation rotates default control x-axis (= plane normal) onto +z so
+        # the drag plane is xy. always_visible=True keeps the sphere on screen
+        # even when not hovered.
+        ctrl = InteractiveMarkerControl()
+        ctrl.name = "move_xy_body"
+        ctrl.interaction_mode = InteractiveMarkerControl.MOVE_PLANE
+        ctrl.orientation.w = 0.7071068
+        ctrl.orientation.x = 0.0
+        ctrl.orientation.y = 0.7071068
+        ctrl.orientation.z = 0.0
+        ctrl.always_visible = True
+        ctrl.markers.append(self._make_visual_marker())
+        int_marker.controls.append(ctrl)
+        return int_marker
+
+    def _marker_pose_cb(self, feedback: InteractiveMarkerFeedback):
+        """POSE_UPDATE while user drags the marker; cache xyz for the spawn button."""
+        if feedback.event_type == InteractiveMarkerFeedback.POSE_UPDATE:
+            p = feedback.pose.position
+            self._marker_xyz = (float(p.x), float(p.y), float(p.z))
+
+    def _marker_menu_cb(self, feedback: InteractiveMarkerFeedback):
+        """Menu select handler: dispatch on entry id."""
+        if feedback.event_type != InteractiveMarkerFeedback.MENU_SELECT:
+            return
+        if feedback.menu_entry_id == self._menu_id_spawn:
+            # Prefer the marker's current pose (dragged target). Fall back to feedback.
+            if self._marker_xyz is None:
+                p = feedback.pose.position
+                self._marker_xyz = (float(p.x), float(p.y), float(p.z))
+            x, y, z = self._marker_xyz
+            try:
+                resp = self.glob2frenet([x], [y], [z])
+                s_new = float(resp.s[0])
+            except Exception as e:
+                rospy.logwarn(f"[3d_obstacle_publisher] menu spawn glob2frenet failed: {e}")
+                return
             self._pending_respawn_s = s_new
-            rospy.loginfo(f"[3d_obstacle_publisher] Respawn requested at s={s_new:.2f}m "
-                          f"(clicked xy=({data.point.x:.2f}, {data.point.y:.2f}))")
-        except Exception as e:
-            rospy.logwarn(f"[3d_obstacle_publisher] clicked_point conversion failed: {e}")
+            self._dyn_obs_active = True
+            # KF reset so coast/posterior won't bridge the teleport
+            self._kf_x = None
+            self._kf_P = None
+            self._last_posterior = None
+            self._last_seen_t = None
+            rospy.loginfo(f"[3d_obstacle_publisher] menu Spawn at s={s_new:.2f}m "
+                          f"(xy=({x:.2f}, {y:.2f}))")
+        elif feedback.menu_entry_id == self._menu_id_delete:
+            self._dyn_obs_active = False
+            self._kf_x = None
+            self._kf_P = None
+            self._last_posterior = None
+            self._last_seen_t = None
+            rospy.loginfo("[3d_obstacle_publisher] menu Delete: dyn obstacle deactivated")
+
+    def _seed_marker_pose_once(self):
+        """One-shot: build & insert the interactive marker at the obstacle's
+        first real xyz. After this the marker is *never* moved by the node —
+        only by user drag. Per-tick setPose+applyChanges races with RViz's
+        right-click menu and crashes the GUI; this design avoids that entirely.
+        Live obstacle position is visible via /dummy_obstacle_markers."""
+        if self._marker_seeded:
+            return
+        x = float(self.dynamic_obstacle.x_m)
+        y = float(self.dynamic_obstacle.y_m)
+        z = float(self.dynamic_obstacle.z_m)
+        int_marker = self._build_int_marker(x, y, z)
+        self._marker_server.insert(int_marker, self._marker_pose_cb)
+        self._menu_handler.apply(self._marker_server, int_marker.name)
+        self._marker_server.applyChanges()
+        self._marker_xyz = (x, y, z)
+        self._marker_seeded = True
     ### HJ : end
 
     ### HJ : gazebo static obstacle callbacks + cache build
@@ -261,7 +377,8 @@ class ObstaclePublisher3D:
             obs.x_m = xs[i]
             obs.y_m = ys[i]
             obs.z_m = zs[i]
-            obs.s_center = s_c
+            # Wrap s_center to [0, max_s) for parity with s_start/s_end.
+            obs.s_center = s_c % max_s
             obs.d_center = d_c
             obs.s_start = (s_c - radius) % max_s
             obs.s_end = (s_c + radius) % max_s
@@ -516,8 +633,13 @@ class ObstaclePublisher3D:
             truth_msg = ObstacleArray()
             truth_msg.header.stamp = obstacle_msg.header.stamp
             truth_msg.header.frame_id = obstacle_msg.header.frame_id
-            truth_obs = copy.deepcopy(self.dynamic_obstacle)
-            truth_msg.obstacles.append(truth_obs)
+            ### HJ : interactive-marker delete button gates dyn obstacle out of truth too
+            if self._dyn_obs_active:
+                truth_obs = copy.deepcopy(self.dynamic_obstacle)
+                truth_msg.obstacles.append(truth_obs)
+            else:
+                truth_obs = None
+            ### HJ : end
             ### HJ : merge gz static obstacles into truth (always visible, no noise)
             if static_obs_list:
                 truth_msg.obstacles.extend(copy.deepcopy(static_obs_list))
@@ -525,7 +647,17 @@ class ObstaclePublisher3D:
             ### HJ : end
             self.obstacle_truth_pub.publish(truth_msg)
             # marker uses truth (dummy only) so RViz always shows ground-truth position
-            self.publish_obstacle_cartesian([truth_obs])
+            if truth_obs is not None:
+                self.publish_obstacle_cartesian([truth_obs])
+            else:
+                self.publish_obstacle_cartesian([])  # clear stale dummy marker
+            ### HJ : end
+
+            ### HJ : seed interactive-marker handle at obstacle's initial xyz (one-shot only).
+            # Continuous sync was racing with RViz's right-click menu handling and
+            # freezing the GUI. The live obstacle position is already visible via
+            # /dummy_obstacle_markers; the interactive marker is just a drag handle.
+            self._seed_marker_pose_once()
             ### HJ : end
 
             ### HJ (20260422) : build NOISY+gated+KF msg for /tracking/obstacles
@@ -535,7 +667,13 @@ class ObstaclePublisher3D:
             y_true = self.dynamic_obstacle.y_m
             z_true = self.dynamic_obstacle.z_m
 
-            visible = self._in_detect_gate(s_true, d_true, self._ego_s, self._ego_d, max_s)
+            ### HJ : delete button forces visible=False, dropping dyn obs from
+            # /tracking/obstacles (static-only stream still flows below)
+            if not self._dyn_obs_active:
+                visible = False
+            else:
+                visible = self._in_detect_gate(s_true, d_true, self._ego_s, self._ego_d, max_s)
+            ### HJ : end
 
             if visible:
                 # Measurement: cartesian xyz noise → glob2frenet to keep (s,d) consistent
