@@ -38,6 +38,7 @@ def build_recovery_path(lifter, s0, n0, ego_x, ego_y, ego_yaw,
                          g_dleft=None, g_dright=None,
                          g_kappa=None, inflection_points=None,
                          min_candidates_lookahead_n=20, num_kappas=20,
+                         max_candidate_len=None,
                          spline_scale=0.8,
                          n_additional=80,
                          wpnt_dist=0.10,
@@ -88,6 +89,13 @@ def build_recovery_path(lifter, s0, n0, ego_x, ego_y, ego_yaw,
     else:
         candidate_len = ref_max_idx // 2
     candidate_len = int(max(candidate_len, min_candidates_lookahead_n))
+    ### HJ : 2026-04-27 — caller-supplied cap on lookahead range. Used by
+    ###      shrink retry: if a long endpoint produced wall-violating
+    ###      path, caller retries with smaller max_candidate_len so
+    ###      tangent_idx is forced to a closer endpoint.
+    if max_candidate_len is not None:
+        candidate_len = int(min(candidate_len, max(int(max_candidate_len), 5)))
+    ### HJ : end
 
     # gb_idxs: lookahead range
     max_avail = ref_max_idx - 1

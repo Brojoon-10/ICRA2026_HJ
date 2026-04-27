@@ -3004,30 +3004,43 @@ class MPCPlannerStateNode:
             ###      + savgol smoothing. clip_walls=True triggers it; False
             ###      keeps the legacy pure-quintic path.
             if clip_walls:
-                xy_traj, sn_traj = build_recovery_path(
-                    self.lifter, s_cur, ego_n,
-                    ego_x=float(self.car_x), ego_y=float(self.car_y),
-                    ego_yaw=float(self.car_yaw),
-                    g_dleft=self.lifter.g_dleft,
-                    g_dright=self.lifter.g_dright,
-                    g_kappa=getattr(self, 'g_kappa', None),
-                    inflection_points=getattr(self, '_inflection_points', None),
-                    ### HJ : 2026-04-27 v4 — min_candidates is search range,
-                    ###      not actual spline length. Bigger search lets
-                    ###      tangent_idx pick from farther GB if alignment
-                    ###      is good (no harm if not). Cache total capped
-                    ###      at 15m via recovery_cache_total_n anyway.
-                    min_candidates_lookahead_n=int(rospy.get_param(
-                        '~recovery_min_candidates_lookahead_n', 100)),
-                    num_kappas=int(rospy.get_param(
-                        '~recovery_num_kappas', 20)),
-                    n_additional=int(rospy.get_param(
-                        '~recovery_n_additional', 100)),
-                    delta_s=delta_s, n_samples=int(n_samples),
-                    wall_safe=float(getattr(self.solver, 'wall_safe', 0.15)),
-                    spline_scale=float(rospy.get_param(
-                        '~recovery_spline_scale', 0.8)),
-                    return_frenet=True)
+                ### HJ : 2026-04-27 — shrink retry. First attempt uses full
+                ###      candidate range; if validation fails, retry with
+                ###      progressively smaller max_candidate_len so
+                ###      tangent_idx is forced to a closer (= shorter
+                ###      spline) endpoint. User: "안될거같으면 더 당겨서
+                ###      생성하는거 맞지?" — yes.
+                shrink_caps = [None, 60, 30, 15]   # idx caps; None = no cap
+                xy_traj, sn_traj = None, None
+                for attempt_idx, max_cap in enumerate(shrink_caps):
+                    xy_traj, sn_traj = build_recovery_path(
+                        self.lifter, s_cur, ego_n,
+                        ego_x=float(self.car_x), ego_y=float(self.car_y),
+                        ego_yaw=float(self.car_yaw),
+                        g_dleft=self.lifter.g_dleft,
+                        g_dright=self.lifter.g_dright,
+                        g_kappa=getattr(self, 'g_kappa', None),
+                        inflection_points=getattr(self, '_inflection_points', None),
+                        min_candidates_lookahead_n=int(rospy.get_param(
+                            '~recovery_min_candidates_lookahead_n', 100)),
+                        num_kappas=int(rospy.get_param(
+                            '~recovery_num_kappas', 20)),
+                        max_candidate_len=max_cap,
+                        n_additional=int(rospy.get_param(
+                            '~recovery_n_additional', 100)),
+                        delta_s=delta_s, n_samples=int(n_samples),
+                        wall_safe=float(getattr(self.solver, 'wall_safe', 0.15)),
+                        spline_scale=float(rospy.get_param(
+                            '~recovery_spline_scale', 0.8)),
+                        return_frenet=True)
+                    if xy_traj is not None:
+                        if attempt_idx > 0:
+                            rospy.loginfo_throttle(
+                                1.0,
+                                '[mpc tier2][%s] recovery valid after shrink (max_cap=%s, attempt=%d)',
+                                rospy.get_name(), max_cap, attempt_idx)
+                        break
+                ### HJ : end
                 if xy_traj is None:
                     rospy.logwarn_throttle(
                         1.0, '[mpc fallback tier2][%s] recovery path invalid '
