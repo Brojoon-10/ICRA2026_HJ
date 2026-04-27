@@ -3012,12 +3012,13 @@ class MPCPlannerStateNode:
                     g_dright=self.lifter.g_dright,
                     g_kappa=getattr(self, 'g_kappa', None),
                     inflection_points=getattr(self, '_inflection_points', None),
-                    ### HJ : 2026-04-27 v3 — sized for 15m total target.
-                    ###      Spline floor: 50 idx (= 5m).
-                    ###      GB suffix: 100 idx (= 10m). Cache stored ~15-20m,
-                    ###      sample caps at 15m via recovery_cache_total_n.
+                    ### HJ : 2026-04-27 v4 — min_candidates is search range,
+                    ###      not actual spline length. Bigger search lets
+                    ###      tangent_idx pick from farther GB if alignment
+                    ###      is good (no harm if not). Cache total capped
+                    ###      at 15m via recovery_cache_total_n anyway.
                     min_candidates_lookahead_n=int(rospy.get_param(
-                        '~recovery_min_candidates_lookahead_n', 50)),
+                        '~recovery_min_candidates_lookahead_n', 100)),
                     num_kappas=int(rospy.get_param(
                         '~recovery_num_kappas', 20)),
                     n_additional=int(rospy.get_param(
