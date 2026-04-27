@@ -2445,6 +2445,31 @@ class MPCPlannerStateNode:
 
         warm_used = int(bool(getattr(self.solver, 'warm', False)))
 
+        ### HJ : 2026-04-27 — cache HIJACKS NLP. Once a recovery cache is
+        ###      committed, it is sampled EVERY tick (including when NLP
+        ###      would otherwise succeed) until invalidation. Per user:
+        ###      "리커버리 한번 되면 그거 끝까지 따라가고 사이에 mpc 풀려도
+        ###       장애물 생기는거 아니면 그거 따라가게". Solver still runs
+        ###      so warm-start stays warm and we have a fresh "intent"
+        ###      even if we don't publish it — keeps tier-0 ready when
+        ###      cache invalidates.
+        cached_xy, cached_sn = self._sample_recovery_cache(s_cur, ego_n)
+        if cached_xy is not None:
+            # Skip NLP — publish cache directly.
+            self._handle_tier2_geometric(
+                cached_xy, cached_sn, ego_n, 'cache_hold', 0.0,
+                'cached')
+            self._debug_log(
+                tier=2, status='RECOVERY_CACHED', ipopt_status='cache_hold',
+                iter_count=0, solve_ms=0.0, slack_max=0.0,
+                trajectory=cached_xy, u_sol=None, obs_arr=obs_arr,
+                obs_tag='cached', ref_slice=ref_slice,
+                initial_state=initial_state, ego_s=s_cur, ego_n=ego_n,
+                warm_used=warm_used,
+            )
+            return
+        ### HJ : end
+
         t0 = time.time()
         if self.solver_backend == 'frenet_kin':
             speed, steering, trajectory, success = self.solver.solve(
@@ -2948,8 +2973,14 @@ class MPCPlannerStateNode:
                     g_dright=self.lifter.g_dright,
                     g_kappa=getattr(self, 'g_kappa', None),
                     inflection_points=getattr(self, '_inflection_points', None),
+                    ### HJ : 2026-04-27 — was 20 (= 2m at wpnt_dist=0.1).
+                    ###      User: "fallback 루트 왜케 짧아. global이랑 좀
+                    ###      이어야지". Bump to 50 (5m) so spline portion
+                    ###      always has enough length to smoothly join GB.
+                    ###      Inflection-based lookahead overrides upward;
+                    ###      this is the floor.
                     min_candidates_lookahead_n=int(rospy.get_param(
-                        '~recovery_min_candidates_lookahead_n', 20)),
+                        '~recovery_min_candidates_lookahead_n', 50)),
                     num_kappas=int(rospy.get_param(
                         '~recovery_num_kappas', 20)),
                     n_additional=int(rospy.get_param(
