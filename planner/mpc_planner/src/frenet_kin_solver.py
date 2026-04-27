@@ -377,13 +377,27 @@ class FrenetKinMPC:
             opti.subject_to(n_[k] >= P_nlb[k] - slk[k])
             opti.subject_to(n_[k] <= P_nub[k] + slk[k])
             opti.subject_to(slk[k] >= 0.0)
-            ### HJ : 2026-04-27 — slack upper bound. Without it, ipopt's
-            ###      barrier method can settle at slk≈99999 sentinel even
-            ###      on Solve_Succeeded ticks (observed in bag analysis).
-            ###      Cap at 1.0m — anything more means corridor genuinely
-            ###      can't be satisfied → solver should fail and tier-1
-            ###      hold-last takes over.
-            opti.subject_to(slk[k] <= 1.0)
+            ### HJ : 2026-04-27 v2 — slack cap = (wall_safe + inflation).
+            ###      The hard corridor is set at d_L - margin where
+            ###      margin = wall_safe + inflation + ego_half. Slack
+            ###      relaxes corridor → effective limit n[k] ≤ nub + slk.
+            ###      To NEVER cross actual wall, slk cap must be ≤
+            ###      (wall_safe + inflation), because:
+            ###         nub + slk_max = (d_L - margin) + (wall_safe+infl)
+            ###                       = d_L - ego_half  ← still ego_half
+            ###                                            inside wall.
+            ###      With wall_safe=0.08, inflation=0.05, cap = 0.13. So
+            ###      path can never come within 0.15m (= ego_half) of
+            ###      actual wall. If solver can't satisfy with slk<=0.13,
+            ###      it fails → tier-1 hold-last → tier-2 recovery path.
+            ###      k=0 has its own forced slack (from n[0]==ego_n
+            ###      possibly outside corridor); cap looser there.
+            slk_cap = self.wall_safe + self.inflation  # = 0.13 typical
+            slk_cap_k0 = max(slk_cap, 1.0)              # k=0 lenient
+            if k == 0:
+                opti.subject_to(slk[k] <= slk_cap_k0)
+            else:
+                opti.subject_to(slk[k] <= slk_cap)
             ### HJ : end
 
         # ---- cost ----
