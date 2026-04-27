@@ -2909,21 +2909,20 @@ class MPCPlannerStateNode:
         if s_cur < self._recovery_cache_s_start - 1.0:
             self._invalidate_recovery_cache('s underflow')
             return None, None
-        ### HJ : 2026-04-27 — return ALL remaining cached samples from
-        ###      current ego_s onwards (plus GB blend after cache end).
-        ###      User: cache has 30m of path but I was returning only N+1=21
-        ###      samples (= 2m). Now return cached[idx:] + GB suffix beyond
-        ###      s_end so controller lookahead never runs out.
+        ### HJ : 2026-04-27 v2 — fixed total output length ~15m.
+        ###      User: 21m+ too long. Cap at K_target_total wpnts; cache
+        ###      portion takes priority, GB tail fills any remainder.
         s_arr = self._recovery_cache_sn[:, 0]
         idx = int(np.searchsorted(s_arr, s_cur))
         idx = max(0, min(idx, len(s_arr) - 1))
         cached_xy = self._recovery_cache_xy
         cached_sn = self._recovery_cache_sn
-        K_remaining = len(s_arr) - idx
-        # GB blend tail: extra samples beyond cache end at wpnt_dist spacing
         wpnt_dist = float(self.g_s[1] - self.g_s[0]) if (
             self.g_s is not None and len(self.g_s) > 1) else 0.10
-        K_gb_tail = int(rospy.get_param('~recovery_cache_gb_tail_n', 100))
+        K_target_total = int(rospy.get_param(
+            '~recovery_cache_total_n', 150))   # 150 × 0.1m = 15m default
+        K_remaining = min(len(s_arr) - idx, K_target_total)
+        K_gb_tail = max(0, K_target_total - K_remaining)
         K_total = K_remaining + K_gb_tail
         out_xy = np.zeros((K_total, cached_xy.shape[1]), dtype=np.float64)
         out_sn = np.zeros((K_total, cached_sn.shape[1]), dtype=np.float64)
@@ -3013,16 +3012,16 @@ class MPCPlannerStateNode:
                     g_dright=self.lifter.g_dright,
                     g_kappa=getattr(self, 'g_kappa', None),
                     inflection_points=getattr(self, '_inflection_points', None),
-                    ### HJ : 2026-04-27 v2 — user wants LONG path.
-                    ###      Spline floor: 100 idx (= 10m at wpnt_dist=0.1).
-                    ###      GB suffix: 200 idx (= 20m). Total ≥ 30m.
-                    ###      Inflection-based lookahead overrides upward.
+                    ### HJ : 2026-04-27 v3 — sized for 15m total target.
+                    ###      Spline floor: 50 idx (= 5m).
+                    ###      GB suffix: 100 idx (= 10m). Cache stored ~15-20m,
+                    ###      sample caps at 15m via recovery_cache_total_n.
                     min_candidates_lookahead_n=int(rospy.get_param(
-                        '~recovery_min_candidates_lookahead_n', 100)),
+                        '~recovery_min_candidates_lookahead_n', 50)),
                     num_kappas=int(rospy.get_param(
                         '~recovery_num_kappas', 20)),
                     n_additional=int(rospy.get_param(
-                        '~recovery_n_additional', 200)),
+                        '~recovery_n_additional', 100)),
                     delta_s=delta_s, n_samples=int(n_samples),
                     wall_safe=float(getattr(self.solver, 'wall_safe', 0.15)),
                     spline_scale=float(rospy.get_param(
