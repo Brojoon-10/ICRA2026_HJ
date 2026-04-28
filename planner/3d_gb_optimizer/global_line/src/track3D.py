@@ -860,6 +860,62 @@ class Track3D:
         g_tilde = ca.fmax(w_dot - V_omega + (omega_x ** 2 - omega_y ** 2) * h + g_earth * ca.cos(mu) * ca.cos(phi), 0.0)
 
         return ax_tilde, ay_tilde, g_tilde
+
+    ## IY : slope-aware variant — removes slope terms so 3D GGV handles them
+    def calc_apparent_accelerations_no_slope(
+            self, V, n, chi, ax, ay, s, h,
+            neglect_w_omega_y=True, neglect_w_omega_x=True, neglect_euler=True,
+            neglect_centrifugal=True, neglect_w_dot=False, neglect_V_omega=False,
+    ):
+        """Same as calc_apparent_accelerations but with slope (mu) terms removed.
+        Returns (ax_tilde, ay_tilde, g_tilde, mu) where mu is the raw pitch angle."""
+        if not self.track_locked:
+            raise RuntimeError('Track is not locked.')
+
+        mu = self.mu_interpolator(s)
+        phi = self.phi_interpolator(s)
+        Omega_x = self.Omega_x_interpolator(s)
+        dOmega_x = self.dOmega_x_interpolator(s)
+        Omega_y = self.Omega_y_interpolator(s)
+        dOmega_y = self.dOmega_y_interpolator(s)
+        Omega_z = self.Omega_z_interpolator(s)
+        dOmega_z = self.dOmega_z_interpolator(s)
+
+        s_dot = (V * ca.cos(chi)) / (1.0 - n * Omega_z)
+        w = n * Omega_x * s_dot
+        V_dot = ax
+        if not neglect_w_omega_y:
+            V_dot += w * (Omega_x * ca.sin(chi) - Omega_y * ca.cos(chi)) * s_dot
+        n_dot = V * ca.sin(chi)
+        chi_dot = ay / V - Omega_z * s_dot
+        if not neglect_w_omega_x:
+            chi_dot += w * (Omega_x * ca.cos(chi) + Omega_y * ca.sin(chi)) * s_dot / V
+        s_ddot = ((V_dot * ca.cos(chi) - V * ca.sin(chi) * chi_dot) * (1.0 - n * Omega_z) - (V * ca.cos(chi)) * (- n_dot * Omega_z - n * dOmega_z * s_dot)) / (1.0 + 2.0 * n * Omega_z + n ** 2 * Omega_z ** 2)
+
+        omega_x_dot = 0.0
+        omega_y_dot = 0.0
+        if not neglect_euler:
+            omega_x_dot = (dOmega_x * s_dot * ca.cos(chi) - Omega_x * ca.sin(chi) * chi_dot + dOmega_y * s_dot * ca.sin(chi) + Omega_y * ca.cos(chi) * chi_dot) * s_dot + (Omega_x * ca.cos(chi) + Omega_y * ca.sin(chi)) * s_ddot
+            omega_y_dot = (-dOmega_x * s_dot * ca.sin(chi) - Omega_x * ca.cos(chi) * chi_dot + dOmega_y * s_dot * ca.cos(chi) - Omega_y * ca.sin(chi) * chi_dot) * s_dot + (- Omega_x * ca.sin(chi) + Omega_y * ca.cos(chi)) * s_ddot
+        omega_x, omega_y, omega_z = 0.0, 0.0, 0.0
+        if not neglect_centrifugal:
+            omega_x = (Omega_x * ca.cos(chi) + Omega_y * ca.sin(chi)) * s_dot
+            omega_y = (- Omega_x * ca.sin(chi) + Omega_y * ca.cos(chi)) * s_dot
+            omega_z = Omega_z * s_dot + chi_dot
+        w_dot = 0.0
+        if not neglect_w_dot:
+            w_dot = n_dot * Omega_x * s_dot + n * dOmega_x * s_dot ** 2 + n * Omega_x * s_ddot
+        V_omega = 0.0
+        if not neglect_V_omega:
+            V_omega = (- Omega_x * ca.sin(chi) + Omega_y * ca.cos(chi)) * s_dot * V
+
+        # No sin(mu)/cos(mu) — GGV envelope handles slope
+        ax_tilde = ax + omega_y_dot * h - omega_z * omega_x * h + g_earth * (ca.sin(phi) * ca.sin(chi))
+        ay_tilde = ay + omega_x_dot * h + omega_z * omega_y * h + g_earth * (ca.sin(phi) * ca.cos(chi))
+        g_tilde = ca.fmax(w_dot - V_omega + (omega_x ** 2 - omega_y ** 2) * h + g_earth * ca.cos(phi), 0.0)
+
+        return ax_tilde, ay_tilde, g_tilde, mu
+    ## IY : end
  
     def get_track_bounds(self, margin=0.0):
         normal_vector = self.get_normal_vector_numpy(self.theta, self.mu, self.phi)
