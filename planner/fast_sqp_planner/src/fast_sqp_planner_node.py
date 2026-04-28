@@ -14,6 +14,7 @@ import rospy
 from std_msgs.msg import Bool, Float32, Float32MultiArray, Header
 from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
 from tf.transformations import euler_from_quaternion
 from rospkg import RosPack
 
@@ -56,6 +57,8 @@ class OvertakingIYNode:
         self.back_to_raceline_after = pp('~back_to_raceline_after', 5.0)
         self.obs_traj_tresh = pp('~obs_traj_tresh', 1.5)
         self.prediction_horizon_s = pp('~prediction_horizon_s', 1.0)
+        ## IY : obs_min += sigma_k * sqrt(d_var)
+        self.obs_sigma_k = pp('~obs_sigma_k', 2.0)
 
         # Rolling-horizon specific
         self.lambda_reg = pp('~regularization/lambda_reg', 1.0)
@@ -225,6 +228,7 @@ class OvertakingIYNode:
         self.lookahead          = config.lookahead
         self.evasion_dist       = config.evasion_dist
         self.prediction_horizon_s = config.prediction_horizon_s
+        self.obs_sigma_k        = config.obs_sigma_k
         self.T_horizon          = config.T_horizon
         self.s_min_horizon      = config.s_min_horizon
         self.lambda_reg         = config.lambda_reg
@@ -710,6 +714,72 @@ class OvertakingIYNode:
             mrks.markers.append(m)
         self.mrks_pub.publish(mrks)
 
+    ## IY : visualize GP-based obstacle avoidance band in RViz
+    def _visualize_obs_band(self, s_av, obs_center, obs_min):
+        """Draw upper/lower boundary + center of the obstacle band as LINE_STRIP markers."""
+        active = obs_min > 0.0
+        if not np.any(active):
+            # publish delete to clear stale markers
+            mrks = MarkerArray()
+            d = Marker(header=Header(stamp=rospy.Time.now()))
+            d.ns = 'obs_band'
+            d.action = Marker.DELETEALL
+            mrks.markers = [d]
+            self.mrks_pub.publish(mrks)
+            return
+        idxs = np.where(active)[0]
+        s_band = s_av[idxs]
+        c_band = obs_center[idxs]
+        m_band = obs_min[idxs]
+        s_wrap = np.mod(s_band, self.scaled_max_s)
+        try:
+            xyz_upper = self.converter.get_cartesian_3d(s_wrap, c_band + m_band).T
+            xyz_center = self.converter.get_cartesian_3d(s_wrap, c_band).T
+            xyz_lower = self.converter.get_cartesian_3d(s_wrap, c_band - m_band).T
+        except Exception:
+            return
+        mrks = MarkerArray()
+        del_mrk = Marker(header=Header(stamp=rospy.Time.now()))
+        del_mrk.ns = 'obs_band'
+        del_mrk.action = Marker.DELETEALL
+        mrks.markers.append(del_mrk)
+        ttl = rospy.Duration(max(0.2, 3.0 / self.rate_hz))
+        hdr = Header(stamp=rospy.Time.now(), frame_id='map')
+        # upper boundary (red)
+        m_up = Marker(header=hdr)
+        m_up.ns = 'obs_band'
+        m_up.id = 0
+        m_up.type = Marker.LINE_STRIP
+        m_up.scale.x = 0.04
+        m_up.color.r, m_up.color.g, m_up.color.b, m_up.color.a = 1.0, 0.2, 0.2, 0.8
+        m_up.lifetime = ttl
+        m_up.points = [Point(x=xyz_upper[i, 0], y=xyz_upper[i, 1], z=xyz_upper[i, 2] + 0.05)
+                       for i in range(len(xyz_upper))]
+        mrks.markers.append(m_up)
+        # lower boundary (red)
+        m_lo = Marker(header=hdr)
+        m_lo.ns = 'obs_band'
+        m_lo.id = 1
+        m_lo.type = Marker.LINE_STRIP
+        m_lo.scale.x = 0.04
+        m_lo.color.r, m_lo.color.g, m_lo.color.b, m_lo.color.a = 1.0, 0.2, 0.2, 0.8
+        m_lo.lifetime = ttl
+        m_lo.points = [Point(x=xyz_lower[i, 0], y=xyz_lower[i, 1], z=xyz_lower[i, 2] + 0.05)
+                       for i in range(len(xyz_lower))]
+        mrks.markers.append(m_lo)
+        # center line (yellow)
+        m_ct = Marker(header=hdr)
+        m_ct.ns = 'obs_band'
+        m_ct.id = 2
+        m_ct.type = Marker.LINE_STRIP
+        m_ct.scale.x = 0.03
+        m_ct.color.r, m_ct.color.g, m_ct.color.b, m_ct.color.a = 1.0, 1.0, 0.0, 0.9
+        m_ct.lifetime = ttl
+        m_ct.points = [Point(x=xyz_center[i, 0], y=xyz_center[i, 1], z=xyz_center[i, 2] + 0.05)
+                       for i in range(len(xyz_center))]
+        mrks.markers.append(m_ct)
+        self.mrks_pub.publish(mrks)
+
     def _publish_status_text(self, n_obs, ot_check, smart_static,
                              solve_ms, solve_ok, side, abort_reason, dry_run):
         if self.cur_x == 0.0 and self.cur_y == 0.0:
@@ -1024,6 +1094,10 @@ class OvertakingIYNode:
                           and self.opponent_wpnts_sm.size > 0
                           and self.opponent_wpnts_d is not None)
                 fallback_center = (o.d_left + o.d_right) / 2.0
+                ## IY : has_gp also requires d_var for variance-scaled obs_min
+                has_dvar = (has_gp
+                            and self.opponent_wpnts_dvar is not None
+                            and self.opponent_wpnts_dvar.size > 0)
                 for ii in range(i0, i1 + 1):
                     if has_gp:
                         s_at_knot = s_av[ii] % self.scaled_max_s
@@ -1031,7 +1105,17 @@ class OvertakingIYNode:
                             s_at_knot, self.opponent_wpnts_sm, self.opponent_wpnts_d))
                     else:
                         obs_center[ii] = fallback_center
-                    obs_min[ii] = self.width_car + self.evasion_dist
+                    # obs_min[ii] = self.width_car + self.evasion_dist  ### IY : replaced by variance-scaled version
+                    base_min = self.width_car + self.evasion_dist
+                    if has_dvar and self.obs_sigma_k > 0:
+                        s_at_knot = s_av[ii] % self.scaled_max_s
+                        dvar = float(np.interp(
+                            s_at_knot, self.opponent_wpnts_sm, self.opponent_wpnts_dvar))
+                        base_min += self.obs_sigma_k * np.sqrt(max(dvar, 0.0))
+                    obs_min[ii] = base_min
+
+        ## IY : visualize obs band in RViz
+        self._visualize_obs_band(s_av, obs_center, obs_min)
 
         # curvature constraint: interpolated min-radius like sqp_avoidance_node.py:331-337
         clipped_v = max(self.cur_v, 1.0)
