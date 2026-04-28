@@ -24,7 +24,7 @@ from std_srvs.srv import Trigger
 
 class GGTunerNode:
 
-    TIRE_KEYS = ['lambda_mu_x', 'lambda_mu_y', 'p_Dx_2', 'p_Dy_2', 'friction']
+    TIRE_KEYS = ['lambda_mu_x', 'lambda_mu_y', 'p_Dx_1', 'p_Dy_1', 'p_Dx_2', 'p_Dy_2']
     VEHICLE_KEYS = ['P_max', 'v_max', 'epsilon',
                     'P_brake_max', 'ax_max_cap', 'ax_min_cap', 'ay_max_cap']
     CAP_KEYS = ['P_brake_max', 'ax_max_cap', 'ax_min_cap', 'ay_max_cap']
@@ -88,6 +88,11 @@ class GGTunerNode:
             '/gg_compute_status', String, queue_size=5, latch=True)
         self.status_pub.publish(f"READY: {self.base_vehicle}")
 
+        ## IY : publish GGV diamond results as JSON for rqt_gg_viewer
+        self.results_pub = rospy.Publisher(
+            '/gg_results', String, queue_size=1, latch=True)
+        ## IY : end
+
         self.pipeline_thread = None
         self.pipeline_lock = threading.Lock()
         self.fbga_proc = None
@@ -147,11 +152,6 @@ class GGTunerNode:
         # NLP: tire
         for key in self.TIRE_KEYS:
             if key in tuning_dict:
-                if key == 'friction':
-                    fric_val = float(tuning_dict[key])
-                    merged['tire_params']['p_Dx_1'] = fric_val
-                    merged['tire_params']['p_Dy_1'] = fric_val
-                    continue
                 merged['tire_params'][key] = tuning_dict[key]
         # NLP: vehicle (caps: 0.0 → None)
         for key in self.VEHICLE_KEYS:
@@ -350,18 +350,48 @@ class GGTunerNode:
         except (OSError, FileNotFoundError) as e:
             rospy.logerr(f"[GGTuner] gg.bin gen failed (npy missing): {e}")
             return False
-        nv, ng = len(v_list), len(g_list)
-        try:
-            with open(bin_path, 'wb') as f:
-                f.write(struct.pack('II', nv, ng))
-                for arr in [v_list, g_list, ax_max, ax_min, ay_max, gg_exp]:
-                    arr.tofile(f)
-        except OSError as e:
-            rospy.logerr(f"[GGTuner] gg.bin write failed: {e}")
-            return False
-        rospy.loginfo(
-            f"[GGTuner] gg.bin written: {bin_path} (nv={nv}, ng={ng}, "
-            f"size={os.path.getsize(bin_path)} B)")
+
+        ## IY : detect 3D slope data and write 3D gg.bin if available
+        slope_list_path = os.path.join(npy_dir, 'slope_list.npy')
+        ax_max_3d_path = os.path.join(npy_dir, 'ax_max_3d.npy')
+        has_3d = os.path.exists(slope_list_path) and os.path.exists(ax_max_3d_path)
+
+        if has_3d:
+            slope_list = np.load(slope_list_path).astype(np.float64)
+            ax_max_3d = np.load(ax_max_3d_path).astype(np.float64)
+            ax_min_3d = np.load(os.path.join(npy_dir, 'ax_min_3d.npy')).astype(np.float64)
+            ay_max_3d = np.load(os.path.join(npy_dir, 'ay_max_3d.npy')).astype(np.float64)
+            gg_exp_3d = np.load(os.path.join(npy_dir, 'gg_exponent_3d.npy')).astype(np.float64)
+            nv, ng, ns = len(v_list), len(g_list), len(slope_list)
+            try:
+                with open(bin_path, 'wb') as f:
+                    f.write(struct.pack('III', nv, ng, ns))
+                    for arr in [v_list, g_list, slope_list]:
+                        arr.tofile(f)
+                    # 3D arrays: row-major [nv, ng, ns]
+                    for arr in [ax_max_3d, ax_min_3d, ay_max_3d, gg_exp_3d]:
+                        arr.astype(np.float64).tofile(f)
+            except OSError as e:
+                rospy.logerr(f"[GGTuner] 3D gg.bin write failed: {e}")
+                return False
+            rospy.loginfo(
+                f"[GGTuner] 3D gg.bin written: {bin_path} "
+                f"(nv={nv}, ng={ng}, ns={ns}, "
+                f"size={os.path.getsize(bin_path)} B)")
+        else:
+            nv, ng = len(v_list), len(g_list)
+            try:
+                with open(bin_path, 'wb') as f:
+                    f.write(struct.pack('II', nv, ng))
+                    for arr in [v_list, g_list, ax_max, ax_min, ay_max, gg_exp]:
+                        arr.tofile(f)
+            except OSError as e:
+                rospy.logerr(f"[GGTuner] gg.bin write failed: {e}")
+                return False
+            rospy.loginfo(
+                f"[GGTuner] 2D gg.bin written: {bin_path} (nv={nv}, ng={ng}, "
+                f"size={os.path.getsize(bin_path)} B)")
+        ## IY : end
         return True
 
     def _copy_to_gg_diagrams(self, vehicle_name):
@@ -451,7 +481,9 @@ class GGTunerNode:
         return ok
 
     ## IY : fast_ggv — no --tuning, unified params yml already has everything
-    def _run_fast_ggv(self, vehicle_name, full_resolution=False):
+    def _run_fast_ggv(self, vehicle_name, full_resolution=False,
+                      enable_slope=False, slope_max_deg=15.0, slope_N=5,
+                      slope_ax_scale=1.0, slope_normal_scale=1.0):
         rospy.loginfo(f"[GGTuner] [fast_ggv] starting: {vehicle_name}")
         self.status_pub.publish(f"GGV_COMPUTING: {vehicle_name}")
         if not os.path.exists(self.fast_ggv_script):
@@ -459,7 +491,15 @@ class GGTunerNode:
             return False
         resolution = '--full' if full_resolution else '--fast'
         cmd = ['bash', self.fast_ggv_script, vehicle_name, resolution]
-        return self._run_and_stream(cmd, tag='fast_ggv', timeout=600)
+        env = {}
+        if enable_slope:
+            env['ENABLE_SLOPE'] = '1'
+            env['SLOPE_MAX_DEG'] = str(slope_max_deg)
+            env['SLOPE_N'] = str(slope_N)
+            env['SLOPE_AX_SCALE'] = str(slope_ax_scale)
+            env['SLOPE_NORMAL_SCALE'] = str(slope_normal_scale)
+        return self._run_and_stream(cmd, tag='fast_ggv', timeout=600,
+                                    env=env if env else None)
     ## IY : end
 
     def _read_friction_sectors(self, map_name):
@@ -635,6 +675,57 @@ class GGTunerNode:
         rospy.loginfo("[GGTuner] [fbga] killed")
     ## IY : end
 
+    ## IY : publish GGV diamond results as JSON for rqt_gg_viewer
+    def _publish_gg_results(self, vehicle_name, tuning=None, slope_results=None):
+        vf_dir = os.path.join(self.data_path, 'gg_diagrams', vehicle_name,
+                              'velocity_frame')
+        if not os.path.isdir(vf_dir):
+            rospy.logwarn(f"[GGTuner] publish_gg_results: no velocity_frame dir: {vf_dir}")
+            return
+        try:
+            v_list = np.load(os.path.join(vf_dir, 'v_list.npy')).tolist()
+            g_list = np.load(os.path.join(vf_dir, 'g_list.npy')).tolist()
+            ax_max = np.load(os.path.join(vf_dir, 'ax_max.npy')).tolist()
+            ax_min = np.load(os.path.join(vf_dir, 'ax_min.npy')).tolist()
+            ay_max = np.load(os.path.join(vf_dir, 'ay_max.npy')).tolist()
+            gg_exp = np.load(os.path.join(vf_dir, 'gg_exponent.npy')).tolist()
+        except (FileNotFoundError, OSError) as e:
+            rospy.logwarn(f"[GGTuner] publish_gg_results: npy load failed: {e}")
+            return
+        # auto-load slope results from 3D diamond arrays if available
+        if slope_results is None:
+            slope_list_path = os.path.join(vf_dir, 'slope_list_deg.npy')
+            ax_max_3d_path = os.path.join(vf_dir, 'ax_max_3d.npy')
+            if os.path.exists(slope_list_path) and os.path.exists(ax_max_3d_path):
+                try:
+                    slope_results = {
+                        'slope_list_deg': np.load(slope_list_path).tolist(),
+                        'ax_max': np.load(ax_max_3d_path).tolist(),
+                        'ax_min': np.load(os.path.join(vf_dir, 'ax_min_3d.npy')).tolist(),
+                        'ay_max': np.load(os.path.join(vf_dir, 'ay_max_3d.npy')).tolist(),
+                    }
+                    rospy.loginfo(f"[GGTuner] 3D slope diamond loaded for viewer")
+                except (FileNotFoundError, OSError):
+                    pass
+        payload = {
+            'vehicle_name': vehicle_name,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'v_list': v_list,
+            'g_list': g_list,
+            'diamond': {
+                'ax_max': ax_max,
+                'ax_min': ax_min,
+                'ay_max': ay_max,
+                'gg_exponent': gg_exp,
+            },
+            'tuning_params': tuning or {},
+            'slope_results': slope_results,
+        }
+        self.results_pub.publish(json.dumps(payload))
+        rospy.loginfo(f"[GGTuner] Published /gg_results "
+                      f"(V={len(v_list)}, g={len(g_list)})")
+    ## IY : end
+
     def _run_full_pipeline(self, tuning, run_opts):
         with self.pipeline_lock:
             try:
@@ -665,6 +756,9 @@ class GGTunerNode:
                     rospy.loginfo(
                         f"[GGTuner] Stage 2 SKIP (run_ggv=False), reusing latest")
                     self.status_pub.publish(f"GGV_SKIP: {vehicle_name}")
+                    ## IY : publish existing results for rqt_gg_viewer
+                    self._publish_gg_results(vehicle_name, tuning)
+                    ## IY : end
                 else:
                     rospy.loginfo(
                         f"[GGTuner] Stage 2: compute fresh into latest "
@@ -673,7 +767,12 @@ class GGTunerNode:
                     self._write_latest_params_yml(merged)
                     ok = self._run_fast_ggv(
                         vehicle_name,
-                        full_resolution=run_opts['full_resolution'])
+                        full_resolution=run_opts['full_resolution'],
+                        enable_slope=run_opts.get('enable_slope', False),
+                        slope_max_deg=run_opts.get('slope_max_deg', 15.0),
+                        slope_N=run_opts.get('slope_N', 5),
+                        slope_ax_scale=run_opts.get('slope_ax_scale', 1.0),
+                        slope_normal_scale=run_opts.get('slope_normal_scale', 1.0))
                     if not ok:
                         self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
                         return
@@ -682,6 +781,9 @@ class GGTunerNode:
                         return
                     self._save_meta(vehicle_name, tuning)
                     self.status_pub.publish(f"GGV_DONE: {vehicle_name}")
+                    ## IY : publish fresh results for rqt_gg_viewer
+                    self._publish_gg_results(vehicle_name, tuning)
+                    ## IY : end
                 ## IY : end
                     
                 # Publish sector snapshot-name selectors for velopt/FBGA
@@ -775,6 +877,12 @@ class GGTunerNode:
             'ggv_sector4':      str(getattr(config, 'ggv_sector4', '')).strip(),
             ## IY : raceline-dedicated snapshot (empty=latest)
             'raceline_ggv':     str(getattr(config, 'raceline_ggv', '')).strip(),
+            ## IY : slope sweep for rqt_gg_viewer
+            'enable_slope':     bool(getattr(config, 'enable_slope', False)),
+            'slope_max_deg':    float(getattr(config, 'slope_max_deg', 15.0)),
+            'slope_N':          int(getattr(config, 'slope_N', 5)),
+            'slope_ax_scale':   float(getattr(config, 'slope_ax_scale', 1.0)),
+            'slope_normal_scale': float(getattr(config, 'slope_normal_scale', 1.0)),
             ## IY : end
         }
         ## IY : end

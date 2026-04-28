@@ -265,4 +265,68 @@ for frame in ['vehicle', 'velocity']:
     np.save(os.path.join(out_path, frame + '_frame', "ax_max.npy"), ax_max_list)
     np.save(os.path.join(out_path, frame + '_frame', "ay_max.npy"), ay_max_list)
 
+## IY : slope diamond fitting — produces 3D arrays [V_N, g_N, slope_N]
+slope_data_root = os.path.join(gg_diagram_path, vehicle_name, 'slope_data')
+if os.path.isdir(slope_data_root):
+    print(f'\n[gen_diamond] ===== Slope diamond fitting =====')
+    for frame in ['vehicle', 'velocity']:
+        slope_frame_dir = os.path.join(slope_data_root, frame + '_frame')
+        if not os.path.isdir(slope_frame_dir):
+            continue
+        slope_list = np.load(os.path.join(slope_frame_dir, 'slope_list.npy'))
+        slope_list_deg = np.load(os.path.join(slope_frame_dir, 'slope_list_deg.npy'))
+        alpha_list = np.load(os.path.join(slope_frame_dir, 'alpha_list.npy'))
+        rho_4d = np.load(os.path.join(slope_frame_dir, 'rho.npy'))
+        # rho_4d shape: [slope_N, V_N, g_N, alpha_N]
+        slope_N, V_N_s, g_N_s, _ = rho_4d.shape
+
+        print(f'[gen_diamond] [{frame}_frame] slope_N={slope_N}, '
+              f'V_N={V_N_s}, g_N={g_N_s}')
+
+        # Fit diamond for each slope angle
+        # Output shape: [V_N, g_N, slope_N]
+        gg_exp_3d = np.zeros((V_N_s, g_N_s, slope_N))
+        ax_min_3d = np.zeros((V_N_s, g_N_s, slope_N))
+        ax_max_3d = np.zeros((V_N_s, g_N_s, slope_N))
+        ay_max_3d = np.zeros((V_N_s, g_N_s, slope_N))
+
+        for si in range(slope_N):
+            # rho_4d[si] shape: [V_N, g_N, alpha_N] — same as standard rho
+            rho_this_slope = rho_4d[si]
+            results = Parallel(n_jobs=num_cores)(
+                delayed(gen_diamond_representation_for_V)(alpha_list, rho_v)
+                for rho_v in rho_this_slope
+            )
+            for vi, (gg_e, ax_mn, ax_mx, ay_mx) in enumerate(results):
+                for gi in range(g_N_s):
+                    gg_exp_3d[vi, gi, si] = gg_e[gi]
+                    ax_min_3d[vi, gi, si] = ax_mn[gi]
+                    ax_max_3d[vi, gi, si] = ax_mx[gi]
+                    ay_max_3d[vi, gi, si] = ay_mx[gi]
+            print(f'[gen_diamond] slope {slope_list_deg[si]:+.1f}°: fitted')
+
+        # Apply post-process scales
+        if tuning_post['gg_exp_scale'] is not None:
+            gg_exp_3d = np.clip(gg_exp_3d * tuning_post['gg_exp_scale'], 1.0, 2.0)
+        if tuning_post['ax_max_scale'] is not None:
+            ax_max_3d *= tuning_post['ax_max_scale']
+        if tuning_post['ax_min_scale'] is not None:
+            ax_min_3d *= tuning_post['ax_min_scale']
+        if tuning_post['ay_scale'] is not None:
+            ay_max_3d *= tuning_post['ay_scale']
+
+        # Save 3D diamond arrays to the main frame directory
+        main_frame_dir = os.path.join(gg_diagram_path, vehicle_name, frame + '_frame')
+        np.save(os.path.join(main_frame_dir, 'slope_list.npy'), slope_list)
+        np.save(os.path.join(main_frame_dir, 'slope_list_deg.npy'), slope_list_deg)
+        np.save(os.path.join(main_frame_dir, 'gg_exponent_3d.npy'), gg_exp_3d)
+        np.save(os.path.join(main_frame_dir, 'ax_min_3d.npy'), ax_min_3d)
+        np.save(os.path.join(main_frame_dir, 'ax_max_3d.npy'), ax_max_3d)
+        np.save(os.path.join(main_frame_dir, 'ay_max_3d.npy'), ay_max_3d)
+        print(f'[gen_diamond] [{frame}_frame] 3D diamond saved: '
+              f'{gg_exp_3d.shape}')
+else:
+    print(f'[gen_diamond] No slope_data/ found — 2D only')
+## IY : end
+
 # EOF

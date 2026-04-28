@@ -51,28 +51,21 @@ VehicleParams read_params(const std::string& path) {
 }
 
 // IY : Step D — GG diagram lookup table loaded from binary dump produced by Python.
-//      Bit-exact double-precision values (no text conversion).
-//      Binary layout (little-endian, IEEE 754 double):
-//        [uint32 n_v]
-//        [uint32 n_g]
-//        [double × n_v]              v_list
-//        [double × n_g]              g_list
-//        [double × n_v × n_g]        ax_max  (row-major: idx = iv*n_g + ig)
-//        [double × n_v × n_g]        ax_min
-//        [double × n_v × n_g]        ay_max
-//        [double × n_v × n_g]        gg_exp
+//      Supports both 2D (V,g) and 3D (V,g,slope) formats.
+//      2D layout: [uint32 nv][uint32 ng] + grids + 4×[nv*ng] arrays
+//      3D layout: [uint32 nv][uint32 ng][uint32 ns] + grids + 4×[nv*ng*ns] arrays
+//      Detection: file size determines 2D vs 3D.
 struct GGTable {
-  int n_v = 0, n_g = 0;
-  std::vector<GG::real> v_list, g_list;
+  int n_v = 0, n_g = 0, n_s = 0;  // n_s=0 → 2D mode
+  std::vector<GG::real> v_list, g_list, slope_list;
   std::vector<GG::real> ax_max, ax_min, ay_max, gg_exp;
 
-  GG::real interp(const std::vector<GG::real>& tbl, GG::real v, GG::real g) const {
-    // clamp into grid
+  // 2D bilinear interpolation
+  GG::real interp2d(const std::vector<GG::real>& tbl, GG::real v, GG::real g) const {
     if (v < v_list.front()) v = v_list.front();
     if (v > v_list.back())  v = v_list.back();
     if (g < g_list.front()) g = g_list.front();
     if (g > g_list.back())  g = g_list.back();
-    // find lower indices
     int iv = 0;
     while (iv + 1 < n_v - 1 && v_list[iv + 1] < v) iv++;
     int ig = 0;
@@ -88,10 +81,55 @@ struct GGTable {
     return (1-tv)*(1-tg)*q00 + (1-tv)*tg*q01 + tv*(1-tg)*q10 + tv*tg*q11;
   }
 
-  GG::real ax_max_at(GG::real v, GG::real g) const { return interp(ax_max, v, g); }
-  GG::real ax_min_at(GG::real v, GG::real g) const { return interp(ax_min, v, g); }
-  GG::real ay_max_at(GG::real v, GG::real g) const { return interp(ay_max, v, g); }
-  GG::real gg_exp_at(GG::real v, GG::real g) const { return interp(gg_exp, v, g); }
+  // 3D trilinear interpolation — idx = iv*n_g*n_s + ig*n_s + is
+  GG::real interp3d(const std::vector<GG::real>& tbl,
+                    GG::real v, GG::real g, GG::real slope) const {
+    if (v < v_list.front()) v = v_list.front();
+    if (v > v_list.back())  v = v_list.back();
+    if (g < g_list.front()) g = g_list.front();
+    if (g > g_list.back())  g = g_list.back();
+    if (slope < slope_list.front()) slope = slope_list.front();
+    if (slope > slope_list.back())  slope = slope_list.back();
+    int iv = 0;
+    while (iv + 1 < n_v - 1 && v_list[iv + 1] < v) iv++;
+    int ig = 0;
+    while (ig + 1 < n_g - 1 && g_list[ig + 1] < g) ig++;
+    int is_ = 0;
+    while (is_ + 1 < n_s - 1 && slope_list[is_ + 1] < slope) is_++;
+    GG::real tv = (v_list[iv+1] > v_list[iv]) ? (v - v_list[iv]) / (v_list[iv+1] - v_list[iv]) : 0.0;
+    GG::real tg = (g_list[ig+1] > g_list[ig]) ? (g - g_list[ig]) / (g_list[ig+1] - g_list[ig]) : 0.0;
+    GG::real ts = (slope_list[is_+1] > slope_list[is_]) ? (slope - slope_list[is_]) / (slope_list[is_+1] - slope_list[is_]) : 0.0;
+    auto idx = [&](int vi, int gi, int si) -> size_t {
+      return static_cast<size_t>(vi) * n_g * n_s + gi * n_s + si;
+    };
+    GG::real c000 = tbl[idx(iv,   ig,   is_  )];
+    GG::real c001 = tbl[idx(iv,   ig,   is_+1)];
+    GG::real c010 = tbl[idx(iv,   ig+1, is_  )];
+    GG::real c011 = tbl[idx(iv,   ig+1, is_+1)];
+    GG::real c100 = tbl[idx(iv+1, ig,   is_  )];
+    GG::real c101 = tbl[idx(iv+1, ig,   is_+1)];
+    GG::real c110 = tbl[idx(iv+1, ig+1, is_  )];
+    GG::real c111 = tbl[idx(iv+1, ig+1, is_+1)];
+    // trilinear blend
+    GG::real c00 = c000*(1-ts) + c001*ts;
+    GG::real c01 = c010*(1-ts) + c011*ts;
+    GG::real c10 = c100*(1-ts) + c101*ts;
+    GG::real c11 = c110*(1-ts) + c111*ts;
+    GG::real c0 = c00*(1-tg) + c01*tg;
+    GG::real c1 = c10*(1-tg) + c11*tg;
+    return c0*(1-tv) + c1*tv;
+  }
+
+  GG::real interp(const std::vector<GG::real>& tbl,
+                  GG::real v, GG::real g, GG::real slope = 0.0) const {
+    if (n_s <= 1) return interp2d(tbl, v, g);
+    return interp3d(tbl, v, g, slope);
+  }
+
+  GG::real ax_max_at(GG::real v, GG::real g, GG::real slope = 0.0) const { return interp(ax_max, v, g, slope); }
+  GG::real ax_min_at(GG::real v, GG::real g, GG::real slope = 0.0) const { return interp(ax_min, v, g, slope); }
+  GG::real ay_max_at(GG::real v, GG::real g, GG::real slope = 0.0) const { return interp(ay_max, v, g, slope); }
+  GG::real gg_exp_at(GG::real v, GG::real g, GG::real slope = 0.0) const { return interp(gg_exp, v, g, slope); }
 };
 
 GGTable read_gg_binary(const std::string& path) {
@@ -101,48 +139,80 @@ GGTable read_gg_binary(const std::string& path) {
     std::cerr << "read_gg_binary: cannot open " << path << "\n";
     std::exit(1);
   }
+  // Read nv, ng first
   uint32_t nv = 0, ng = 0;
   f.read(reinterpret_cast<char*>(&nv), sizeof(uint32_t));
   f.read(reinterpret_cast<char*>(&ng), sizeof(uint32_t));
   t.n_v = static_cast<int>(nv);
   t.n_g = static_cast<int>(ng);
+
   auto read_vec = [&](std::vector<GG::real>& v, size_t n) {
     v.resize(n);
     f.read(reinterpret_cast<char*>(v.data()), n * sizeof(double));
   };
-  read_vec(t.v_list, nv);
-  read_vec(t.g_list, ng);
-  read_vec(t.ax_max, static_cast<size_t>(nv) * ng);
-  read_vec(t.ax_min, static_cast<size_t>(nv) * ng);
-  read_vec(t.ay_max, static_cast<size_t>(nv) * ng);
-  read_vec(t.gg_exp, static_cast<size_t>(nv) * ng);
+
+  // Detect 2D vs 3D by file size
+  f.seekg(0, std::ios::end);
+  size_t file_size = f.tellg();
+  size_t expected_2d = 8 + 8*nv + 8*ng + 4*8*static_cast<size_t>(nv)*ng;
+  f.seekg(8, std::ios::beg);  // back to after nv,ng
+
+  if (file_size > expected_2d) {
+    // 3D format: read ns
+    uint32_t ns = 0;
+    f.read(reinterpret_cast<char*>(&ns), sizeof(uint32_t));
+    t.n_s = static_cast<int>(ns);
+    read_vec(t.v_list, nv);
+    read_vec(t.g_list, ng);
+    read_vec(t.slope_list, ns);
+    size_t total = static_cast<size_t>(nv) * ng * ns;
+    read_vec(t.ax_max, total);
+    read_vec(t.ax_min, total);
+    read_vec(t.ay_max, total);
+    read_vec(t.gg_exp, total);
+    std::cout << "read_gg_binary: 3D (nv=" << nv << " ng=" << ng
+              << " ns=" << ns << ")\n";
+  } else {
+    // 2D format
+    t.n_s = 0;
+    read_vec(t.v_list, nv);
+    read_vec(t.g_list, ng);
+    size_t total = static_cast<size_t>(nv) * ng;
+    read_vec(t.ax_max, total);
+    read_vec(t.ax_min, total);
+    read_vec(t.ay_max, total);
+    read_vec(t.gg_exp, total);
+    std::cout << "read_gg_binary: 2D (nv=" << nv << " ng=" << ng << ")\n";
+  }
   return t;
 }
 
 // IY : Step E — GGModel struct + lookup model factory
 //      Same diamond constraint as our NLP point_mass_model.py:
-//        ax_upper = ax_max(v,g) * (1 - (|ay|/ay_max(v,g))^p)^(1/p)
+//        ax_upper = ax_max(v,g,slope) * (1 - (|ay|/ay_max(v,g,slope))^p)^(1/p)
+//      slope parameter defaults to 0.0 for 2D backward compatibility.
 struct GGModel {
-  std::function<GG::real(GG::real, GG::real, GG::real)> upper;   // (ay, v, g) -> ax_max
-  std::function<GG::real(GG::real, GG::real, GG::real)> lower;   // (ay, v, g) -> ax_min
+  std::function<GG::real(GG::real, GG::real, GG::real, GG::real)> upper;   // (ay, v, g, slope) -> ax_max
+  std::function<GG::real(GG::real, GG::real, GG::real, GG::real)> lower;   // (ay, v, g, slope) -> ax_min
   GG::gg_range_max_min range;                                    // (v, g) -> ay_min/max
   std::function<GG::real(GG::real, GG::real)> exp_func;          // HJ : (v, g) -> exponent p
+  bool slope_aware = false;
 };
 
 GGModel make_lookup(const VehicleParams& /*params*/, const GGTable& tbl) {
-  auto upper = [&tbl](GG::real ay, GG::real v, GG::real g) -> GG::real {
-    GG::real ax_max_val = tbl.ax_max_at(v, g);
-    GG::real ay_max_val = tbl.ay_max_at(v, g);
-    GG::real p          = tbl.gg_exp_at(v, g);
+  auto upper = [&tbl](GG::real ay, GG::real v, GG::real g, GG::real slope = 0.0) -> GG::real {
+    GG::real ax_max_val = tbl.ax_max_at(v, g, slope);
+    GG::real ay_max_val = tbl.ay_max_at(v, g, slope);
+    GG::real p          = tbl.gg_exp_at(v, g, slope);
     GG::real ratio  = std::min(std::abs(ay) / ay_max_val, GG::real(1.0));
     GG::real factor = std::pow(std::max(GG::real(1.0) - std::pow(ratio, p), GG::real(0.0)),
                                GG::real(1.0) / p);
     return ax_max_val * factor;
   };
-  auto lower = [&tbl](GG::real ay, GG::real v, GG::real g) -> GG::real {
-    GG::real ax_min_val = tbl.ax_min_at(v, g);   // negative
-    GG::real ay_max_val = tbl.ay_max_at(v, g);
-    GG::real p          = tbl.gg_exp_at(v, g);
+  auto lower = [&tbl](GG::real ay, GG::real v, GG::real g, GG::real slope = 0.0) -> GG::real {
+    GG::real ax_min_val = tbl.ax_min_at(v, g, slope);
+    GG::real ay_max_val = tbl.ay_max_at(v, g, slope);
+    GG::real p          = tbl.gg_exp_at(v, g, slope);
     GG::real ratio  = std::min(std::abs(ay) / ay_max_val, GG::real(1.0));
     GG::real factor = std::pow(std::max(GG::real(1.0) - std::pow(ratio, p), GG::real(0.0)),
                                GG::real(1.0) / p);
@@ -156,7 +226,7 @@ GGModel make_lookup(const VehicleParams& /*params*/, const GGTable& tbl) {
   auto exp_func = [&tbl](GG::real v, GG::real g) -> GG::real {
     return tbl.gg_exp_at(v, g);
   };
-  return {upper, lower, range, exp_func};
+  return {upper, lower, range, exp_func, tbl.n_s > 1};
 }
 // IY+HJ : end Step B/C/D/E
 
