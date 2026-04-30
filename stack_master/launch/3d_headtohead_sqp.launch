@@ -53,7 +53,7 @@
   <!-- ## IY : lightweight overtaking SM -->
   <group if="$(eval arg('state_machine_type') == 'overtaking')">
     <node pkg="state_machine" type="dynamic_statemachine_server.py" name="dyn_statemachine" output="screen" />
-    <node pkg="fast_sqp_planner" type="fast_sqp_planner_sm.py" name="state_machine" output="screen">
+    <node pkg="state_machine" type="fast_sqp_planner_sm.py" name="state_machine" output="screen">
       <rosparam file="$(find stack_master)/config/state_machine_params.yaml" />
       <rosparam file="$(find fast_sqp_planner)/config/state_machine_overtake.yaml" />
     </node>

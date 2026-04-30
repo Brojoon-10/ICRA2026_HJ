@@ -236,6 +236,9 @@ class StateMachine:
         self.ot_collision_ttc_s = rospy.get_param("state_machine/ot_collision_ttc_s", 0.5)
         self.ot_engage_ttc_s = rospy.get_param("state_machine/ot_engage_ttc_s", 1.0)
         self.ot_engage_min_m = rospy.get_param("state_machine/ot_engage_min_m", 5.0)
+        ### IY : trailing trigger params — lateral margin + s-gap based
+        self.ot_margin_safe_m = rospy.get_param("state_machine/ot_margin_safe_m", 0.15)
+        self.ot_blocking_s_gap_m = rospy.get_param("state_machine/ot_blocking_s_gap_m", 0.5)
 
         self.overtaking_horizon_m = rospy.get_param("state_machine/overtaking_horizon_m", 6.9)
         self.lateral_width_ot_m = rospy.get_param("state_machine/lateral_width_ot_m", 0.3)  # [m] DYNIAMIC PARAMETER
@@ -662,6 +665,36 @@ class StateMachine:
             if abs(path_d - obs_d) < obs_half + half_width:
                 return True
         return False
+
+    ### IY : min lateral margin between OT path and dynamic obstacles
+    def _get_ot_path_min_margin(self) -> float:
+        """Returns min lateral margin [m]. +inf if no obstacles or no OT path."""
+        if self._ot_iy_wpnts is None or len(self._ot_iy_wpnts) == 0:
+            return float('inf')
+        ot_s = np.array([w.s_m for w in self._ot_iy_wpnts])
+        ot_d = np.array([w.d_m for w in self._ot_iy_wpnts])
+        half_width = 0.15
+        ot_collision_horizon = np.clip(
+            self.cur_vs * self.ot_collision_ttc_s, 2.0, self.gb_horizon_m)
+        min_margin = float('inf')
+        for obs in self.obstacles:
+            if obs.is_static:
+                continue
+            gap = (obs.s_center - self.cur_s) % self.track_length
+            if gap > ot_collision_horizon:
+                continue
+            s_dists = np.abs(
+                (ot_s - obs.s_center + self.track_length / 2) % self.track_length
+                - self.track_length / 2)
+            idx = int(np.argmin(s_dists))
+            path_d = ot_d[idx]
+            obs_d = obs.d_center
+            d_var = getattr(obs, 'd_var', 0.0)
+            sigma = np.sqrt(max(d_var, 0.0))
+            obs_half = obs.size / 2.0 + 2.0 * sigma
+            margin = abs(path_d - obs_d) - obs_half - half_width
+            min_margin = min(min_margin, margin)
+        return min_margin
 
     def _check_ot_path_excessive_kappa(self) -> bool:
         """Returns True if near-term OT path has curvature too high to follow safely."""
