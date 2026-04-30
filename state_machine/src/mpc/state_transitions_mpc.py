@@ -162,20 +162,24 @@ def RecoveryTransition(state_machine: StateMachine) -> Tuple[StateType, StateTyp
         # Recovery ended - return to Smart mode closed loop
         return SmartStaticTransition(state_machine)
     else:
-        recovery_sustainability = state_machine._check_sustainability(state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts)
-
-        # ### HJ : 2026-04-24 — asymmetric exit hysteresis.
-        # Entry (GB → RECOVERY) is triggered on `|ego_n| > n_recovery_trigger`
-        # (~0.15 m) which is intentionally easy — we want to start the
-        # convergent solve quickly. Exit (RECOVERY → GB) was previously
-        # just "close_to_raceline single-tick" → snapped the car onto GB
-        # the moment |ego_n| dropped below ~0.5 m, steer twitched.
+        # ### HJ : 2026-05-01 — RECOVERY exit policy simplified.
+        # User directive: "ego 가 GB 에서 멀리 떨어지면 무슨 일이 있어도
+        # GB 안 씀". 이전 코드는 _check_sustainability (=_check_availability
+        # AND _check_free_frenet) 가 False 일 때 GlobalTrackingTransition
+        # 으로 폴백 → close_to_gb=False 면 또 _check_on_spline 의 min_dist
+        # 진동에 부딪혀 LOSTLINE→GB 폴백 → 1-tick burst toggle.
         #
-        # New exit rule: require TIGHT proximity (|n| < 0.05 m, heading
-        # error < 10°) AND K ticks continuous before handing to GB. This
-        # gives the NO_OBS MPC a few cycles of "already on raceline"
-        # convergence so the SM switch happens when MPC path and GB path
-        # are already visually identical → no controller L1 jump.
+        # NO_OBS 분기에서 검사들의 의미:
+        #   _check_free_frenet     — obstacle 0 이라 항상 True (무의미)
+        #   _check_on_spline       — ego 가 멀수록 min_dist 가 임계 위로
+        #                            튀어 False. 정확히 RECOVERY 가 필요한
+        #                            상황을 막는 자기모순. 게이트 제거.
+        #   _check_latest_wpnts    — recovery publisher (recovery_spliner
+        #                            80Hz + MPC 40Hz) 둘 다 죽지 않는 한
+        #                            항상 True.
+        #
+        # 새 종료 조건 (단 하나): close_tight (|n|<0.10, |Δψ|<10°) 가
+        # K=2 tick 연속 만족 → GB 로 핸드오프. 그 외엔 RECOVERY 유지.
         tight_threshold = getattr(state_machine, '_rc_exit_tight_m', 0.10)
         tight_heading_deg = getattr(state_machine, '_rc_exit_tight_deg', 10)
         exit_hysteresis_K = getattr(state_machine, '_rc_exit_hyst_ticks', 8)
@@ -188,17 +192,17 @@ def RecoveryTransition(state_machine: StateMachine) -> Tuple[StateType, StateTyp
             state_machine._rc_exit_streak = 0
 
         debug_log_on_change("Recovery_exit",
-                            sustain=recovery_sustainability,
                             close_tight=int(close_tight),
                             streak=state_machine._rc_exit_streak,
                             K=exit_hysteresis_K)
 
-        if (recovery_sustainability
-                and state_machine._rc_exit_streak < exit_hysteresis_K):
-            return StateType.RECOVERY, StateType.RECOVERY
-        # Recovery ended — stable-on-GB streak met OR path sustainability lost.
-        state_machine._rc_exit_streak = 0
-        return GlobalTrackingTransition(state_machine)
+        if state_machine._rc_exit_streak >= exit_hysteresis_K:
+            # ego on raceline for K consecutive ticks → safe to hand off.
+            state_machine._rc_exit_streak = 0
+            return GlobalTrackingTransition(state_machine)
+        # Stay in RECOVERY — sustain-related toggles are no longer a path
+        # to GB. ego 가 멀면 RECOVERY, ego 가 close_tight 도달하면 GB.
+        return StateType.RECOVERY, StateType.RECOVERY
 
 
 def TrailingTransition(state_machine: StateMachine) -> Tuple[StateType, StateType]:
@@ -561,15 +565,19 @@ def NonObstacleTransition_GBMode(state_machine: StateMachine, close_to_gb: bool)
         # rospy.logwarn(f"[NonObstacle_GB→GB_TRACK] ✓ Close to GB")
         return StateType.GB_TRACK, StateType.GB_TRACK
 
+    # ### HJ : 2026-05-01 — _check_on_spline gate REMOVED.
+    # Sim spawn / overpass-jump 시 ego가 raceline 1m 이상 떨어진 상태에서
+    # _check_on_spline 의 min_dist 가 임계값 위로 튀면 LOSTLINE→GB 로
+    # 떨어뜨려 사용자 directive ("ego 멀리면 절대 GB 안 씀") 위반.
+    # NO_OBS 분기에서 _check_free_frenet 도 무의미 (장애물 0).
     # Priority 2: Not close to GB - use recovery to get back
     if state_machine._check_latest_wpnts(state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts):
-        if state_machine._check_on_spline(state_machine.cur_recovery_wpnts):
-            # rospy.logwarn(f"[NonObstacle_GB→RECOVERY] Not close, recovering")
-            return StateType.RECOVERY, StateType.RECOVERY
+        return StateType.RECOVERY, StateType.RECOVERY
 
-    # Priority 3: No valid path - lost line
-    # rospy.logwarn(f"[NonObstacle_GB→LOSTLINE] Lost line")
-    return StateType.LOSTLINE, StateType.GB_TRACK
+    # ### HJ : 2026-05-01 — fallback now keeps RECOVERY source even when
+    # MPC publish dies (system failure). User directive: "ego 멀리면
+    # 무슨 일이 있어도 GB 안 씀".
+    return StateType.LOSTLINE, StateType.RECOVERY
 
 
 def ObstacleTransition_GBMode(state_machine: StateMachine, close_to_gb: bool) -> Tuple[StateType, StateType]:
