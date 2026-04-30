@@ -611,3 +611,288 @@ roslaunch stack_master 3d_headtohead.launch planner_backend:=mpc
 - observation 모드 동안 `/planner/avoidance/otwpnts` publisher가 여전히 `spliner_node`인지 확인 (`rostopic info`) — MPC가 끼어들지 않았다는 증거.
 - `_observation` 토픽과 실제 토픽을 RViz에서 서로 다른 색으로 중첩 시각화해 형상 차이 비교.
 - Phase 9 메트릭 스크립트로 CSV 로깅, Phase X 진입 전 합격선 체크.
+
+---
+
+## Phase X — Path Switching + SM Fork (2026-04-23, HJ 재설계 세션)
+
+> **상태 요약**: Phase 1~9 완료, MPC가 OVERTAKE/RECOVERY/OBSERVE 3 state로 `_observation` 토픽에 정상 발행 중. 이번 세션은 Phase X 게이트 진입 — **MPC를 실제로 state_machine에 연결**하되 원본을 건드리지 않고 **SM 사본(`3d_mpc_*`) 기반**으로 진행.
+>
+> **다음 세션 첫 10분 복귀 가이드** (read this first):
+> - 작업 파일: `planner/mpc_planner/node/mpc_planner_state_node.py`, `state_machine/src/3d_mpc_state_machine_node.py` (신규 사본), `state_transitions_mpc.py`, `states_mpc.py`, `stack_master/launch/3d_mpc_headtohead.launch` (신규).
+> - 원본은 건드리지 않음. SQP/sampling 파이프라인 무손상 보존.
+> - 시뮬: `gazebo_wall_2`, 호스트 Gazebo. 컨테이너 내 run 3 terminals (base + mpc_headtohead + mpc_planner_state state:=auto).
+> - Live debug: `/mpc_planner/debug/tick_json`, `/state_machine_mpc/debug` 동시 echo.
+
+### 문제 정의 (왜 이 세션이 필요한가)
+
+Phase 9까지 완료된 MPC는 관측 모드에서 동작하지만, 실제 SM에 붙이면 아래 3가지 증상이 확인됨:
+
+1. **SM OVERTAKE exit이 discrete**: `state_transitions.py:192-204` — sustainability 실패 시 blending 없이 GB로 snap, steering 진동.
+2. **Overtake 경로 stickiness**: 우회 궤적이 수 초간 유지, 상대차가 떠났어도 우회 경로 따라감.
+3. **Seam 속도 점프**: 기존 `calc_vel_profile()`는 GB 경로만 호출, avoidance 경로 vx는 그대로 통과. GB↔avoidance 경계에서 vx 0.5~1.0 m/s 점프.
+
+### 설계 원칙 (이 세션에만 유효한 3가지 결정)
+
+1. **원본 불간섭**. `3d_state_machine_node.py`, `state_transitions.py`, `states.py`, `3d_headtohead.launch`는 건드리지 않음. `3d_mpc_*`, `*_mpc.*` 사본에서만 작업. 사본이 충분히 검증되면 다음 세션에 통합 검토.
+2. **경로(MPC) ↔ 속도(MPC 후처리) 분리**. MPC solver는 shape만 최적화. Speed painter는 같은 노드 안 후처리 단계로 GB vx s-lookup + curvature cap + seam blend 수행. SM은 MPC가 painted한 vx 그대로 통과.
+3. **Recovery는 장애물 없이**. quintic과 NLP 둘 다 구현. NLP는 `collision_mode=none`. 장애물 등장 시 state 전환으로 처리 (RECOVERY solver 내부에 obstacle 개념 없음). Recovery solver 선택은 런타임 param `~recovery_solver ∈ {quintic, nlp}` 로 A/B 비교 가능.
+
+### MPC 내부 state machine
+
+States: `MPC_IDLE`, `MPC_OVERTAKE`, `MPC_TRANSITION_OT2RC`, `MPC_RECOVERY`. SideDecider verdict + ego_n + obstacle-in-horizon + TTC 로 결정.
+
+```
+IDLE:
+  → OVERTAKE       if obs_in_horizon AND side ∈ {LEFT, RIGHT}
+  → RECOVERY       if |ego_n| > n_recovery_trigger (0.25 m)
+OVERTAKE:
+  → IDLE (skip RC) if (no obs) AND |ego_n| < n_idle_ok (0.12 m)
+  → TRANSITION     if (no obs) OR (side ∈ {TRAIL, CLEAR} AND |ego_n| > n_idle_ok)
+TRANSITION_OT2RC (K_trans=8 ticks, alpha_ramp 0→1):
+  cost = (1-alpha)*OVERTAKE_weights + alpha*RECOVERY_weights
+  publish → /planner/avoidance/otwpnts 유지
+  → OVERTAKE (원복)  if obs 재등장 AND side ∈ {LEFT, RIGHT}
+  → RECOVERY        if dwell >= K_trans
+RECOVERY:
+  → OVERTAKE        if obs_in_horizon AND side ∈ {LEFT, RIGHT}
+  → IDLE            if |ego_n| < n_idle_ok AND final_n < 0.05
+```
+
+Hysteresis: `mode_dwell_min_ticks=5`. TTC<1.5s 은 dwell override. TRAIL verdict → MPC IDLE (SM이 GB + 컨트롤러 PID trailing 처리).
+
+### Transition smoothness (3종 세트)
+
+1. **Weight ramp** (TRANSITION 전용): 위 state diagram. JIT 보존 (param-only switch).
+2. **Warm-start 연속성**: mode/weight 바뀌어도 이전 tick `(x_sol, u_sol)` 재사용. tier 0 실패 시에만 reset.
+3. **경로 continuity guard**: `_last_published_wpnts` 캐시 → 현 tick 첫 K_guard=5 wp와 L2 체크 → threshold(0.15m) 초과 시 xy/d_m/psi_rad blend (s_m 보존).
+
+### MPC 내부 speed painter
+
+`_post_process_speed(local_wpnts, mode)` — solver 성공 후 publish 직전:
+
+1. **Baseline**: `_gb_vx_by_s` (s_m sorted array, binary search) 로 wp.s_m → wp.vx_mps lookup. **xy→frenet 라운드트립 금지**.
+2. **Curvature cap**: wp.kappa_radpm, wp.mu_rad, grip_params 로 v_curv 계산, baseline과 min.
+3. **ego v 연속성**: wp0 = clip(ego_v ± a_max·dT), forward acc limit.
+4. **Seam blend**:
+   - RECOVERY: 종점 K_blend=10 스텝 blend (alpha 0→1)
+   - OVERTAKE: |d_m|<n_near(0.15m) 첫 지점 → 이후 K_blend 스텝 blend. 없으면 skip.
+
+### SM fork — `3d_mpc_*`
+
+| 원본 | 사본 |
+|---|---|
+| `state_machine/src/3d_state_machine_node.py` | `3d_mpc_state_machine_node.py` |
+| `state_machine/src/state_transitions.py` | `state_transitions_mpc.py` |
+| `state_machine/src/states.py` | `states_mpc.py` |
+| `state_machine/src/states_types.py` | (공유, 필요 시 원본에 enum 추가만) |
+| (신규) | `stack_master/launch/3d_mpc_headtohead.launch` (기존 사본, state_machine 노드만 `3d_mpc_state_machine_node.py`로 교체, SQP/sampling OFF 강제) |
+
+사본 수정 포인트:
+- rospy node name `3d_mpc_state_machine`
+- path_source enum: `GB`, `MPC_OT`, `MPC_RC`. 전환 규칙은 `/planner/avoidance/otwpnts` / `/planner/recovery/wpnts` freshness + `|ego_n|` + sustainability.
+- `OvertakingTransition` exit (원본 192-204)에 RECOVERY 경유 분기 추가.
+- `_pub_local_wpnts()`: path_source별 분기, GB만 기존 `calc_vel_profile()` 호출, MPC 경로는 painted vx 통과.
+- `/state_machine_mpc/debug` JSON publish: `sm_state`, `path_source`, `n_ego`, `mpc_mode_echo`, `trail_targets_n`, `ot_age_ms`, `rc_age_ms`, `latest_path_jitter_m`.
+
+### 운용 (HJ sim)
+
+```bash
+# T1: 3D base
+roslaunch stack_master 3d_base_system.launch map:=gazebo_wall_2 sim:=true
+# T2: MPC 버전 headtohead (SQP/sampling OFF)
+roslaunch stack_master 3d_mpc_headtohead.launch dynamic_avoidance_mode:=NONE
+# T3: MPC planner (auto mode)
+roslaunch mpc_planner mpc_planner_state.launch state:=auto attach_to_statemachine:=true recovery_solver:=quintic
+# recovery_solver:=nlp 로 A/B
+```
+
+### 검증 (수치 합격선)
+
+| 항목 | 합격 | 출처 |
+|---|---|---|
+| solve_ms p95 (OVERTAKE) | < 30 ms | `tick_json.solve_ms` |
+| solve_ms p95 (TRANSITION, nlp) | < 35 ms | 〃 |
+| solve_ms p95 (RECOVERY quintic) | < 3 ms | 〃 |
+| solve_ms p95 (RECOVERY nlp) | < 35 ms | 〃 |
+| traj jitter | < 0.05 m | `tick_json.traj_jitter_rms` |
+| 경로 continuity L2 (blend 후) | < 0.05 m | `tick_json.path_continuity_L2` |
+| seam 인접 vx diff | < 0.3 m/s | `/behavior_strategy.local_wpnts` |
+| margin_min (OVERTAKE) | > 0.15 m | `tick_json.margin_left_min/right_min` |
+| RECOVERY 종점 \|n\| | < 0.05 m | recovery wpnts last |
+| publisher count (`/planner/avoidance/otwpnts`) | == 1 | `rostopic info` |
+| A/B 판정 (quintic vs nlp) | 비교 표 완성 | 이 문서 아래 섹션 |
+
+### 시나리오
+
+1. **Clear lap** — MPC IDLE, SM `GB_TRACK`, vx 정상.
+2. **Static obstacle 1개** — OT→TRANSITION→RC→GB. 궤적 점프 없음.
+3. **Dynamic opp (빠짐)** — OT→상대 빠짐→IDLE→SM GB. stickiness 없음.
+4. **Dynamic opp (안 빠짐)** — MPC TRAIL→IDLE. SM `TRAILING` + trailing_targets.
+5. **Recovery A/B** — 시나리오 2, 3을 quintic/nlp 각각.
+
+### Recovery A/B 결과 (세션 완료 후 기입)
+
+| 지표 | quintic | nlp | 판정 |
+|---|---|---|---|
+| solve_ms p50/p95 | TBD | TBD | |
+| 종점 \|n\| | TBD | TBD | |
+| 종점 \|μ\| | TBD | TBD | |
+| 고속 코너 feasibility | TBD | TBD | |
+| 전환 스무스도 (경로 L2) | TBD | TBD | |
+| 최종 선택 (기본값) | — | — | TBD |
+
+### 진행 체크리스트 (Phase X 당일 완료)
+
+- [ ] P0: `git status` + `mpc_planner_state_node.py` → `..._backup_20260423.py` 백업
+- [ ] P1: 4-state FSM (IDLE / OVERTAKE / TRANSITION_OT2RC / RECOVERY) + dwell + TTC override + TRAIL handling
+- [ ] P1: mode별 publish 분기, IDLE/TRAIL publish skip
+- [ ] P1: `tick_json`에 `mpc_mode`, `dwell_count`, `alpha_ramp`, `recovery_solver_used`
+- [ ] P1: `mpc_planner_state.launch` 인자 (`state:=auto`, `attach_to_statemachine:=true`, `recovery_solver`)
+- [ ] P1.5: `_build_weight_vector(mode, alpha)` 선형 보간
+- [ ] P1.5: warm-start seed 유지 정책
+- [ ] P1.5: 경로 continuity guard (L2 + K_guard wp blend)
+- [ ] P2a: RECOVERY quintic 경로 호출
+- [ ] P2b: `frenet_kin_solver.py` terminal n/μ weight 파라미터화 + obstacle ON/OFF flag
+- [ ] P2b: `collision_mode=none` 런타임 주입
+- [ ] P2c: `~recovery_solver` ROS param
+- [ ] P3: `_gb_vx_by_s` 캐시 + `_post_process_speed()`
+- [ ] P3: seam blend (OVERTAKE/RECOVERY 공용)
+- [ ] P4: SM 사본 3파일 생성 + import 교체
+- [ ] P4: path_source enum + 선택 로직 + recovery freshness
+- [ ] P4: OVERTAKE exit → RECOVERY 경유 전환
+- [ ] P4: `/state_machine_mpc/debug` JSON publish
+- [ ] P5: trailing_targets 트리거 path_source 무관 통일
+- [ ] P6: `3d_mpc_headtohead.launch` (state_machine 노드만 교체)
+- [ ] P7: `catkin build mpc_planner state_machine`
+- [ ] P7: 시나리오 1~4 실측 + 수치 수집 (background echo/hz 모니터 + 주기 집계 agent)
+- [ ] P7: 시나리오 5 Recovery A/B + 위 표 기입
+- [ ] P7: 합격선 위반 튜닝
+- [ ] P7: `TODO_HJ.md` 갱신, 원본 commit SHA 박제
+
+### 다음 세션 미룸
+
+- [ ] **START mode (런치 컨트롤)**: 출발 전용 MPC mode + SM START state
+- [ ] `Wpnt.msg`에 `tier`, `is_valid` 필드 정식 추가
+- [ ] PPC lookahead rate-limit (controller 수정)
+- [ ] 사본 검증 완료 후 원본 `3d_state_machine_node.py` 통합 + `dynamic_avoidance_mode:=MPC_INTERNAL` 정식 옵션화
+- [ ] OVERTAKE 튜닝 추가 (corridor/obs weight 재조정)
+
+### 세션 인수인계용 참조
+
+- 전체 plan raw 파일: `/home/nuc3/.claude/plans/mpc-planner-vast-pearl.md` (로컬 Claude 작업 영역, 저장소 외부)
+- 원본 기준 commit SHA: `1242f29` (main) — 사본이 diverge 시 rebase 기준
+- 관련 선행 작업: `HJ_docs/mpc_frenet_kin_v3c_live_debugging_20260421.md` (Phase 9 live-debug 결과)
+
+---
+
+### 2026-04-23 — 구현 완료 스냅샷 (live 테스트 전)
+
+**코드 상태**: `catkin build mpc_planner state_machine` 성공 (warnings only from google test CMake policy — 무관).
+
+**이번 세션 완료 항목 (P2b NLP 제외)**:
+
+| 항목 | 파일 | 상태 |
+|---|---|---|
+| Phase 0 — MPC 노드 백업 | `planner/mpc_planner/node/mpc_planner_state_node_backup_20260423.py` | ✅ |
+| Phase 1 — 4-state FSM (IDLE / OVERTAKE / TRANSITION_OT2RC / RECOVERY) | `mpc_planner_state_node.py` `_update_mpc_mode` + `_obs_in_horizon_and_ttc` | ✅ |
+| Phase 1 — mode별 publish 분기 (auto 모드만) | `_publish_outputs` routing by `self._mpc_mode` | ✅ |
+| Phase 1 — tick_json 확장 | `mpc_mode`, `mode_dwell`, `alpha_ramp`, `ttc_min`, `obs_in_horizon`, `recovery_solver`, `painter{seam_idx,blend_applied,vx_first_delta}`, `continuity_guard{L2,applied}` | ✅ |
+| Phase 1 — launch `state:=auto` + `recovery_solver` 인자 + dual remap | `mpc_planner_state.launch` | ✅ |
+| Phase 1.5 — 경로 continuity guard (K_guard=5 wp-wise blend) | `_apply_continuity_guard` | ✅ |
+| Phase 1.5 — warm-start seed 유지 (기본 구조 그대로) | 기존 `self.solver.reset_warm_start()`는 tier 0 실패에만 유지 | ✅ |
+| Phase 2a — RECOVERY quintic primary | `_plan_loop`에 quintic 바이패스 블록 | ✅ |
+| Phase 2c — `~recovery_solver ∈ {quintic, nlp}` ROS param + launch | ✅ |
+| Phase 3 — GB vx 캐시 + speed painter + seam blend | `_global_wpnts_cb`의 `_gb_vx_by_s_{s,v}`, `_lookup_gb_vx`, `_post_process_speed` | ✅ |
+| Phase 4 — SM 사본 3파일 | `state_machine/src/{3d_mpc_state_machine_node.py,state_transitions_mpc.py,states_mpc.py}` | ✅ |
+| Phase 4 — 사본 node name 변경 (`mpc_state_machine`) + import 교체 | ✅ |
+| Phase 4 — `recovery_wpnts_cb`/`avoidance_cb`에 stamp 저장 | ✅ |
+| Phase 4 — `/state_machine_mpc/debug` JSON publish | `loop()` 끝에 삽입 (sm_state, path_source, mpc_mode_echo, trail_targets_n, ot/rc age ms) | ✅ |
+| Phase 5 — trailing_targets path_source 무관 통일 | `get_farthest_target()` 그대로 | ✅ |
+| Phase 6 — `stack_master/launch/3d_mpc_headtohead.launch` (state_machine 노드만 교체) | ✅ |
+| **Phase 2b — RECOVERY NLP weight switch** | — | ⏸ 다음 세션 (quintic 기본이라 MVP 불필요) |
+
+**Backward compat 보장**:
+- `state:=overtake/recovery/observe` 런치는 painter/continuity guard **비활성화** (자동 조건부 skip). 기존 solver vx 그대로 통과.
+- 원본 `3d_state_machine_node.py`, `state_transitions.py`, `states.py`, `3d_headtohead.launch` **건드리지 않음**.
+- SQP, sampling 파이프라인 무손상.
+
+**실측 전 주의사항**:
+1. `3d_mpc_headtohead.launch`는 기존 `/state_machine`(`3d_state_machine_node.py`) 과 **동시 기동 금지** — node 이름은 다르지만(`mpc_state_machine`), `/behavior_strategy` 퍼블리셔가 둘이 되어 controller 입력이 교란됨. 원본 SM 먼저 kill 후 기동.
+2. `/planner/avoidance/otwpnts` publisher는 반드시 1개만 — 실측 전 `rostopic info /planner/avoidance/otwpnts`로 publisher count 확인. SQP/sampling이 떠 있으면 그쪽을 끔.
+3. Phase 2b 미구현 상태에서 `recovery_solver:=nlp`는 OVERTAKE weight 그대로 NLP가 도는 상태 — **현재 세션에서는 `recovery_solver:=quintic`만 사용**.
+
+**권장 실측 순서** (컨테이너 내부):
+```bash
+# 1) 기존 state_machine kill (원본이 이미 돌고 있으면)
+rosnode kill /state_machine 2>/dev/null || true
+
+# 2) MPC-paired headtohead 기동 (기존 3d_base_system.launch는 유지 가능)
+roslaunch stack_master 3d_mpc_headtohead.launch dynamic_avoidance_mode:=NONE
+
+# 3) MPC planner (auto + quintic recovery)
+roslaunch mpc_planner mpc_planner_state.launch \
+    state:=auto attach_to_statemachine:=true recovery_solver:=quintic
+
+# 4) 모니터링 (별도 터미널, 컨테이너 내부)
+rostopic echo -c /mpc_planner/debug/tick_json    # mpc_mode, alpha_ramp 등
+rostopic echo -c /state_machine_mpc/debug        # sm_state, path_source 등
+rostopic hz /planner/avoidance/otwpnts /planner/recovery/wpnts /behavior_strategy
+rostopic info /planner/avoidance/otwpnts         # publisher count == 1 확인
+```
+
+**다음 세션 이어받을 항목**:
+- [ ] 시나리오 1~5 실측 (Phase X 체크리스트 P7) — clear / static / dynamic-pass / dynamic-stuck / Recovery A/B
+- [ ] 합격선 위반 튜닝 (margin_min, seam vx jump, path_continuity_L2 등)
+- [ ] Phase 2b: RECOVERY NLP weight switch (`_build_weight_vector(mode, alpha)` + `frenet_kin_solver.py` terminal n/μ param화)
+- [ ] OVERTAKE exit → RECOVERY 경유 전환 분기 (`state_transitions_mpc.py` OvertakingTransition 수정 — 현재 원본 로직 그대로 + MPC 내부 TRANSITION_OT2RC 의존)
+- [ ] Recovery A/B 결과 표 위 섹션에 기입
+- [ ] `TODO_HJ.md` 체크박스 갱신
+
+**변경 파일 전체 목록 (이번 세션)**:
+- Modified: `TODO_HJ.md`, `HJ_docs/mpc_planner_state_machine_integration.md`, `planner/mpc_planner/node/mpc_planner_state_node.py`, `planner/mpc_planner/launch/mpc_planner_state.launch`, `planner/mpc_planner/config/state_overtake.yaml`
+- New: `planner/mpc_planner/node/mpc_planner_state_node_backup_20260423.py`, `state_machine/src/3d_mpc_state_machine_node.py`, `state_machine/src/state_transitions_mpc.py`, `state_machine/src/states_mpc.py`, `stack_master/launch/3d_mpc_headtohead.launch`
+
+---
+
+### 2026-04-24 — 리팩터 + Phase 2b + OVERTAKE exit 분기 강화
+
+**변경 1 — 디렉토리 재구성** (사용자 요청):
+- `state_machine/src/{3d_mpc_state_machine_node,state_transitions_mpc,states_mpc}.py`
+  → `state_machine/src/mpc/` 하위로 이동 (`__init__.py` 추가)
+- `3d_mpc_state_machine_node.py`, `state_transitions_mpc.py`에 `sys.path`에 부모(`state_machine/src/`) prepend 추가 — 공유 `states_types.py`가 부모 디렉토리에 남아 있어서 필요.
+- `rosrun state_machine 3d_mpc_state_machine_node.py`로 로드 정상 확인 (docker 안에서 executable 탐색 OK). launch 파일 경로 변경 불필요.
+
+**변경 2 — Phase 2b: RECOVERY NLP weight switch**:
+- `config/state_overtake.yaml`에 `recovery_nlp_profile:` 섹션 추가 (`w_obs:0.0`, `q_n_term:60.0`, `w_cont:4.0`, `q_n:1.5`, `gamma_progress:12.0`, ...). 모두 초기값 — 실측 후 튜닝.
+- `mpc_planner_state_node.py`:
+  - `__init__`: `~recovery_nlp_profile` rosparam 로드 → `self._recovery_nlp_weights`
+  - `_capture_overtake_baseline()`: solver 현재 weights snapshot 1회 (사용자가 rqt로 튜닝한 OVERTAKE 값 보존용)
+  - `_apply_mode_weights(mpc_mode, alpha_ramp)`: `state:=auto` AND `recovery_solver:=nlp`일 때만 동작. OVERTAKE↔RECOVERY 선형 보간(`(1-α)·baseline + α·rc`)을 `FrenetKinMPC.update_weights()` 로 주입 → JIT 재컴파일 없음. 동일 (mode, α) 반복 시 idempotent.
+  - `_plan_loop`에서 quintic 바이패스 직후, NLP 솔브 전에 호출.
+- tick_json은 solver의 `get_weights()` 스냅샷(`'weights'` 필드)로 이미 주입된 weight가 반영됨.
+- 주의: `q_mu_term` (terminal μ) 항목은 현재 솔버 NLP 구조에 없음 — 추가 시 JIT 재컴파일 필요해서 이번 세션에는 제외. `q_n_term`만으로도 n→0 수렴 유도 충분.
+
+**변경 3 — `state_transitions_mpc.py`: OVERTAKE exit 분기 강화**:
+- `OvertakingTransition` 말미 (원본 `state_transitions.py:207-212` 영역)에 RECOVERY 경유 분기 삽입. Smart mode는 기존 closed loop 유지.
+- 조건: `(not smart_active)` AND `recovery_wpnts fresh` (`_check_latest_wpnts`) AND `_check_free_frenet(cur_recovery_wpnts)` AND `NOT _check_close_to_raceline(close_threshold_smart)`
+- 조건 만족 시 `return StateType.RECOVERY, StateType.RECOVERY` → `local_wpnts_src`가 `MPC_RC`가 되어 `/planner/recovery/wpnts` 경로를 탐. 이미 GB 근처면 RC 생략하고 바로 GB.
+- 이는 MPC 내부 `TRANSITION_OT2RC`와 이중 방어: MPC는 궤적/속도 연속성(seam blend), SM은 state-level 연속성.
+
+**빌드**: `catkin build mpc_planner state_machine` 성공 (warnings from gtest CMake policy만, 무관).
+
+**남은 미수행 항목 (실측 필요)**:
+- [ ] 시나리오 1~5 실측 (clear / static / dynamic-pass / dynamic-stuck / Recovery A/B)
+- [ ] Recovery A/B 결과 표 기입 (Phase X 섹션)
+- [ ] 합격선 위반 튜닝 (seam vx diff, margin_min, path_continuity_L2, RECOVERY 종점 |n|)
+- [ ] `recovery_nlp_profile` 파라미터 튜닝 (현재 값은 초기 추정)
+
+**실행 커맨드 (어제와 동일, 파일 경로만 변경됨)**:
+```bash
+rosnode kill /state_machine 2>/dev/null || true
+roslaunch stack_master 3d_mpc_headtohead.launch dynamic_avoidance_mode:=NONE
+# quintic 기본
+roslaunch mpc_planner mpc_planner_state.launch state:=auto attach_to_statemachine:=true recovery_solver:=quintic
+# nlp (Phase 2b 검증)
+roslaunch mpc_planner mpc_planner_state.launch state:=auto attach_to_statemachine:=true recovery_solver:=nlp
+```

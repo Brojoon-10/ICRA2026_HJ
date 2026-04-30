@@ -65,6 +65,13 @@ from frenet_kin_solver import (FrenetKinMPC,  # noqa: E402 — new frenet-kin ba
                                SIDE_CLEAR, SIDE_LEFT, SIDE_RIGHT, SIDE_TRAIL)
 from side_decider import SideDecider  # noqa: E402 — rule-based side selection
 from mpc_raceline_lifter import MPCRacelineLifter  # noqa: E402
+### HJ : 2026-04-28 Stage 2 Phase 2-1 — plan library
+from plan_library import (pick_plan as _pick_plan, plan_ot_line as _plan_ot_line,
+                          make_target_n_profile as _make_target_n_profile,
+                          PLAN_LEFT_PASS, PLAN_RIGHT_PASS, PLAN_TRAIL, PLAN_RACELINE)  # noqa: E402
+from plan_scorer import (pick_plan_scored as _pick_plan_scored,
+                         horizon_aware_d_free as _horizon_d_free,
+                         filter_feasible_plans as _filter_feasible_plans)  # noqa: E402
 from geometric_fallback import build_quintic_fallback, build_recovery_path  # noqa: E402
 
 # ### HJ : debug_log — optional structured logger (CSV + NPZ per tick).
@@ -310,7 +317,11 @@ class MPCPlannerStateNode:
         # tier 0 성공 시 trajectory + u_sol 캐시 → tier 1 에서 s-shift 로 재발행.
         # streak > H 이면 tier 2 (Frenet quintic) 진입. tier 2 실패 시 tier 3.
         self._fail_streak = 0
-        self._fail_tier_H = int(rospy.get_param('~fail_streak_H', 5))
+        ### HJ : 2026-04-28 (S1-5) — was 5; 3 tick cap 으로 축소.
+        ###      이전 5 + obs_in_horizon OR 무한 연장이 51 tick (3.62s) HOLD_LAST
+        ###      유발 → stale traj → inter-msg jump 1.683m → 충돌. 짧은 cap +
+        ###      cap 초과 + obstacle 시 publish 생략으로 구조적 robust.
+        self._fail_tier_H = int(rospy.get_param('~fail_streak_H', 3))
         self._last_good_traj = None    # (N+1, 5)  [x, y, psi, s, z] (lifted)
         self._last_good_frenet_traj = None  # (N+1, 4) raw frenet [s, n, mu, v]
         self._last_good_u = None       # (N, 2)    [v, δ]
@@ -330,6 +341,14 @@ class MPCPlannerStateNode:
         self._recovery_cache_s_start = None
         self._recovery_cache_s_end = None
         self._recovery_cache_committed_at = None
+        # ### HJ : 2026-04-29 — single-use cache flag.
+        # User directive: cache is "build once, follow once, then drop".
+        # While in_use=True, every tick samples the cache and the NLP
+        # output is suppressed for publishing. When the cache window
+        # ends (ego past s_end OR ego_n converged OR mode flip to
+        # WITH_OBS) the flag is cleared AND the cache itself wiped, so
+        # the same cache cannot be re-used after a gap.
+        self._recovery_cache_in_use = False
         self._recovery_cache_exit_n = float(
             rospy.get_param('~recovery_cache_exit_n', 0.10))
         ### HJ : end
@@ -542,6 +561,21 @@ class MPCPlannerStateNode:
         self._post_ot_boost_total_ticks = int(
             rospy.get_param('~post_ot_boost_total_ticks', 15))
         self._post_ot_boost_ticks_left = 0
+        ### HJ : R1 — proactive recovery cache build trigger
+        self._just_transitioned_to_no_obs = False
+        ### HJ : end
+        ### HJ : 2026-04-27 (C1'+) — per-obstacle sigma safety clearance.
+        ###      sigma_n[o] = obs_half[o] + ego_half + safety_clearance.
+        ###      User asked for at least 0.2m clearance.
+        self._obs_safety_clearance = float(
+            rospy.get_param('~obs_safety_clearance', 0.20))
+        ### HJ : end
+        ### HJ : 2026-04-27 — rear safety window. When obstacle just slipped
+        ###      behind ego (ds slightly negative), keep treating it as "in
+        ###      horizon" so OT mode lingers long enough for ego to clear
+        ###      the obstacle laterally before raceline pull-back kicks in.
+        self._obs_rear_window_m = float(
+            rospy.get_param('~obs_rear_window_m', 3.0))
         ### HJ : end
 
         # ### HJ : 2026-04-24 — prediction variance aware obstacle bubble.
@@ -631,6 +665,12 @@ class MPCPlannerStateNode:
             rospy.get_param('~continuity_K_guard', 5))
         self._continuity_threshold_m = float(
             rospy.get_param('~continuity_threshold_m', 0.15))
+            # 2026-04-28: tested 0.08 (more aggressive blend) but it slowed
+            # MPC's lateral reaction during plan transitions and produced
+            # 3 collisions in the post_final bag. Reverted to 0.15. Plan
+            # transition smoothness comes from the sticky-fix + feasibility
+            # filter (fewer flips) + solver's own w_cont=300, not from
+            # head-wpnt over-blending.
         self._last_published_wpnts = None   # list[Wpnt] cache for L2 check
         self._last_published_mode = None
         self._last_continuity_L2 = 0.0
@@ -827,17 +867,23 @@ class MPCPlannerStateNode:
         return None, 'none'
 
     def _merge_obs_sources(self):
-        """### HJ : 2026-04-25 — fuse prediction + tracking obstacle streams.
+        """### HJ : 2026-04-27 (C1') — tracking-anchored merge.
 
-        User reported: when dynamic obstacle + static obstacle coexist, MPC
-        was tracking only the dynamic one. Root cause: _pick_obs_source
-        returns prediction XOR tracking. Prediction topic typically carries
-        only the opponent (dynamic) obstacle — static obstacles live in the
-        tracking topic. Selecting prediction alone silently drops static.
+        Previous bug: prediction publishes N=20 Obstacle msgs per opponent
+        (one per horizon timestep). Earlier merge dedupe-by-id failed
+        because prediction's `id` is the timestep index, not opponent id.
+        N msgs all kept → n_obs_max=2 slots filled by prediction
+        snapshots → static obstacles dropped → collision risk.
 
-        Fix: merge both sources. Dedupe by obstacle `id` (prediction wins —
-        it carries the propagated trajectory for that obstacle). Return list
-        of Obstacle msgs + a human-readable tag like 'merge:P1+T2'.
+        Fix: tracking is canonical source (1 msg per real obstacle).
+        For each tracked obstacle:
+          - find the prediction msg with (s, d) closest to (t.s, t.d)
+            AND smallest stamp (= timestep 0 of that opponent's sequence)
+          - if matched: copy vs / vd / vs_var / vd_var onto the tracked
+            obstacle (so solver gets propagation info), mark dynamic
+          - if no match: treat as static (vs=vd=0)
+        Result: 1 entry per real obstacle. Static + dynamic coexist
+        cleanly within n_obs_max slots.
         """
         pred_fresh = (self._is_fresh(self._obs_predict_t)
                       and self._obs_predict is not None
@@ -845,32 +891,76 @@ class MPCPlannerStateNode:
         track_fresh = (self._is_fresh(self._obs_track_t)
                        and self._obs_track is not None
                        and len(self._obs_track.obstacles) > 0)
-        if not pred_fresh and not track_fresh:
-            return [], 'none'
-
-        out = []
-        seen_ids = set()
-        n_p = 0
-        n_t = 0
-        # Prediction first — if the same id is in tracking too, prediction
-        # version (with vs/vd from GP/propagation) is preferred.
-        if pred_fresh:
-            for o in self._obs_predict.obstacles:
-                oid = int(getattr(o, 'id', -1))
-                if oid in seen_ids:
+        if not track_fresh:
+            # No tracking — fall back to legacy behaviour: emit prediction
+            # if available, dedup by (s,d) bucket. Won't see static-only.
+            if not pred_fresh:
+                return [], 'none'
+            out = []
+            seen = []
+            for p in self._obs_predict.obstacles:
+                key = (round(float(p.s_center), 0), round(float(p.d_center), 1))
+                if key in seen:
                     continue
-                out.append(o)
-                seen_ids.add(oid)
-                n_p += 1
-        if track_fresh:
-            for o in self._obs_track.obstacles:
-                oid = int(getattr(o, 'id', -1))
-                if oid != -1 and oid in seen_ids:
-                    continue   # id already from prediction
-                out.append(o)
-                seen_ids.add(oid)
-                n_t += 1
-        tag = 'merge:P%d+T%d' % (n_p, n_t)
+                seen.append(key)
+                out.append(p)
+            return out, 'pred-only:%d' % len(out)
+
+        ### Tracking-anchored loop
+        out = []
+        tl = float(self.track_length) if self.track_length else 1e6
+        n_matched = 0
+        for t in self._obs_track.obstacles:
+            match = None
+            best_score = float('inf')
+            best_stamp = None
+            if pred_fresh:
+                t_s = float(t.s_center)
+                t_d = float(t.d_center)
+                for p in self._obs_predict.obstacles:
+                    ds = abs(float(p.s_center) - t_s)
+                    if ds > 0.5 * tl:
+                        ds = tl - ds
+                    dn = abs(float(p.d_center) - t_d)
+                    # Match if within reasonable thresholds
+                    if ds > 1.5 or dn > 0.5:
+                        continue
+                    # Prefer earliest stamp (= timestep 0 of opponent's seq)
+                    p_stamp = (p.header.stamp.to_sec()
+                               if hasattr(p, 'header') else 0.0)
+                    score = ds + 2.0 * dn  # weighted distance
+                    if (score < best_score
+                            or (abs(score - best_score) < 0.05
+                                and (best_stamp is None
+                                     or p_stamp < best_stamp))):
+                        best_score = score
+                        best_stamp = p_stamp
+                        match = p
+            if match is not None:
+                # Use TRACKED obstacle as canonical, attach prediction info.
+                # Copy by attribute (Obstacle msg is mutable).
+                try:
+                    t.vs = float(match.vs)
+                    t.vd = float(match.vd)
+                    t.vs_var = float(getattr(match, 'vs_var', 0.0) or 0.0)
+                    t.vd_var = float(getattr(match, 'vd_var', 0.0) or 0.0)
+                    if abs(t.vs) > 0.05 or abs(t.vd) > 0.05:
+                        t.is_static = False
+                except Exception:
+                    pass
+                n_matched += 1
+            else:
+                # Tracked obs without prediction → static (or stale).
+                try:
+                    t.vs = 0.0
+                    t.vd = 0.0
+                    t.vs_var = 0.0
+                    t.vd_var = 0.0
+                    t.is_static = True
+                except Exception:
+                    pass
+            out.append(t)
+        tag = 'tanchor:T%d+P%d' % (len(out), n_matched)
         return out, tag
 
     def _extrapolate_obs_traj(self, obs, N, dT):
@@ -968,6 +1058,11 @@ class MPCPlannerStateNode:
         ###      pre-2026-04-26 behaviour.
         self._obs_half_arr = np.full(self.n_obs_max,
                                      self._obs_half_fixed, dtype=np.float64)
+        ### HJ : 2026-04-27 — per-slot static/dynamic flag for SideDecider.
+        ###      True = static (must avoid laterally), False = dynamic
+        ###      (trail-able). Default True (conservative — treat unknown
+        ###      slots as static).
+        self._obs_static_arr = np.full(self.n_obs_max, True, dtype=bool)
         ### HJ : end
 
         if self.collision_mode == 'none' or self.w_obstacle <= 0.0:
@@ -981,11 +1076,27 @@ class MPCPlannerStateNode:
         if tag == 'none' or len(merged_obs) == 0:
             return obs_arr, 'stale'
 
-        def fwd_dist(o):
-            return (o.s_center - ego_s) % tl
+        ### HJ : 2026-04-27 — signed lap distance with rear window. Modulo
+        ###      alone makes ds=-0.06 wrap to ~tl-0.06 → filtered as "almost
+        ###      full lap behind", which DROPPED an obstacle that just slipped
+        ###      under ego's rear (still alongside!) → mode flips to NO_OBS
+        ###      → recovery cache fires while ego is still next to the
+        ###      obstacle. _obs_in_horizon_and_ttc has rear_window logic but
+        ###      it can't run if obs_arr is empty here. Apply the same window
+        ###      at the build step. signed_dist returns ds in (-tl/2, +tl/2].
+        rear_window = float(getattr(self, '_obs_rear_window_m', 3.0))
 
-        obs_list = sorted(merged_obs, key=fwd_dist)
-        obs_list = [o for o in obs_list if fwd_dist(o) < 0.5 * tl]
+        def signed_dist(o):
+            ds = (o.s_center - ego_s) % tl
+            if ds > 0.5 * tl:
+                ds -= tl
+            return ds
+
+        obs_list = sorted(merged_obs,
+                          key=lambda o: max(signed_dist(o), 0.0))
+        obs_list = [o for o in obs_list
+                    if -rear_window <= signed_dist(o) <= 0.5 * tl]
+        ### HJ : end
         # ### HJ : dedup near-duplicate obstacles (prediction+detection race can
         # emit the same object twice within ~0.5m s and ~0.1m d). Keeping both
         # loads two half-plane constraints on the same target → solver pinches
@@ -1018,7 +1129,15 @@ class MPCPlannerStateNode:
             while s0 - ego_s < -0.5 * tl:
                 s0 += tl
 
-            if o.is_static or abs(o.vs) < 1e-3:
+            ### HJ : 2026-04-27 — capture static/dynamic flag in sidecar.
+            ###      User mandate: side decision must be driven by STATIC
+            ###      obstacles (must avoid laterally), dynamic obstacles can
+            ###      be trailed. SideDecider needs this classification to
+            ###      separate.
+            is_static_flag = bool(o.is_static or abs(o.vs) < 1e-3)
+            self._obs_static_arr[n_used] = is_static_flag
+            ### HJ : end
+            if is_static_flag:
                 obs_arr[n_used, :, 0] = s0
                 obs_arr[n_used, :, 1] = d0
             else:
@@ -1045,6 +1164,59 @@ class MPCPlannerStateNode:
 
         self._last_obs_max_vs_var = max_vs_var
         self._last_obs_max_vd_var = max_vd_var
+
+        ### HJ : 2026-04-27 (C1'+) — push per-obstacle sigma to solver.
+        ###      sigma[o] = obs_half[o] + ego_half + safety_clearance.
+        ###      Inactive slots get scalar fallback (sigma_n_obs).
+        try:
+            ego_half = float(getattr(self.solver, 'ego_half', 0.15))
+            sigma_arr = np.full(self.n_obs_max,
+                                max(float(self.solver.sigma_n_obs), 1e-3),
+                                dtype=np.float64)
+            for o in range(min(n_used, self.n_obs_max)):
+                obs_half_o = float(self._obs_half_arr[o])
+                sigma_arr[o] = max(obs_half_o + ego_half
+                                   + self._obs_safety_clearance, 1e-3)
+            self.solver.set_sigma_n_obs_per(sigma_arr)
+        except Exception as e:  # pragma: no cover
+            rospy.logwarn_throttle(
+                2.0, '[mpc][%s] sigma_n_obs_per push failed: %s',
+                rospy.get_name(), e)
+        ### HJ : end
+        ### HJ : 2026-04-27 — push static/dynamic flag so solver applies
+        ###      σ_n inflation ONLY to dynamic obstacles in TRAIL mode.
+        ###      Static obstacles keep full lateral bubble for steering ego
+        ###      around them even while trailing dynamic ones.
+        try:
+            if hasattr(self.solver, 'set_obs_static'):
+                self.solver.set_obs_static(self._obs_static_arr.copy())
+        except Exception as e:
+            rospy.logwarn_throttle(
+                2.0, '[mpc][%s] obs_static push failed: %s',
+                rospy.get_name(), e)
+        ### HJ : end
+        ### HJ : 2026-04-27 (Option A) — pre-compute obstacle xy at every (o, k)
+        ###      and push to solver. Inactive slots = far placeholder.
+        try:
+            obs_xy_mat = np.full(
+                (2, self.n_obs_max, N_plus_1), 1.0e3, dtype=np.float64)
+            for o in range(min(n_used, self.n_obs_max)):
+                for k in range(N_plus_1):
+                    s_o = float(obs_arr[o, k, 0])
+                    n_o = float(obs_arr[o, k, 1])
+                    s_o_w = s_o % tl if tl > 0 else s_o
+                    try:
+                        x, y = self.lifter.sn_to_xy(s_o_w, n_o)
+                    except Exception:
+                        x = 1e3; y = 1e3
+                    obs_xy_mat[0, o, k] = x
+                    obs_xy_mat[1, o, k] = y
+            self.solver.set_obs_xy(obs_xy_mat)
+        except Exception as e:  # pragma: no cover
+            rospy.logwarn_throttle(
+                2.0, '[mpc][%s] obs_xy push failed: %s',
+                rospy.get_name(), e)
+        ### HJ : end
 
         if n_used == 0:
             return obs_arr, 'empty'
@@ -1082,6 +1254,9 @@ class MPCPlannerStateNode:
                 # fallback (node-side)
                 'fail_streak_H':   int(self._fail_tier_H),
                 'quintic_delta_s': float(self._quintic_delta_s),
+                # ### HJ : per-obstacle sigma extra clearance (node-side)
+                'obs_safety_clearance': float(self._obs_safety_clearance),
+                'obs_rear_window_m':    float(self._obs_rear_window_m),
                 # one-shot triggers off by default
                 'save_params':  False,
                 'reset_params': False,
@@ -1132,6 +1307,14 @@ class MPCPlannerStateNode:
         # Fallback tuning (node-side, no solver touch).
         self._fail_tier_H = int(config.fail_streak_H)
         self._quintic_delta_s = float(config.quintic_delta_s)
+        ### HJ : 2026-04-27 (C1'+) — per-obstacle sigma extra clearance.
+        ###      Node-side state; consumed by next _build_obstacle_array
+        ###      tick when sigma per slot is recomputed.
+        if hasattr(config, 'obs_safety_clearance'):
+            self._obs_safety_clearance = float(config.obs_safety_clearance)
+        if hasattr(config, 'obs_rear_window_m'):
+            self._obs_rear_window_m = float(config.obs_rear_window_m)
+        ### HJ : end
 
         if changed and not self._suppress_dynreg_cb:
             rospy.loginfo_throttle(
@@ -1559,6 +1742,22 @@ class MPCPlannerStateNode:
         dR_ref = np.asarray(ref_slice['d_right_arr'])
         N_plus_1 = rs.shape[0]
 
+        ### HJ : 2026-04-27 — side decision filters TRULY PASSED obstacles
+        ###      only. Earlier draft filtered any obs with s0 < ego_s, which
+        ###      was wrong: a dynamic opponent in mid-overtake (ego at same
+        ###      s within cm) is the SIDE-DECIDE TARGET, not "rear". Bag
+        ###      2026-04-27-10-55-57 t=2.5 had ego_s=80.31 vs opponent
+        ###      s=80.25 (alongside, OT in progress) — that obstacle MUST
+        ###      drive side decision. Real "rear" only when ego physically
+        ###      cleared the obstacle: signed_dist < -fully_passed_m.
+        ###      fully_passed_m = ego_length + obs_half so ego's tail is
+        ###      past obstacle's head. Within that window, obstacle stays
+        ###      in side decision as the alongside OT target.
+        ego_s_for_side = float(rs[0]) if rs.size > 0 else 0.0
+        ego_length = float(getattr(self.solver, 'ego_half', 0.15)) * 2.0
+        obs_half_default = float(getattr(self, '_obs_half_fixed', 0.05))
+        fully_passed_m = ego_length + obs_half_default + 0.10  # ~0.45m
+
         obs_list = []
         for o in range(obs_arr.shape[0]):
             w_ts = obs_arr[o, :, 2]
@@ -1568,22 +1767,51 @@ class MPCPlannerStateNode:
             n0 = float(obs_arr[o, 0, 1])
             sN = float(obs_arr[o, -1, 0])
             nN = float(obs_arr[o, -1, 1])
+            ### HJ : skip ONLY obstacles ego has fully cleared (longer than
+            ###      ego_length + obs_half behind). Alongside obstacles
+            ###      (within ±fully_passed_m) are kept — they're the active
+            ###      OT target, even if s0 is marginally < ego_s.
+            if s0 < ego_s_for_side - fully_passed_m:
+                continue
+            ### HJ : end
             v_s_obs = (sN - s0) / max(self.N * self.dT, 1e-3)
-            # d_L, d_R at the obstacle's s (use nearest ref_slice index)
-            k_near = int(np.argmin(np.abs(rs - s0)))
-            k_near = int(np.clip(k_near, 0, N_plus_1 - 1))
+            ### HJ : 2026-04-27 — d_L/d_R lookup at obstacle's EXACT world s
+            ###      via lifter (np.interp wraps s%L). For a static obstacle
+            ###      this MUST be constant tick-to-tick. No fallback path —
+            ###      previous try/except silently routed to ref_slice[k_near]
+            ###      which moved with ego_s in tight corners and produced the
+            ###      d_free swing the user observed.
+            d_L_raw = float(self.lifter._interp(s0, self.lifter.g_dleft))
+            d_R_raw = float(self.lifter._interp(s0, self.lifter.g_dright))
+            cos_d = 1.0
+            if (self.g_psi_center is not None
+                    and len(self.g_psi_center) == len(self.lifter.g_s)):
+                psi = float(self.lifter._interp_psi(s0))
+                psi_c = float(self.lifter._interp(s0, self.g_psi_center))
+                cos_d = float(max(np.cos(psi - psi_c), 0.5))
+            d_L_eff = d_L_raw / cos_d
+            d_R_eff = d_R_raw / cos_d
+            ref_v_at_obs = float(self.lifter._interp(s0, self.lifter.g_vx))
             ### HJ : per-slot half_width from obs_size_source. Falls back to
             ###      _obs_half_fixed when sidecar unavailable (e.g. legacy backend).
             try:
                 half_w = float(self._obs_half_arr[o])
             except (AttributeError, IndexError):
                 half_w = float(self._obs_half_fixed)
+            ### HJ : 2026-04-27 — propagate static/dynamic flag.
+            try:
+                is_static = bool(self._obs_static_arr[o])
+            except (AttributeError, IndexError):
+                # Fallback: classify by computed v_s_obs.
+                is_static = abs(v_s_obs) < 0.3
+            ### HJ : end
             obs_list.append({
                 's0': s0, 'n0': n0, 'v_s_obs': v_s_obs,
                 'half_width': half_w,
-                'd_L': float(dL_ref[k_near]),
-                'd_R': float(dR_ref[k_near]),
-                'ref_v': float(ref_slice['ref_v'][k_near]),
+                'd_L': d_L_eff,
+                'd_R': d_R_eff,
+                'ref_v': ref_v_at_obs,
+                'is_static': is_static,
             })
             ### HJ : end
         # sort by forward distance (smallest s0 first assuming ref_s is
@@ -1591,7 +1819,14 @@ class MPCPlannerStateNode:
         obs_list.sort(key=lambda d: d['s0'])
 
         ego_v = float(getattr(self, 'car_vx', 0.0))
-        return self.side_decider.decide(ego_v, obs_list)
+        ### HJ : 2026-04-27 (v4) — pass ego state so SideDecider can do
+        ###      ego-aware reach feasibility + switching-safety check.
+        ego_n_for_decider = float(ref_slice.get('n_ego', 0.0))
+        return self.side_decider.decide(
+            ego_v, obs_list,
+            ego_n=ego_n_for_decider,
+            ego_s=ego_s_for_side)
+        ### HJ : end
 
     # ---------------------------------------------------------------- Phase X FSM
     def _obs_in_horizon_and_ttc(self, obs_arr, ego_s, ego_v):
@@ -1606,6 +1841,15 @@ class MPCPlannerStateNode:
         """
         if obs_arr is None or obs_arr.shape[0] == 0:
             return float('inf'), float('inf')
+        ### HJ : 2026-04-27 — rear window. When ego just passed an obstacle,
+        ###      ds = s_obs - ego_s is small NEGATIVE. Old code wrapped it
+        ###      to ~track_length (huge) → mode flips to NO_OBS immediately
+        ###      → q_n pulls ego to raceline while obstacle still beside it.
+        ###      Now: keep ds as small negative (= "alongside / just past")
+        ###      until ego is more than rear_window m past — only then wrap.
+        ###      Mode logic naturally treats small ds as still in horizon.
+        rear_window = float(getattr(self, '_obs_rear_window_m', 3.0))
+        ### HJ : end
         min_ds = float('inf')
         ttc_min = float('inf')
         for o in range(obs_arr.shape[0]):
@@ -1615,8 +1859,8 @@ class MPCPlannerStateNode:
             s0 = float(obs_arr[o, 0, 0])
             sN = float(obs_arr[o, -1, 0])
             ds = s0 - ego_s
-            if ds < 0.0:
-                ds += self.track_length   # wrap
+            if ds < -rear_window:
+                ds += self.track_length   # wrap (genuinely far behind = full lap)
             if ds < min_ds:
                 min_ds = ds
             v_obs = (sN - s0) / max(self.N * self.dT, 1e-3)
@@ -1699,6 +1943,31 @@ class MPCPlannerStateNode:
                     pass
                 ### HJ : 2026-04-26 (A6) — kick post-OT q_n boost.
                 self._post_ot_boost_ticks_left = self._post_ot_boost_total_ticks
+                ### HJ : end
+                ### HJ : 2026-04-27 (R1) — flag for proactive recovery cache
+                ###      build on this tick. _plan_loop reads this flag
+                ###      AFTER _update_mpc_mode and forces a cache build so
+                ###      the very next sample hijacks NLP with a clean
+                ###      ego→GB recovery path. Eliminates the post-OT
+                ###      "wobble for several ticks while NLP unwinds OT
+                ###      shape from warm-start" problem.
+                self._just_transitioned_to_no_obs = True
+                ### HJ : end
+                ### HJ : 2026-04-27 (R2) — clear SideDecider commit on
+                ###      OT exit. SideDecider's _prev_side / _pending_side
+                ###      hold_ticks=10 carries the OT's left/right
+                ###      selection into NO_OBS, biasing the solver. Reset
+                ###      them so first NO_OBS tick has SIDE_CLEAR (no
+                ###      bias). Also zero bias_scale immediately.
+                try:
+                    self.side_decider._prev_side = SIDE_CLEAR
+                    self.side_decider._pending_side = SIDE_CLEAR
+                    self.side_decider._pending_streak = 0
+                except Exception:
+                    pass
+                self._last_side_int = SIDE_CLEAR
+                self._last_side_str = 'clear'
+                self._last_bias_scale = 0.0
                 ### HJ : end
             ### HJ : end
         else:
@@ -1961,6 +2230,55 @@ class MPCPlannerStateNode:
                 2.0, '[mpc][%s] update_weights failed: %s',
                 rospy.get_name(), e)
 
+    ### HJ : 2026-04-28 Stage 2 Phase 2-1 + plan transition smooth ramp.
+    def _apply_plan_weights(self, plan):
+        """plan 의 weight overlay 를 solver 에 push. Plan 변경 시 5 tick
+        (0.10s @ 50Hz) 동안 prev plan 의 weight 와 alpha-blend.
+
+        User wants smooth trajectory on plan change but slowing alpha to
+        10 ticks made MPC react too slowly to obstacles entering horizon
+        (post_smooth bag: 1 collision, 2mm lateral). 5-tick ramp keeps
+        reaction speed; trajectory smoothness is delivered by the solver's
+        own continuity cost (w_cont=300) and the head-blending continuity
+        guard with the lowered 0.08m threshold.
+        """
+        if plan is None:
+            return
+        try:
+            weights = dict(plan.get('weights', {}))
+            if not weights:
+                return
+            cur_name = plan.get('name', '?')
+            prev_name = getattr(self, '_prev_applied_plan_name', None)
+            prev_weights = getattr(self, '_prev_applied_plan_weights', None)
+            # Plan 변경 시 alpha ramp 시작 (5 tick 동안 0→1)
+            if prev_name is None or prev_name == cur_name:
+                self._plan_transition_alpha = 1.0
+            elif prev_name != cur_name:
+                # 새 transition 시작 또는 진행 중
+                if not hasattr(self, '_plan_transition_alpha') or self._plan_transition_alpha >= 1.0:
+                    self._plan_transition_alpha = 0.0
+                else:
+                    self._plan_transition_alpha = min(1.0, self._plan_transition_alpha + 0.20)
+            alpha = float(getattr(self, '_plan_transition_alpha', 1.0))
+            if alpha < 1.0 and prev_weights is not None:
+                # Blend: alpha=0 → prev, alpha=1 → cur
+                blended = {}
+                for k, v in weights.items():
+                    pv = prev_weights.get(k, v)
+                    blended[k] = (1.0 - alpha) * pv + alpha * v
+                self.solver.update_weights(**blended)
+            else:
+                self.solver.update_weights(**weights)
+                self._prev_applied_plan_name = cur_name
+                self._prev_applied_plan_weights = weights.copy()
+            self._last_applied_weight_alpha = None
+        except Exception as e:
+            rospy.logwarn_throttle(
+                2.0, '[mpc][%s] plan weights apply failed (%s): %s',
+                rospy.get_name(), plan.get('name', '?'), e)
+    ### HJ : end
+
     # ---------------------------------------------------------------- Phase X speed painter
     def _lookup_gb_vx(self, s):
         """Binary-search GB raceline vx at arc-length s. s-based only, no xy
@@ -2097,6 +2415,18 @@ class MPCPlannerStateNode:
             else:
                 v_curv = float(np.sqrt(max(mu * g / kappa, 0.0)))
             capped.append(min(v_gb, v_curv))
+
+        # ### HJ : 2026-04-28 — plan-aware painter override tried and
+        # reverted. User bag (2026-04-28-14-54-57) showed cmd_v0 stuck
+        # at ~3.95 m/s while obs_vs was 1-3 m/s (TRAILING ego 가 obstacle
+        # 따라잡으며 충돌). Root cause: even when the cap was set to
+        # obs.vs - 0.3, the immediately-following ego_v continuity ramp
+        # (`capped[0] = clip(capped[0], ego_v - a_max*dT, ego_v + a_max*dT)`,
+        # ±0.15 m/s/tick) clipped capped[0] back to ego_v - 0.15, so
+        # the brake intent never reached the controller's first
+        # waypoint. The override needs a plan-aware a_max (TRAIL allowing
+        # larger deceleration) before it can take effect — see Step 4
+        # in HJ_docs/mpc_overtake_redesign_plan_20260428.md.
 
         # 3) ego v continuity — clip wp0 then forward acc limit
         ego_v = float(getattr(self, 'car_vx', 0.0))
@@ -2287,8 +2617,12 @@ class MPCPlannerStateNode:
             local_v = max(float(self.g_vx[idx]), 1.0)
             target_s += local_v * dT
 
+        ### HJ : Option A — explicit ref_x/y arrays for xy-based obstacle cost.
+        cp_arr = np.array(center_pts)
         return {
-            'center_points': np.array(center_pts),
+            'center_points': cp_arr,
+            'ref_x_arr': cp_arr[:, 0],
+            'ref_y_arr': cp_arr[:, 1],
             'left_points': np.array(left_pts),
             'right_points': np.array(right_pts),
             'd_left_arr': np.array(d_left_arr),       # raceline-normal eff (post cos(Δ))
@@ -2330,6 +2664,20 @@ class MPCPlannerStateNode:
         # tick's (same shape (n_slot, N+1, 3)). Only blend (s, n) columns;
         # keep active-weight (col 2) as a hard on/off to avoid zombie slots.
         if self.solver_backend == 'frenet_kin':
+            ### HJ : 2026-04-28 (S1-8) — ego_s 점프 (lap-wrap, sim reset)
+            ###      감지 시 EMA reset. 점프 후 stale EMA 와 새 obs_arr blend
+            ###      하면 nonsense s 값 (예: 61, 69) 으로 mode flip 유발.
+            ###      구조적으로 robust — staleness check 자체는 기존 EMA 가
+            ###      처리, 추가는 ego_s 점프 한 번 만 detect.
+            try:
+                cur_es = float(getattr(self, 'ego_s', 0.0) or 0.0)
+                prev_es = float(getattr(self, '_prev_ego_s_for_ema', cur_es))
+                if abs(cur_es - prev_es) > 30.0:  # >30m 점프 (lap-wrap or sim reset)
+                    self._obs_arr_ema = None
+                self._prev_ego_s_for_ema = cur_es
+            except Exception:
+                pass
+            ### HJ : end (S1-8)
             if obs_arr is None:
                 # no obstacles this tick — drop stale EMA so a future
                 # re-acquisition doesn't blend against 5-sec-old data.
@@ -2364,6 +2712,25 @@ class MPCPlannerStateNode:
             initial_state = np.array([float(ego_n), mu0, v0])
             # side decision (rule-based, external, now feasibility-aware)
             side_int, side_str, side_scores = self._decide_side(obs_arr, ref_slice)
+            ### HJ : 2026-04-27 — log every side decision change with full
+            ###      score breakdown so user can immediately see WHY decider
+            ###      picked LEFT vs RIGHT (numbers, not guesses).
+            if side_int != self._last_side_int:
+                rospy.logwarn(
+                    '[mpc][%s] SIDE DECISION → %s ego_n=%.3f obs_n=%.3f '
+                    'd_L=%.3f d_R=%.3f d_free_L=%.3f d_free_R=%.3f '
+                    'can_pass_L=%s can_pass_R=%s reason=%s',
+                    rospy.get_name(),
+                    side_str.upper(), float(ego_n),
+                    float(side_scores.get('n_o', 0.0)),
+                    float(ref_slice['d_left_arr'][0]),
+                    float(ref_slice['d_right_arr'][0]),
+                    float(side_scores.get('d_free_L', 0.0)),
+                    float(side_scores.get('d_free_R', 0.0)),
+                    side_scores.get('can_pass_L'),
+                    side_scores.get('can_pass_R'),
+                    side_scores.get('reason'))
+            ### HJ : end
             # ### HJ : v3 — bias_scale ramp REMOVED. Continuity cost in
             # solver handles tick-to-tick smoothness directly. Fixed 1.0.
             if side_int != self._last_side_int:
@@ -2394,6 +2761,11 @@ class MPCPlannerStateNode:
         min_obs_ds, ttc_min = self._obs_in_horizon_and_ttc(
             obs_arr, s_cur, ego_v_now)
         self._update_mpc_mode(ego_n, side_int, min_obs_ds, ttc_min)
+        ### HJ : 2026-04-27 (R1) — proactive recovery cache on OT→NO_OBS.
+        if getattr(self, '_just_transitioned_to_no_obs', False):
+            self._just_transitioned_to_no_obs = False
+            self._force_recovery_cache_build(s_cur, ego_n)
+        ### HJ : end
 
         # ### HJ : 2026-04-24 — corridor sanity diagnostic. If ego is
         # physically outside the corridor at solve-time (dragged in Gazebo,
@@ -2443,6 +2815,158 @@ class MPCPlannerStateNode:
                     rospy.get_name(), _e)
         ### HJ : end
 
+        ### HJ : 2026-04-28 Stage 2 Phase 2-1 — plan_picker + weight overlay.
+        ###      side_decider 의 결정 + obs_in_horizon 으로 plan 선택.
+        ###      plan 의 weight overlay 를 solver 에 push (앞의 _apply_*_weights
+        ###      위에 덮어쓰기 → plan 이 최종 결정).
+        try:
+            obs_in_horizon = (self._mpc_mode == MPC_MODE_WITH_OBS)
+            ### HJ : 2026-04-28 (a) — fully plan-based picker.
+            ###      SideDecider 의 결정 무시. d_free_L/R / dv 정보만 활용.
+            ###      모든 5 plan (LEFT/RIGHT/TRAIL/RACELINE) score 비교 → best.
+            ###      사용자 명시: "MPC 가 전략 짠다" 의 진짜 구현.
+            ###      sticky bonus + risk 강화 → plan 변경 빈도 제한.
+            if obs_in_horizon:
+                candidates = [PLAN_LEFT_PASS, PLAN_RIGHT_PASS, PLAN_TRAIL]
+            else:
+                candidates = [PLAN_RACELINE, PLAN_LEFT_PASS, PLAN_RIGHT_PASS]
+            current_name = getattr(self, '_last_plan_name_logged', None)
+            ### HJ : 2026-04-28 root-cause fix — physical-feasibility filter.
+            ###      User feedback rejected both (a) hysteresis-only locks
+            ###      ("그냥 고정하는거잖나") and (b) worst-case obs.n inflation
+            ###      ("저정도 트래킹 에러는 갖고 있어야지"). Tracking noise on
+            ###      d_free is normal; MPC w_obs + target_n cost handle it.
+            ###
+            ###      The actual root cause of LEFT↔RIGHT flips: scorer compares
+            ###      both passes even when ego_n is committed (e.g. +0.30).
+            ###      Cross-over RIGHT_PASS is physically infeasible from there
+            ###      → flip is just score-noise, not strategy.
+            ###
+            ###      Drop infeasible candidates BEFORE scoring. Not a time-lock,
+            ###      no state — purely structural. LEFT↔TRAIL, RACELINE↔LEFT,
+            ###      etc. all stay open and respond to legitimate signals.
+            candidates = _filter_feasible_plans(candidates, ego_n)
+            ### HJ : end
+            ### HJ : 2026-04-28 (a)+근원 (1)+(2) — horizon-aware d_free + EMA.
+            ###      사용자 명시 근본 해결. snapshot d_free 진동의 근원 차단.
+            ###      Horizon-aware: k=0..N min d_free → ego ≈ obs 시점도 안정.
+            ###      EMA: 추가 smoothing (잔여 변동).
+            ### HJ : 2026-04-28 — adaptive gap_lat from runtime topic state
+            ###      (user feedback: 토픽 상태 기반 유동적). Pulls predicted
+            ###      lateral velocity variance + rolling obs.n stddev. When
+            ###      both report low, gap_lat barely grows (no over-margin);
+            ###      when predictor uncertainty or recent obs.n variation is
+            ###      high, ramp grows accordingly.
+            #
+            # Rolling history of current-tick obs.n (closest active obs) for
+            # local stddev estimate. Buffer length ~20 ticks (~0.4s @ 50Hz).
+            if not hasattr(self, '_obs_n_history'):
+                from collections import deque
+                self._obs_n_history = deque(maxlen=20)
+            obs_n_std = 0.0
+            try:
+                if obs_arr is not None and obs_arr.size > 0:
+                    active = obs_arr[:, 0, 2] > 0
+                    if np.any(active):
+                        self._obs_n_history.append(float(obs_arr[np.where(active)[0][0], 0, 1]))
+                if len(self._obs_n_history) >= 4:
+                    obs_n_std = float(np.std(np.array(self._obs_n_history)))
+            except Exception:
+                obs_n_std = 0.0
+            ### HJ : 2026-04-28 — snapshot d_free only (no horizon, no EMA).
+            ###      long_baseline 10min bag analysis: 10/12 collisions during
+            ###      TRAIL plan. In 4 of those, snapshot d_free showed a clear
+            ###      pass side (d_free_L=0.47, 0.49 etc.) but the smoothed
+            ###      values used by the scorer were small enough that TRAIL's
+            ###      long_term bonus dominated. The horizon-min and EMA chain
+            ###      collapses confidence in legitimate pass margins. Trust
+            ###      the snapshot — the MPC solver handles future obstacle
+            ###      motion via its own w_obs cost.
+            smoothed_scores = side_scores  # alias kept for downstream code
+            score_hist = getattr(self, '_plan_score_history', None)
+            best_plan, all_scores, new_hist = _pick_plan_scored(
+                candidates, ego_n, smoothed_scores, obs_in_horizon,
+                current_plan_name=current_name,
+                score_history=score_hist,
+                score_gap_threshold=0.15)  # was 0.40 — feasibility filter handles
+                                            # main flip source, light gap is enough
+            self._plan_score_history = new_hist
+            ### HJ : 2026-04-28 — passing-freeze + 5-tick dwell removed.
+            ###      User: "두가지 방법 말고(저건 그냥 고정하는거잖나)".
+            ###      Plan stability now comes from feasibility filter +
+            ###      smooth quadratic risk (no cliff) + score EMA + light gap.
+            ###      No time-locks.
+            self._last_plan = best_plan
+            self._last_plan_scores = all_scores
+            self._apply_plan_weights(self._last_plan)
+            ### HJ : end (a)
+            ### HJ : 2026-04-28 (trailing 강화 — 사용자 정정 정확 구현):
+            ###      TRAIL plan 시 ref_v 를 obs_v - margin 으로 override.
+            ###      "차 뒤 + 일정 거리/속도, 빈틈 노림" 의 'target_v' 명시화.
+            ###      Solver progress cost (gamma) 가 자연스럽게 ego_v → target_v.
+            ###      단순 vmax cap 보다 active trailing 효과.
+            try:
+                if self._last_plan is not None and self._last_plan.get('name') == 'trail':
+                    obs_vs = float(side_scores.get('v_obs', 0.0))
+                    target_v = max(obs_vs - 0.3, 0.5)  # margin 0.3 m/s, floor 0.5
+                    ref_slice['ref_v'] = np.full_like(ref_slice['ref_v'], target_v)
+            except Exception as _e:
+                rospy.logwarn_throttle(2.0,
+                    '[mpc][%s] TRAIL ref_v override failed: %s',
+                    rospy.get_name(), _e)
+            ### HJ : end (trailing target_v)
+            self._apply_plan_weights(self._last_plan)
+            ### HJ : 2026-04-28 — plan-aligned side_int tried (long_side_align).
+            ###      Forcing side_int from plan name made things worse (7→10
+            ###      events). When plan_picker chose RIGHT_PASS while ego was
+            ###      slightly on the LEFT side of the obstacle (ego_n=+0.12,
+            ###      under filter threshold 0.15), the forced side_int=RIGHT
+            ###      drove the solver across the obstacle bubble — collisions
+            ###      followed. Reverted; side_decider's side_int stays
+            ###      authoritative for the solver.
+            ### HJ : 2026-04-28 Phase 2-2 — target_n profile push.
+            ###      Plan 의 'where to go' 를 명시적 cost 로 강제. obs_n =
+            ###      가장 가까운 (s 기준) obstacle 의 n. None 이면 fallback.
+            try:
+                obs_n = None
+                if obs_arr is not None and obs_arr.size > 0:
+                    # 가장 가까운 (s_close) obstacle 의 n0 추출
+                    active_mask = (obs_arr[:, 0, 2] > 0)
+                    if active_mask.any():
+                        # k=0 의 n 평균 (multi-obs 시 closest 사용 가능하나 단순)
+                        active_idx = np.where(active_mask)[0][0]
+                        obs_n = float(obs_arr[active_idx, 0, 1])
+                target_profile = _make_target_n_profile(
+                    self._last_plan, ego_n, obs_n, self.N)
+                self.solver.set_n_target_profile(target_profile)
+                ### HJ : 2026-04-28 — target_n profile blend tried (option C)
+                ###      and removed. 5x60s aggregate trial_c showed 12
+                ###      collisions vs trial_b's 4 — blending the target
+                ###      across plan transitions slowed MPC's lateral
+                ###      response just like the alpha=0.10 weight ramp did.
+                ###      Smoothness must come from solver's w_cont=300 +
+                ###      fewer transitions (sticky fix + filter), not from
+                ###      blending the planner's intent toward the previous
+                ###      tick's intent.
+            except Exception as _e:
+                rospy.logwarn_throttle(2.0,
+                    '[mpc][%s] target_n profile push failed: %s',
+                    rospy.get_name(), _e)
+            ### HJ : end (Phase 2-2)
+            # log plan transition
+            if getattr(self, '_last_plan_name_logged', None) != self._last_plan['name']:
+                rospy.loginfo(
+                    '[mpc][%s] PLAN → %s (side=%s obs_in_h=%s)',
+                    rospy.get_name(),
+                    self._last_plan['name'].upper(), side_str, obs_in_horizon)
+                self._last_plan_name_logged = self._last_plan['name']
+        except Exception as _e:
+            rospy.logwarn_throttle(
+                2.0, '[mpc][%s] plan_picker apply failed: %s',
+                rospy.get_name(), _e)
+            self._last_plan = None
+        ### HJ : end (Stage 2 Phase 2-1)
+
         warm_used = int(bool(getattr(self.solver, 'warm', False)))
 
         ### HJ : 2026-04-27 — cache HIJACKS NLP. Once a recovery cache is
@@ -2453,21 +2977,30 @@ class MPCPlannerStateNode:
         ###      so warm-start stays warm and we have a fresh "intent"
         ###      even if we don't publish it — keeps tier-0 ready when
         ###      cache invalidates.
-        cached_xy, cached_sn = self._sample_recovery_cache(s_cur, ego_n)
-        if cached_xy is not None:
-            # Skip NLP — publish cache directly.
-            self._handle_tier2_geometric(
-                cached_xy, cached_sn, ego_n, 'cache_hold', 0.0,
-                'cached')
-            self._debug_log(
-                tier=2, status='RECOVERY_CACHED', ipopt_status='cache_hold',
-                iter_count=0, solve_ms=0.0, slack_max=0.0,
-                trajectory=cached_xy, u_sol=None, obs_arr=obs_arr,
-                obs_tag='cached', ref_slice=ref_slice,
-                initial_state=initial_state, ego_s=s_cur, ego_n=ego_n,
-                warm_used=warm_used,
-            )
-            return
+        ###
+        ###      Cache invalidation when obstacle re-enters horizon is
+        ###      handled inside _sample_recovery_cache (mode flip to
+        ###      WITH_OBS triggers invalidate). Cache is intentionally
+        ###      allowed when obstacle is far (NO_OBS mode + ego far from
+        ###      GB) because that's the smooth-return-to-GB use case the
+        ###      cache was built for.
+        ###
+        ### HJ : 2026-04-29 — Cache pre-NLP hijack REMOVED.
+        # Previous behaviour: when obs was outside horizon, the cache
+        # could be sampled BEFORE the NLP call and published as the MPC
+        # output, skipping the NLP entirely. With cache build firing on
+        # every R1 OT→NO_OBS transition (and on every NLP-fail quintic),
+        # the cache could repeatedly hijack the publish path so that
+        # only "RECOVERY_CACHED" trajectories appeared in RViz, even
+        # when the NLP would have produced a fresh, more accurate
+        # trajectory. User report (2026-04-29): "obstacle in horizon
+        # 아니어도 지금 MPC recovery 만 나오고 있어".
+        # Fix: always run the NLP first. Cache is now exclusively a
+        # fallback (used in the post-fail ladder only — see below).
+        _obs_in_h_pre_nlp = bool(
+            obs_arr is not None
+            and obs_arr.size > 0
+            and (obs_arr[:, :, 2] > 0).any())
         ### HJ : end
 
         t0 = time.time()
@@ -2506,6 +3039,38 @@ class MPCPlannerStateNode:
 
         # ### HJ : Phase 4.3 — 4-tier fallback. Even at tier 3 we still
         # publish a sane Wpnt[] so controller has zero-gap input.
+        # ### HJ : 2026-04-29 — single-use cache follow-through.
+        # Once a recovery cache is in_use (committed by R1 OT→NO_OBS
+        # pre-build or by tier 2 quintic), we follow it to the end.
+        # Even if the NLP starts succeeding mid-follow, we keep
+        # publishing the cache so the controller doesn't suddenly
+        # switch from a smooth recovery curve to a fresh NLP path.
+        # The cache invalidates itself when:
+        #   - mode flips to WITH_OBS (obstacle entered horizon)
+        #   - ego_n converged (raceline reached)
+        #   - ego past s_end (cache window exhausted)
+        # so this branch only fires while the cache is genuinely active.
+        if self._recovery_cache_in_use:
+            cached_xy, cached_sn = self._sample_recovery_cache(s_cur, ego_n)
+            if cached_xy is not None:
+                self._handle_tier2_geometric(
+                    cached_xy, cached_sn, ego_n,
+                    'cache_follow', solve_ms, obs_tag + ':cached')
+                self._debug_log(
+                    tier=2, status='RECOVERY_CACHED',
+                    ipopt_status='cache_follow',
+                    iter_count=0, solve_ms=solve_ms, slack_max=0.0,
+                    trajectory=cached_xy, u_sol=None, obs_arr=obs_arr,
+                    obs_tag=obs_tag + ':cached', ref_slice=ref_slice,
+                    initial_state=initial_state, ego_s=s_cur, ego_n=ego_n,
+                    warm_used=warm_used,
+                )
+                return
+            # _sample_recovery_cache returned None (one of the
+            # invalidation conditions fired). in_use was already cleared
+            # inside _invalidate_recovery_cache; fall through to publish
+            # the fresh NLP / fallback below.
+
         if success and trajectory is not None:
             self._handle_tier0_success(trajectory, s_cur, solve_ms, obs_tag,
                                        speed, steering)
@@ -2524,22 +3089,56 @@ class MPCPlannerStateNode:
         status = ipopt_status
         self.solver.reset_warm_start()
 
-        if self._last_good_traj is not None and self._fail_streak <= self._fail_tier_H:
-            self._handle_tier1_hold_last(status, solve_ms, obs_tag)
-            self._debug_log(
-                tier=1, status='HOLD_LAST', ipopt_status=status,
-                iter_count=iter_count, solve_ms=solve_ms, slack_max=slack_max,
-                trajectory=self._last_good_traj, u_sol=self._last_good_u,
-                obs_arr=obs_arr, obs_tag=obs_tag, ref_slice=ref_slice,
-                initial_state=initial_state, ego_s=s_cur, ego_n=ego_n,
-                warm_used=warm_used,
-            )
-            return
+        ### HJ : 2026-04-28 — "MPC must always publish" directive.
+        # Previous version (S1-5) capped HOLD_LAST at 3 ticks and dropped
+        # to EMERGENCY_NO_TRAJ (publish nothing) when the cap was exceeded
+        # with an obstacle in horizon. That was the source of the
+        # multi-second publish blackouts the user observed in bag
+        # 2026-04-28-15-08-36 (3.7s gap, SM kept using a stale OT path
+        # from a previous lap → local_wpnts jumping by ~15m). User
+        # mandate (2026-04-28): MPC trajectory must come out every tick
+        # regardless of state — global tracking, overtake, recovery —
+        # because the controller / SM treat publish absence as brake and
+        # produce far worse behaviour than a slightly-stale path.
+        # New ladder:
+        #   tier 0 — NLP success (above)
+        #   tier 1 — HOLD_LAST: republish last good trajectory while NLP
+        #            recovers. No fail_streak cap. Always publish if a
+        #            last_good_traj exists.
+        #   tier 2 — recovery cache (still gated by obs_in_horizon to
+        #            avoid driving an OT-shaped cached path through a new
+        #            obstacle).
+        #   tier 3 — quintic fallback (recovery curve).
+        #   tier 4 — raceline slice (last resort, always available).
+        # EMERGENCY_NO_TRAJ removed — every fail must reach a publish.
+        obs_in_horizon_strict = bool(
+            obs_arr is not None
+            and obs_arr.size > 0
+            and (obs_arr[:, :, 2] > 0).any())
 
-        # ### HJ : 2026-04-27 — cache-first recovery dispatch.
-        ###      Try the cached recovery path FIRST. If valid (in s-window,
-        ###      no obstacle, not converged), sample from it and skip the
-        ###      tier-2 rebuild — keeps the goalpost stationary.
+        ### HJ : 2026-04-29 — Fallback ladder REORDERED.
+        # Previous order put HOLD_LAST first. That meant on every NLP
+        # fail the system republished the last NLP-success trajectory,
+        # which is typically a raceline-shaped path (because the prior
+        # tick the obstacle was farther / NLP solved easily). The
+        # painter then overwrote vx_mps with vel-planner GB raceline
+        # speeds. Net effect: when the obstacle got close enough to
+        # break the NLP, the car kept driving the previous raceline
+        # path at full GB speed → drove straight into the obstacle.
+        # User report (2026-04-29): "냅다 GB 경로 나오던데".
+        #
+        # New order — recovery-first, hold-last as last-ditch:
+        #   tier 2 cache       (committed recovery path; obs-aware self-invalidate)
+        #   tier 2 quintic     (fresh ego_n→0 recovery curve, obs-aware skip)
+        #   tier 3 short quintic (aggressive convergence)
+        #   tier 3 raceline slice (last resort; controller might jump)
+        #   tier 1 HOLD_LAST   (only if every fresh option above failed)
+        #
+        # The HOLD_LAST now exists to keep the publish stream alive in
+        # the rare case where every recovery primitive raised, not as
+        # the default fail handler.
+
+        # Tier 2: cache (committed recovery path)
         cached_xy, cached_sn = self._sample_recovery_cache(s_cur, ego_n)
         if cached_xy is not None:
             self._handle_tier2_geometric(
@@ -2554,20 +3153,18 @@ class MPCPlannerStateNode:
                 warm_used=warm_used,
             )
             return
-        ### HJ : end
 
-        # ### HJ : v3b — tier2 gets (s_cur, ego_n) from /odom_frenet directly.
-        # Previously `_try_quintic_fallback(s_cur)` re-projected (car_x, car_y)
-        # via lifter.project_xy_to_sn — 2D nearest that aliases overpass
-        # floors. The /odom_frenet s is z-aware and cannot alias.
-        # ### HJ : 2026-04-24 — wall clip ON so NLP→tier2 cascade doesn't
-        # punch the corridor even if ego is spawned outside it.
-        traj_fb, frenet_fb = self._try_quintic_fallback(
-            s_cur, ego_n, delta_s=self._quintic_delta_s, clip_walls=True)
+        # Tier 2: quintic recovery (fresh path). Skip when obstacle is
+        # in horizon — quintic targets ego_n→0 (raceline) and would
+        # drive through the obstacle. Fall through to short-quintic /
+        # raceline-slice / HOLD_LAST in that case.
+        if obs_in_horizon_strict:
+            traj_fb, frenet_fb = None, None
+        else:
+            traj_fb, frenet_fb = self._try_quintic_fallback(
+                s_cur, ego_n, delta_s=self._quintic_delta_s, clip_walls=True)
         if traj_fb is not None:
-            ### HJ : 2026-04-27 — cache the freshly-built recovery path.
             self._cache_recovery_path(traj_fb, frenet_fb)
-            ### HJ : end
             self._handle_tier2_geometric(
                 traj_fb, frenet_fb, ego_n, status, solve_ms, obs_tag)
             self._debug_log(
@@ -2580,12 +3177,7 @@ class MPCPlannerStateNode:
             )
             return
 
-        # ### HJ : v3b — tier3 used to be a raw raceline slice (n=0 forced),
-        # which jumps the controller whenever ego_n is non-zero. Per user's
-        # recovery-style directive: tier3 is now an aggressive short-Δs
-        # quintic (ego_n → 0 convergence). If even that blows up, we fall
-        # through to the last-resort pure raceline slice.
-        # ### HJ : 2026-04-24 — wall clip ON (same rationale as tier2).
+        # Tier 3: short-Δs quintic (aggressive convergence)
         traj_short, frenet_short = self._try_quintic_fallback(
             s_cur, ego_n, delta_s=max(self._quintic_delta_s * 0.5, 3.0),
             clip_walls=True)
@@ -2602,6 +3194,21 @@ class MPCPlannerStateNode:
             )
             return
 
+        # ### HJ : 2026-04-29 — HOLD_LAST removed entirely.
+        # User directive: "HOLD_LAST 없애고, 항상 무조건 valid 한 경로가
+        # 나오게". Stale-path republishing was producing GB-shaped paths
+        # right when an obstacle was bearing down (the prior NLP success
+        # had been raceline-tracking before the obstacle came close), so
+        # the car drove the old path straight into the new obstacle.
+        # The recovery primitives above (cache, quintic, short quintic)
+        # plus the raceline-slice last resort all generate fresh,
+        # geometrically-valid trajectories (finite x/y, bounded kappa,
+        # n=0 raceline path). Publish is therefore always guaranteed
+        # without needing to fall back to a stale snapshot.
+
+        # Tier 3-final: raceline slice. Fresh raceline path from s_cur
+        # for N+1 waypoints. Always succeeds (depends only on the global
+        # raceline lifter, no NLP / quintic dependence).
         traj_last = self._handle_tier3_raceline(
             s_cur, status, solve_ms, obs_tag)
         # ### HJ : v3b — feed the raceline-slice trajectory to debug_log so
@@ -2856,6 +3463,27 @@ class MPCPlannerStateNode:
             rospy.get_name(), self._fail_streak, ipopt_status, solve_ms, obs_tag,
         )
 
+    ### HJ : 2026-04-28 (S1-5) — emergency no-publish.
+    def _handle_emergency_no_traj(self, ipopt_status, solve_ms, obs_tag):
+        """Cap 초과 + obstacle in horizon 시 publish 생략.
+
+        사용자 룰 1: 장애물 옆 recovery/GB curve 금지. Stale HOLD_LAST,
+        raceline_slice, geometric quintic 모두 obstacle 충돌 위험. publish
+        안 함이 가장 안전. Controller 의 latest_threshold (200ms) 가 자체
+        brake 트리거. Status 토픽만 발행해서 SM 등이 신호 받음.
+        """
+        self._viz_tier = -1
+        self._viz_status = 'EMERGENCY_NO_TRAJ'
+        self._publish_status('EMERGENCY_NO_TRAJ streak=%d obs=%s' %
+                             (self._fail_streak, obs_tag))
+        self._last_status = 'EMERGENCY'
+        rospy.logerr_throttle(
+            0.5,
+            '[mpc][%s] EMERGENCY (no traj) streak=%d ipopt=%s solve=%.1fms obs=%s',
+            rospy.get_name(), self._fail_streak, ipopt_status, solve_ms, obs_tag,
+        )
+    ### HJ : end (S1-5)
+
     ### HJ : 2026-04-27 — Recovery path cache (commit-once).
     def _cache_recovery_path(self, xy_traj, sn_traj):
         """Cache a tier-2 recovery path. Subsequent fallback ticks sample
@@ -2868,6 +3496,8 @@ class MPCPlannerStateNode:
         self._recovery_cache_s_start = float(sn_traj[0, 0])
         self._recovery_cache_s_end = float(sn_traj[-1, 0])
         self._recovery_cache_committed_at = rospy.Time.now()
+        # 2026-04-29 single-use: any commit starts a new follow window.
+        self._recovery_cache_in_use = True
         rospy.loginfo_throttle(
             1.0,
             '[mpc][%s] recovery path CACHED: s=[%.2f, %.2f] L=%.2f',
@@ -2875,8 +3505,51 @@ class MPCPlannerStateNode:
             self._recovery_cache_s_start, self._recovery_cache_s_end,
             self._recovery_cache_s_end - self._recovery_cache_s_start)
 
+    ### HJ : 2026-04-27 (R1) — proactive recovery cache build on OT→NO_OBS.
+    ###      Called from _plan_loop right after _update_mpc_mode detects
+    ###      WITH_OBS → NO_OBS transition. Builds + caches a recovery path
+    ###      synchronously so the rest of THIS tick's cache-hijack picks it
+    ###      up. Skips work if cache already present.
+    def _force_recovery_cache_build(self, s_cur, ego_n):
+        if self._recovery_cache_sn is not None:
+            rospy.logwarn(
+                '[mpc][%s] R1 OT→NO_OBS: recovery cache already exists '
+                '(s=[%.2f, %.2f]), skipping pre-build',
+                rospy.get_name(),
+                self._recovery_cache_s_start,
+                self._recovery_cache_s_end)
+            return
+        if self.solver_backend != 'frenet_kin':
+            return
+        try:
+            n_samples = self.N + 1
+            traj_fb, frenet_fb = self._try_quintic_fallback(
+                s_cur, ego_n, delta_s=self._quintic_delta_s,
+                n_samples=int(n_samples), clip_walls=True)
+            if traj_fb is not None:
+                self._cache_recovery_path(traj_fb, frenet_fb)
+                rospy.logwarn(
+                    '[mpc][%s] R1 OT→NO_OBS: recovery cache PRE-BUILT '
+                    '(ego_n=%.3f, s_start=%.2f, s_end=%.2f, L=%.2f)',
+                    rospy.get_name(),
+                    float(ego_n),
+                    self._recovery_cache_s_start,
+                    self._recovery_cache_s_end,
+                    self._recovery_cache_s_end - self._recovery_cache_s_start)
+            else:
+                rospy.logwarn(
+                    '[mpc][%s] R1 OT→NO_OBS: cache pre-build FAILED '
+                    '(build_recovery_path returned None at ego_n=%.3f)',
+                    rospy.get_name(), float(ego_n))
+        except Exception as e:
+            rospy.logwarn_throttle(
+                2.0, '[mpc][%s] proactive recovery build failed: %s',
+                rospy.get_name(), e)
+    ### HJ : end
+
     def _invalidate_recovery_cache(self, reason='unspecified'):
         if self._recovery_cache_sn is None:
+            self._recovery_cache_in_use = False
             return
         rospy.loginfo_throttle(
             1.0, '[mpc][%s] recovery cache cleared (%s)',
@@ -2886,6 +3559,7 @@ class MPCPlannerStateNode:
         self._recovery_cache_s_start = None
         self._recovery_cache_s_end = None
         self._recovery_cache_committed_at = None
+        self._recovery_cache_in_use = False
 
     def _sample_recovery_cache(self, s_cur, ego_n):
         """If cache valid, sample at current s_cur. Returns (xy, sn) of
@@ -2893,11 +3567,13 @@ class MPCPlannerStateNode:
         """
         if self._recovery_cache_sn is None:
             return None, None
+        # ### HJ : 2026-04-29 — TTL removed. Cache is single-use:
+        # follow-once until window end / convergence / obstacle entry.
         # Invalidate if mode flipped to WITH_OBS (obstacle near)
         if self._mpc_mode == MPC_MODE_WITH_OBS:
             self._invalidate_recovery_cache('mode→WITH_OBS')
             return None, None
-        # Invalidate if ego converged
+        # Invalidate if ego converged (raceline reached)
         if abs(float(ego_n)) < self._recovery_cache_exit_n:
             self._invalidate_recovery_cache('converged')
             return None, None
@@ -3320,6 +3996,30 @@ class MPCPlannerStateNode:
             wp_arr.wpnts = self._densify_wpnt_list(
                 wp_arr.wpnts, ds=self._mpc_output_ds)
 
+        ### HJ : 2026-05-01 — sparsify pass.
+        ### bag 2026-04-29-16-47-24 분석에서 cache splice junction 이
+        ### 인접 ds 0.0287/0.0419/0.0481 로 publish gate (ds_min < 0.05)
+        ### 에 매번 막혀 18s 동안 21번 path_source GB ↔ MPC_RC 토글 발생.
+        ### 게이트 0.02 로 낮추는 동시에, 호출자가 publish 직전 ds < 0.02
+        ### 인 점을 drop. trajectory 모양은 유지하되 인접 점 너무 가까운
+        ### 케이스는 한 점만 남김. controller 는 길이 가변에 강건.
+        wp_arr.wpnts = self._sparsify_wpnts(wp_arr.wpnts, ds_min=0.02)
+
+        ### HJ : 2026-04-28 (S1-4) — publish-side validation chain.
+        ###      lift→painter→guard 후 kappa/ds/finite 검사. 위배 시 publish
+        ###      생략 (controller latest_threshold 가 자체 brake). bag2 의
+        ###      kappa=1.6M trajectory 발행 차단의 안전망.
+        valid, reason = self._validate_publish_wpnts(wp_arr.wpnts)
+        if not valid:
+            self._viz_status = 'PUBLISH_VALIDATE_FAIL'
+            self._publish_status('PUBLISH_VALIDATE_FAIL reason=%s' % reason)
+            self._last_status = 'PUBLISH_VALIDATE_FAIL'
+            rospy.logerr_throttle(
+                0.5, '[mpc][%s] publish blocked: %s',
+                rospy.get_name(), reason)
+            return
+        ### HJ : end (S1-4)
+
         self.pub_best_trajectory.publish(wp_arr)
         self._publish_debug_markers(header, trajectory)
 
@@ -3348,6 +4048,95 @@ class MPCPlannerStateNode:
         # Cache for next-tick continuity guard (deep copy of header-less wpnts).
         self._last_published_wpnts = [self._wpnt_copy(w) for w in wp_arr.wpnts]
         self._last_published_mode = self._mpc_mode
+
+    ### HJ : 2026-04-28 (S1-4) — publish-side validation chain.
+    def _validate_publish_wpnts(self, wpnts):
+        """publish 전 trajectory 안전성 검사. 사용자 룰 1 (이상한 답 금지).
+
+        Reject if:
+          - kappa_max > 5 rad/m (lifter degeneracy 또는 numerical 폭발)
+          - 인접 점 ds < 0.02m (near-coincident points → kappa explode)
+          - x/y/vx NaN/Inf
+          - inter-msg first-wpnt jump > 0.5m (단, ego_s 큰 점프 시 skip)
+
+        2026-05-01: ds_min 임계값 0.05 → 0.02 완화 + 호출자가 sparsify
+        후처리하므로 ds_min 게이트는 안전망(곡률 폭발의 진짜 게이트는
+        kappa_max > 5)으로만 남음. bag 2026-04-29-16-47-24 에서 cache
+        splice junction 이 ds 0.0287~0.0481 로 18s 동안 publish 21번
+        차단된 케이스를 해결.
+        """
+        import math
+        if not wpnts or len(wpnts) < 2:
+            return False, 'empty_or_short'
+        kappa_max = 0.0
+        ds_min = 1e9
+        last_xy = (wpnts[0].x_m, wpnts[0].y_m)
+        for i, w in enumerate(wpnts):
+            if not (math.isfinite(w.x_m) and math.isfinite(w.y_m)
+                    and math.isfinite(w.vx_mps)):
+                return False, 'non_finite_at_%d' % i
+            ka = abs(getattr(w, 'kappa_radpm', 0.0))
+            if ka > kappa_max:
+                kappa_max = ka
+            if i > 0:
+                ds = math.hypot(w.x_m - last_xy[0], w.y_m - last_xy[1])
+                if ds < ds_min:
+                    ds_min = ds
+                last_xy = (w.x_m, w.y_m)
+        if kappa_max > 5.0:
+            return False, 'kappa_max=%.2f' % kappa_max
+        if ds_min < 0.02:
+            return False, 'ds_min=%.4f' % ds_min
+        # inter-msg jump check — DOWNGRADED to warn (no reject).
+        # 2026-04-28 user directive: MPC trajectory must publish every
+        # tick regardless of state. The previous reject path (whether the
+        # raw form or the ego_travel-compensated form) blocked publishing
+        # whenever a side-decision flip or plan_picker toggle shifted the
+        # path's first waypoint laterally by >0.5m. That created
+        # multi-tick blackouts and is exactly the failure mode the user
+        # is rejecting. Trajectory smoothness on big lateral shifts is
+        # the continuity_guard's job (it blends the first K=5 wpnts with
+        # the previous publish). Just emit a status string for telemetry
+        # and let publishing proceed.
+        ego_xy_now = (float(getattr(self, 'car_x', 0.0)),
+                      float(getattr(self, 'car_y', 0.0)))
+        self._ego_xy_at_prev_publish = ego_xy_now
+        prev_pub = getattr(self, '_last_published_wpnts', None)
+        if prev_pub is not None and len(prev_pub) > 0:
+            jump = math.hypot(wpnts[0].x_m - prev_pub[0].x_m,
+                              wpnts[0].y_m - prev_pub[0].y_m)
+            if jump > 1.0:
+                self._last_inter_msg_jump_warn = jump
+        return True, 'ok'
+    ### HJ : end (S1-4)
+
+    @staticmethod
+    def _sparsify_wpnts(wpnts, ds_min=0.02):
+        """Drop adjacent wpnts where xy distance < ds_min.
+
+        Keeps the first point. For each subsequent point, only keep it if
+        its xy distance from the LAST KEPT point is >= ds_min. The final
+        point is forced to be kept (replacing the previous tail if it was
+        within ds_min) so horizon end is preserved.
+        """
+        import math
+        if not wpnts or len(wpnts) < 3:
+            return wpnts
+        out = [wpnts[0]]
+        last_xy = (wpnts[0].x_m, wpnts[0].y_m)
+        for w in wpnts[1:-1]:
+            d = math.hypot(w.x_m - last_xy[0], w.y_m - last_xy[1])
+            if d >= ds_min:
+                out.append(w)
+                last_xy = (w.x_m, w.y_m)
+        # always keep the last horizon point
+        tail = wpnts[-1]
+        d_tail = math.hypot(tail.x_m - last_xy[0], tail.y_m - last_xy[1])
+        if d_tail >= ds_min or len(out) < 2:
+            out.append(tail)
+        else:
+            out[-1] = tail
+        return out
 
     @staticmethod
     def _wpnt_copy(w):
@@ -3799,6 +4588,9 @@ class MPCPlannerStateNode:
                 'L2': round(float(getattr(self, '_last_continuity_L2', 0.0)), 4),
                 'applied': bool(getattr(self, '_last_path_blend_applied', False)),
             },
+            ### HJ : 2026-04-28 — expose plan name in tick_json for analysis.
+            'plan': (self._last_plan.get('name')
+                     if getattr(self, '_last_plan', None) else None),
         }
 
         try:

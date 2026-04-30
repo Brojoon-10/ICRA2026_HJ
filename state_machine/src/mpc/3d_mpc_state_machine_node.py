@@ -349,13 +349,31 @@ class StateMachine:
             "state_machine/rc_exit_hyst_ticks", 2)
         self._rc_exit_streak = 0
 
+        ### HJ : 2026-05-01 — sustain-fail hysteresis.
+        ### Bag 2026-04-30-19-05-41 showed RECOVERY ↔ GB toggling in
+        ### 80-150 ms bursts: ego_n ~0.8m (way off raceline) yet SM
+        ### popped into GB for one tick because _check_on_spline's
+        ### min_dist oscillated around the threshold as MPC published
+        ### a fresh recovery trajectory each tick. We now require K
+        ### consecutive sustain=False ticks before falling out of
+        ### RECOVERY. Mirrors _rc_exit_streak's pattern.
+        self._rc_sustain_fail_K = rospy.get_param(
+            "state_machine/rc_sustain_fail_K", 5)
+        self._rc_sustain_fail_streak = 0
+
         # ### HJ : 2026-04-25 — trailing gap measured along local_wpnts
         # (actual driven path arc length) instead of raceline global s.
         # Handled entirely in SM by rewriting trailing_targets[i].s_center
         # before publish; controller PID math unchanged. Toggle off to
         # revert to legacy global-s behaviour.
+        # 2026-04-28: reverted to default False — the rewrite was dropping
+        # trailing targets when obs_idx <= ego_idx (cartesian projection),
+        # which fires whenever ego is laterally close to the obstacle (the
+        # MPC PASS scenario). Drop → controller has no opponent → trailing
+        # PID off → ego does not slow when alongside obstacle → contact.
+        # Pass `state_machine/trailing_gap_local_arc:=true` to re-enable.
         self._trailing_gap_local_arc = bool(rospy.get_param(
-            "state_machine/trailing_gap_local_arc", True))
+            "state_machine/trailing_gap_local_arc", False))
 
         # ### HJ : 2026-04-25 — OT sustainability / entry uses xy Euclidean
         # min-distance from obstacle to any wpnt on MPC path, instead of
@@ -743,6 +761,15 @@ class StateMachine:
 
                 if gap < horizon:
                     obstacles_in_interest.append(obs)
+                # ### HJ : 2026-04-28 — ttc-based encounter-window filter
+                # tried and reverted. User bag (2026-04-28-14-54-57)
+                # showed 437 SM state transitions in 50.7s
+                # (TRAILING ↔ GB_TRACK toggling at ~50Hz) because obs.vs
+                # noise (KF estimate spike from ~1.0 to ~3.5 m/s within
+                # 0.05s) made closure rate cross the ttc threshold every
+                # tick. Plain gap-only filter is more stable. ttc-based
+                # filtering needs an obs.vs smoother first (Step 7 in
+                # the redesign plan).
 
             self.obstacles_in_interest = obstacles_in_interest
         # ===== HJ ADDED END =====
@@ -951,13 +978,22 @@ class StateMachine:
             return loose
 
     def _check_close_to_raceline_heading(self, threshold_deg=None) -> bool:
-
-        cloest_wpnt_idx = int(self.cur_s / self.waypoints_dist)%self.num_glb_wpnts
+        ### HJ : 2026-05-01 — heading bug fix.
+        ### Pre-fix code did `|self.cur_d| < deg2rad(threshold_deg)` in the
+        ### `else` branch — that compared lateral offset (m) to a heading
+        ### threshold cast to radians, so the function never actually
+        ### inspected heading and `close_to_gb` lost one of its two
+        ### intended conditions. Bag 2026-04-30-19-05-41 showed SM toggling
+        ### between GB ↔ RECOVERY purely on |n| even though heading was
+        ### way off raceline. Now both branches compare ψ against ψ.
+        cloest_wpnt_idx = int(self.cur_s / self.waypoints_dist) % self.num_glb_wpnts
         cloest_wpnt_psi = self.cur_gb_wpnts.list[cloest_wpnt_idx].psi_rad
-        if threshold_deg is None:
-            return np.abs(self.current_position[2] - cloest_wpnt_psi) < np.deg2rad(20)
-        else:
-            return np.abs(self.cur_d) < np.deg2rad(threshold_deg)
+        deg = threshold_deg if threshold_deg is not None else 20
+        threshold = np.deg2rad(deg)
+        dpsi = self.current_position[2] - cloest_wpnt_psi
+        # wrap to [-pi, pi] so heading comparison works around ±π
+        dpsi = (dpsi + np.pi) % (2 * np.pi) - np.pi
+        return np.abs(dpsi) < threshold
 
     # ===== ORIGINAL FUNCTION (before HJ modification) =====
     # def _check_ot_sector(self) -> bool:
@@ -1513,6 +1549,8 @@ class StateMachine:
             xy_clearance_m = getattr(self, '_xy_clearance_m', 0.25)
         obstacles = self.cur_obstacles_in_interest
         if not obstacles:
+            wpnts_data.closest_target = None
+            wpnts_data.closest_gap = None
             return True   # no obs → path is free
         arr = wpnts_data.array   # (M, 4) [x, y, s, d]
         if arr is None or len(arr) == 0:
@@ -1521,6 +1559,9 @@ class StateMachine:
         ego_s = self.cur_s
         tl = self.track_length
         half_ego = getattr(self, 'gb_ego_width_m', 0.30) / 2.0
+        is_free = True
+        closest_obs = None
+        min_gap = None
         for obs in obstacles:
             obs_s = obs.s_center
             gap = (obs_s - ego_s) % tl
@@ -1531,8 +1572,18 @@ class StateMachine:
             min_dist = float(np.min(np.linalg.norm(dxy, axis=1)))
             free = min_dist - float(obs.size) / 2.0 - half_ego
             if free < xy_clearance_m:
-                return False
-        return True
+                is_free = False
+                if closest_obs is None or (min_gap is not None and min_gap > gap):
+                    closest_obs = obs
+                    min_gap = gap
+                elif closest_obs is None:
+                    closest_obs = obs
+                    min_gap = gap
+        # NEW 2026-04-28: set closest_target so downstream get_farthest_target /
+        # trailing PID has the opponent to follow (parity with _check_free_frenet).
+        wpnts_data.closest_target = closest_obs
+        wpnts_data.closest_gap = min_gap
+        return is_free
 
     def _check_overtaking_mode_sustainability(self) -> bool:
         if self.static_overtaking_mode:
@@ -2004,14 +2055,13 @@ class StateMachine:
         self.behavior_strategy.trailing_targets = kept
 
     def _pub_local_wpnts(self, wpts):
-        mrks = MarkerArray()
+        ### HJ : merge DELETEALL into the same MarkerArray to halve publish rate
+        loc_markers = MarkerArray()
         del_mrk = Marker()
         del_mrk.header.stamp = rospy.Time.now()
         del_mrk.action = Marker.DELETEALL
-        mrks.markers.append(del_mrk)
-        self.vis_loc_wpnt_pub.publish(mrks)
+        loc_markers.markers.append(del_mrk)
 
-        loc_markers = MarkerArray()
         loc_wpnts = WpntArray()
         loc_wpnts.wpnts = wpts
         loc_wpnts.header.stamp = rospy.Time.now()
@@ -2040,11 +2090,6 @@ class StateMachine:
             mrk.pose.position.z = wpnt.z_m
             mrk.pose.orientation.w = 1
             loc_markers.markers.append(mrk)
-
-        # if len(loc_wpnts.wpnts) == 0:
-        #     rospy.logwarn(f"[{self.name}] No local waypoints published...")
-        # else:
-
 
         self.loc_wpnt_pub.publish(loc_wpnts)
         self.vis_loc_wpnt_pub.publish(loc_markers)
@@ -2333,6 +2378,34 @@ class StateMachine:
                     closest_target = self.cur_start_wpnts.closest_target
                     local_wpnts_src = StateType.START
                 return [closest_target], local_wpnts_src
+
+            # ### HJ : 2026-04-29 — OVERTAKE branch (was missing).
+            # ObstacleTransition_GBMode returns (TRAILING, OVERTAKE) when
+            # avoidance_wpnts is fresh and from_mpc — that's the path
+            # source the controller will follow. The trailing PID still
+            # needs an opponent (closest_target) so that the controller
+            # actually slows down behind the car. Without this branch,
+            # the function fell through to "return [], ..." and the
+            # controller saw self.opponent = None during TRAILING with
+            # an OT path → trailing PID inactive → ego accelerated into
+            # the obstacle. User report (2026-04-29): "OT 경로로
+            # trailing할때 trailing 타겟이 안들어가".
+            if local_wpnts_src == StateType.OVERTAKE:
+                # 1) prefer the obstacle that the avoidance path sees
+                #    threatening it (closest_target set inside _check_free_*)
+                if self.cur_avoidance_wpnts.closest_target is not None:
+                    return [self.cur_avoidance_wpnts.closest_target], local_wpnts_src
+                # 2) fall back to the s-nearest obstacle from
+                #    obstacles_in_interest. TRAILING was triggered, so by
+                #    definition there IS an obstacle worth tracking.
+                if self.cur_obstacles_in_interest:
+                    nearest = min(self.cur_obstacles_in_interest,
+                                  key=lambda o: (o.s_start - self.cur_s) % self.track_length)
+                    return [nearest], local_wpnts_src
+                # 3) GB path's view is the last fallback (still better
+                #    than empty when all caches are stale)
+                if self.cur_gb_wpnts.closest_target is not None:
+                    return [self.cur_gb_wpnts.closest_target], local_wpnts_src
         # ===== HJ MODIFIED END =====
 
         return [], local_wpnts_src
@@ -2440,13 +2513,10 @@ class StateMachine:
         self.behavior_strategy.need_vel_planner = need_vel_planner
         # self.behavior_strategy.need_vel_planner = False
 
-        # ### HJ : 2026-04-25 — rewrite trailing_targets[i].s_center so the
-        # controller's `(opp_s - ego_s) % track_length` PID math reads ARC
-        # LENGTH along the currently-driven local_wpnts instead of global
-        # raceline s-difference. No controller / msg change needed; other
-        # consumers (SM viz) only read x_m/y_m. Global s is preserved in
-        # original obstacle sources; we only rewrite the copy stored in
-        # behavior_strategy.trailing_targets.
+        # ### HJ : 2026-04-25 — rewrite trailing_targets[i].s_center to local
+        # arc length. Default toggled OFF 2026-04-28 (see __init__). The
+        # call is gated by self._trailing_gap_local_arc; left here so the
+        # toggle still works without code edits.
         self._rewrite_trailing_to_local_arc()
 
         self.behavior_strategy_pub.publish(self.behavior_strategy)
