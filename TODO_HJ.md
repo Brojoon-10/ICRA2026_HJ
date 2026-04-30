@@ -84,7 +84,48 @@
 - [ ] **TRAIL per-k v cap 개선** — 현재 `ref_v` + 물리 deceleration ramp만 적용, 장애물 가속/감속 예측은 미포함 (GP predictor 연결은 후순위)
 - [ ] **합격 시 Phase X 진입** — `_observation` suffix 제거, state_machine 직결 (사용자 승인 필수)
 
-### 2.3 SQP (3d_sqp_avoidance_node) — 베이스라인 유지
+### 2.3 MPC overtake 재설계 — **architecture 결함 fix (2026-04-28 발견)**
+
+> 진단·논의 출처: 본 세션 (2026-04-28). 24-26일 plan_picker / scoring 수정으로 long_qnt15 7 events / 600s 까지 축소했으나 stack architecture-level 결함 두 가지가 본질적 root cause임이 확인됨.
+> **상세 수정 계획: `HJ_docs/mpc_overtake_redesign_plan_20260428.md`**
+
+**확인된 결함**:
+- A. `_apply_speed_painter` 가 MPC NLP 의 plan-aware `v[k]` 를 publish 직전에 vel planner GB raceline vx 로 **완전히 덮어씀** → MPC trailing 속도 의도가 시스템 밖으로 안 나감.
+- B. Trailing 의 유일한 obstacle 인식 = controller TRAILING PID. ggv / curvature 무시. opponent가 SM 의 `_check_free_*` 부산물로만 set → path free 시 None → 충돌 시점 trailing 꺼지는 case.
+
+**적용 완료 (2026-04-28)**:
+- [x] **Step 2 — `_rewrite_trailing_to_local_arc` default OFF** — `obs_idx ≤ ego_idx` drop 부작용 제거. legacy global-s trailing gap 으로 복귀. rosparam `state_machine/trailing_gap_local_arc`.
+- [x] **Step 3 — `_check_free_xy` 가 closest_target 도 set** — frenet 버전과 행동 일치. MPC OT path 평가에서 trailing target 누락 case 제거.
+- [x] sticky bonus 부호 버그 fix, snapshot-only d_free, q_n_target 8→15 (Stage 2 Phase 2-2 누적, long_qnt15 best 7 events / 600s)
+- [x] ~~**Step 1 — ttc-based encounter window**~~ → **2026-04-28 revert**. 사용자 bag 분석: obs.vs spike (KF noise, 0.05s 만에 1.0↔3.5 m/s) 가 closure rate 를 ttc 임계값 (3s) 근처에서 진동시켜 obstacles_in_interest 가 in/out 토글 → SM state TRAILING↔GB_TRACK 437 transitions/50.7s (≈8.6/sec). path 번쩍거림 + ego/obs 매칭 망가짐 → 충돌. ttc filter 는 obs.vs smoother (Step 7) 우선 적용 후 재시도.
+- [x] ~~**Step 4 — `_post_process_speed` plan-aware override**~~ → **2026-04-28 revert**. 사용자 bag 분석: TRAIL plan 시 painter cap=`obs.vs-0.3≈1.5 m/s` 적용했으나, 직후 ego_v continuity ramp (`capped[0] = clip(capped[0], ego_v±0.15)`) 가 `capped[0]` 을 ego_v(3.8) 근처로 강제 → controller 가 받는 wpnts[0].vx_mps = 3.95 → ego brake 안 함 → obstacle 따라잡으며 충돌 (50.7s 에 6 events). 진짜 fix 는 painter 의 `a_max` 를 plan-aware (TRAIL 시 더 큰 brake 허용) 하거나 Step 4-alt (MPC v 직접 사용) 로.
+
+**적용 대기 (우선순위 순)**:
+- [ ] **Step 4 — `_apply_speed_painter` plan-aware override (결함 A 1차 fix)** — TRAIL 시 `obs.vs - 0.3` cap 추가. 기존 painter 의 안전 마진 유지하면서 MPC trailing 속도 의도가 trajectory.vx_mps 까지 살아남도록.
+- [ ] **Step 5 — Controller TRAILING PID off (결함 B fix)** — Step 4 후 안전. `Controller.py:537-557` 의 trailing 분기 제거. trajectory.vx_mps 충실 추적. **Step 4 안 되면 단독 적용 시 trailing 자체 사라져 즉시 충돌**.
+- [ ] **Step 6 — GP timestep-별 obs trajectory 활용 + interpolation/filter** — 현재 `_merge_obs_sources` 가 GP horizon msgs 중 timestep 0 만 사용 → vd 상수 propagate. GP 의 oscillation 학습 0% 활용. timestep-별 (s, n, vs, vd) 직접 obs_arr 에 fill + missing/noise robust handling.
+- [ ] **Step 7 — 상대 속도 (obs.vs) tracking-only 분석 + filtering** — **truth 와 비교 절대 X (사용자 명령 2026-04-28)**. tracking topic 시계열만 보고 spike 판정. rolling median (5 tick) 또는 EMA + delta vs 임계 reject.
+- [ ] **Step 8 — Multi-modal hand-crafted hypothesis (plan_scorer)** — LEFT/RIGHT_PASS plan 평가 시 obstacle 의 가능 행동 (stay / drift LEFT / drift RIGHT) 각각 d_free 계산 후 weighted/worst-case score. GP single-mode 보완.
+- [ ] **Step 9 — frenet_kin_solver 에 ggv polar constraint 추가 (옵션 GGV-B)** — `(a_x/a_max)^2 + (a_y/ay_max)^2 ≤ 1`, ay_max 는 sector mu 따라 동적. kinematic bicycle 유지.
+
+**Stage 3+ 후보 (큰 작업)**:
+- [ ] **Step 10 — ggv-based single-track MPC backend (옵션 GGV-A)** — 새 파일 `planner/mpc_planner/src/ggv_singletrack_solver.py`. `solver_backend='ggv_singletrack'` 으로 swap. **단순 분석 결과 (2026-04-28): 자산 다 있음 — `planner/3d_gb_optimizer/fast_ggv_gen/output/<vehicle>/{vehicle,velocity}_frame/*.npy` (ax_max, ay_max, gg_exponent, alpha_list, g_list, v_list), `fbga_velocity_planner.py` (raceline baseline GGV-aware vx), `3d_gb_optimizer/global_line/` (Mintime + GGV global line)**. CasADi `interpolant('ax_max','bspline',[v,g,α], npy)` 로 wrapping → NLP 안에서 polar constraint 적용. single-track dynamics (linear 또는 pacejka tire) 통합. 작업 3-4일 (npy 로딩 + interpolant + dynamics + JIT + 검증). 위험: NLP nonlinear 증가 → solve 시간 30-50ms / infeasibility 빈도 가능.
+- [ ] **Step 11 — MPC solver 의 plan-aware directional obstacle cost** — 현재 Gaussian bubble direction-agnostic → ego wrong-side 시작 시 cross 비용 무한대 → publish path 자체 lateral shift 부족. plan_side 따라 obstacle 한쪽만 push.
+- [ ] **Step 12 — Strategic plan timing (close trail → opportunity → commit)** — reactive plan_picker → multi-stage 의도 표현. plan_scorer 에 opportunity score (코너 진입, brake, dv 큼 등) + commit dwell.
+
+**검증 protocol** (각 Step 후):
+1. ego s=0 spawn (`scripts/spawn_ego_s0.sh`)
+2. obstacle_publisher + MPC 재기동
+3. 10분 bag (`rosbag record -O <step>_long --duration=600 ...`)
+4. `analyze_long_bag.py` + `coll_plan_breakdown.py`
+5. 결과 row 추가: `HJ_docs/debug/0428_debug/work_log/stage2_phase22_progress_20260428.md`
+
+**절대 금지** (사용자 강조 2026-04-28):
+- Tracking 노이즈 분석에 truth 사용 금지 (`/tracking/obstacles_truth` 비교 X). 실제 환경에서 truth 없음.
+- MPC ref_v 의도 우회 / 덮어쓰기 — solver 풀이 결과 살리는 방향만.
+- layer 별 단편 fix 만 누적 — architecture 결함 (A, B) 풀고 가야.
+
+### 2.4 SQP (3d_sqp_avoidance_node) — 베이스라인 유지
 - [ ] **회귀 유지**: HJ 백엔드 튜닝 중 SQP가 여전히 gazebo_wall_2에서 무고장 동작하는지 정기 확인
 - [ ] Track3DValidator 실패 시 `past_avoidance_d` 리셋 로직 검증 (회피 불가 → 빈 OTWpntArray 발행)
 
@@ -155,6 +196,8 @@
 
 ## 5. 장기 / 판단 보류
 
+- [x] **`/local_waypoints/markers` 165Hz → 80Hz (2026-04-30)** — `_pub_local_wpnts()`가 DELETEALL marker를 별도 publish하는 패턴이라 state_machine 80Hz loop마다 publish 2번 (실측 165Hz). DELETEALL을 동일 MarkerArray의 첫 element로 합쳐 publish 1회로 정리. 파일: `state_machine/src/mpc/3d_mpc_state_machine_node.py:_pub_local_wpnts`. 동일 함수 다른 marker는 정상. 효과: cross-host packet rate 감소(특히 70.9에 rviz subscriber 다수일 때 N배 영향). 평균/spike ping과의 인과는 별개 — packet rate ↔ ping correlation 측정 r²=0.008로 직접 변동 원인은 미확정 상태.
+- [x] **wifi cross-host ping 평균 ~3ms 영구 적용 (2026-05-01)** — gazebo(70.9) ↔ stack(70.2) cross-host TCPROS가 wifi airtime 점유 시 ping 평균 7~10ms / max 200~280ms spike 발생. 원인은 (a) Linux `tcp_rto_min=200ms` 기본값 (TCP loss 시 spike 폭 결정), (b) mac80211 BE 큐 saturation/큐잉, (c) AX211 BT coex jitter. 4단계 ablation으로 효과 분리: WMM Voice queue (DSCP EF, ICMP만) **-3.22ms**, RTO_min 50 (spike 200대→50대), BT off (-0.38ms, 사실상 noise). 적용 결과 평균 **2.39ms / max 70ms / >100ms 0건** (60s ping 300packets 기준). cross-host TCP까지 EF로 보내면 voice 큐 saturate → 오히려 악화 (ablation으로 검증, ping max 189ms 발생) → 의도적으로 ICMP만 EF, ROS는 BE 큐 유지. 영구 hook: `/etc/NetworkManager/dispatcher.d/99-wifi-tune` (NetworkManager가 wifi up/DHCP 마다 자동 재적용). bashrc 함수: `wifitune-on / -off / -status` (`~/.bashrc`의 `# >>> HJ wifi tune <<<` 블록). 다른 머신 호환: dispatcher script + bashrc 둘 다 default route iface/subnet/src IP 자동 감지, hardcoded 없음. 환경변수 `WIFITUNE_IFACE`, `WIFITUNE_SUBNET`로 override 가능. 70.9에 같은 변경 적용은 **무효** (효과 없음 확인됨, 70.2 측만 유지). 남은 50~100ms 단발 spike (1% 미만)는 클라이언트 측에서 못 잡는 영역 — AP↔70.9 hop, AP 펌웨어, RF 환경 본질.
 - [ ] **경사면 속도 보상** — `mu_rad` 기반 속도 커맨드 보정 (controller or vel_planner)
 - [ ] **Controller nearest_waypoint 3D 전환** — 현재 local 내부 검색이라 2D로 충분하나 경로 겹침 시 필요
 - [ ] **시각화 마커 z 반영** — sector_server 등 z=0 하드코딩 수정 (controller 마커는 완료)
@@ -177,6 +220,8 @@
   - `HJ_docs/mpc_planner_state_machine_integration.md` — MPCC state-aware 통합 플랜 (기존 Phase 계획, 재설계로 일부 대체됨)
   - **`HJ_docs/mpc_redesign_frenet_kin_20260420.md` — Frenet kinematic MPC 재설계 (기반 설계)**
   - **`HJ_docs/mpc_frenet_kin_v3c_live_debugging_20260421.md` — v3c live-debug 세션 (현행, 1997-tick validation + obs TODO)**
+  - **`HJ_docs/mpc_overtake_redesign_plan_20260428.md` — MPC overtake architecture 결함 진단 + 9 Step 수정 계획 (현행)**
+  - `HJ_docs/debug/0428_debug/work_log/stage2_phase22_progress_20260428.md` — Stage 2 Phase 2-2 진행 / 시도/롤백 누적 (long_qnt15 best 7 events)
   - `HJ_docs/3d_dynamic_prediction_and_planner.md` — 3D prediction + SQP 포팅 (베이스라인 참고)
 - IY 작업분 (HJ는 참고만):
   - `IY_docs/rolling_horizon_overtake_planner.md`, `IY_docs/TODO_HJ.md`
