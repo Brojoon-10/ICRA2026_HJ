@@ -26,7 +26,6 @@ include_directories(
 
 catkin_install_python(PROGRAMS
   src/fast_sqp_planner_node.py
-  src/fast_sqp_planner_sm.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

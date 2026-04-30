@@ -9,3 +9,6 @@ ot_engage_ttc_s: 1.0
 ot_engage_min_m: 5.0
 overtaking_ttl_sec: 0.5
 opponent_dist_threshold: 0.8
+### IY : trailing trigger — lateral margin + s-gap based
+ot_margin_safe_m: 0.15
+ot_blocking_s_gap_m: 0.5

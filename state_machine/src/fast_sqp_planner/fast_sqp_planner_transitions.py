@@ -36,6 +36,16 @@ def _has_obs_nearby(sm) -> bool:
     return False
 
 
+### IY : obstacle is blocking ahead (not beside/behind)
+def _has_obs_blocking_ahead(sm, min_s_gap: float = 0.5) -> bool:
+    """True only if obstacle center is > min_s_gap ahead in s-direction."""
+    for obs in sm.cur_obstacles_in_interest:
+        gap = (obs.s_center - sm.cur_s) % sm.track_length
+        if gap < sm.track_length / 2 and gap < sm.interest_horizon_m and gap > min_s_gap:
+            return True
+    return False
+
+
 def GlobalTrackingTransition(state_machine) -> Tuple[StateType, StateType]:
     """GB_TRACK state transitions."""
     ot_sector = state_machine._check_ot_sector()
@@ -70,10 +80,17 @@ def OvertakingTransition(state_machine) -> Tuple[StateType, StateType]:
     has_nearby = _has_obs_nearby(state_machine)
     ot_sector = state_machine._check_ot_sector()
     path_collision = state_machine._check_ot_path_collision()
-    too_close = state_machine._opponent_dist < state_machine._opponent_dist_threshold
+    # too_close = state_machine._opponent_dist < state_machine._opponent_dist_threshold
+    ### IY : lateral margin replaces raw euclidean too_close
+    ot_margin = state_machine._get_ot_path_min_margin()
+    too_close = ot_margin < state_machine.ot_margin_safe_m
 
-    # obstacle ahead + path collision or too close → TRAILING
-    if has_ahead and (path_collision or too_close):
+    # # obstacle ahead + path collision or too close → TRAILING
+    # if has_ahead and (path_collision or too_close):
+    #     return StateType.TRAILING, StateType.OVERTAKE
+    ### IY : only trigger trailing when obstacle is blocking ahead (not beside)
+    has_blocking = _has_obs_blocking_ahead(state_machine, state_machine.ot_blocking_s_gap_m)
+    if has_blocking and (path_collision or too_close):
         return StateType.TRAILING, StateType.OVERTAKE
 
     # ot_flag turned off → back to GB
@@ -124,7 +141,10 @@ def TrailingTransition(state_machine) -> Tuple[StateType, StateType]:
     # obstacle ahead + path clear → back to OVERTAKE
     if has_ahead and ot_sector and state_machine._ot_iy_wpnts is not None:
         path_collision = state_machine._check_ot_path_collision()
-        too_close = state_machine._opponent_dist < state_machine._opponent_dist_threshold
+        # too_close = state_machine._opponent_dist < state_machine._opponent_dist_threshold
+        ### IY : lateral margin replaces raw euclidean too_close
+        ot_margin = state_machine._get_ot_path_min_margin()
+        too_close = ot_margin < state_machine.ot_margin_safe_m
         if not path_collision and not too_close:
             return StateType.OVERTAKE, StateType.OVERTAKE
 

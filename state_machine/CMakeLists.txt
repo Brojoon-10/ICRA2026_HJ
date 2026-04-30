@@ -170,6 +170,14 @@ include_directories(
 #   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 # )
 
+## IY : install fast_sqp_planner state machine + transitions
+## (single source lives here; consumers rosrun via pkg=state_machine)
+catkin_install_python(PROGRAMS
+  src/fast_sqp_planner/fast_sqp_planner_sm.py
+  src/fast_sqp_planner/fast_sqp_planner_transitions.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 ## Mark executables for installation
 ## See http://docs.ros.org/melodic/api/catkin/html/howto/format1/building_executables.html
 # install(TARGETS ${PROJECT_NAME}_node
