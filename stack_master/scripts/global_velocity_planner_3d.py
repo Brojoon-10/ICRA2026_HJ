@@ -115,11 +115,21 @@ class VelocityPlanner:
             return
         self.dyn_reconfig_changed = True
 
+    ## IY : locate ggv velocity_frame dir for slope_ax_scale.npy meta
+    def _resolve_ggv_meta_dir(self):
+        base = os.path.join(
+            RosPack().get_path('stack_master'),
+            '..', '..', 'planner', '3d_gb_optimizer', 'global_line', 'data',
+            'gg_diagrams', self.racecar_version, 'velocity_frame')
+        return os.path.normpath(base)
+    ## IY : end
+
     def _load_vel_planner_params(self):
         """Load vel planner params from yaml file"""
+        params = {}
         if os.path.exists(self.vel_planner_yaml):
             with open(self.vel_planner_yaml) as f:
-                params = yaml.safe_load(f)
+                params = yaml.safe_load(f) or {}
             self.v_max = params.get('v_max', 12.0)
             self.ax_max_motor = params.get('ax_max_motor', 5.0)
             self.ax_max_brake = params.get('ax_max_brake', 7.0)
@@ -143,6 +153,25 @@ class VelocityPlanner:
             self.slope_correction = 1.0
             self.slope_brake_margin = 0.0
             self.slope_brake_vmax = 5.0
+
+        ## IY : auto-pair slope_correction with ggv meta if yaml does not specify
+        if 'slope_correction' not in params:
+            try:
+                meta_dir = self._resolve_ggv_meta_dir()
+                sas_path = os.path.join(meta_dir, 'slope_ax_scale.npy')
+                es_path  = os.path.join(meta_dir, 'enable_slope.npy')
+                if os.path.isfile(sas_path):
+                    sas = float(np.load(sas_path))
+                    self.slope_correction = max(0.0, 1.0 - sas)
+                    rospy.loginfo(
+                        f'[VelPlanner3D] auto-paired: slope_ax_scale={sas:.2f} '
+                        f'-> slope_correction={self.slope_correction:.2f}')
+                elif os.path.isfile(es_path):
+                    self.slope_correction = 0.0
+                    rospy.loginfo('[VelPlanner3D] partial meta -> slope_correction=0.0')
+            except Exception as e:
+                rospy.logwarn(f'[VelPlanner3D] auto-pair failed: {e} -> keep default')
+        ## IY : end
 
     def _apply_params_to_ggv(self):
         """Apply current params to ggv/ax_max tables"""
