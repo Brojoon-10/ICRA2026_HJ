@@ -53,24 +53,24 @@ int main() {
   // };
   // auto gg_range_min = [mu_y, g](GG::real v) -> GG::real { return -mu_y * g; };
   // auto gg_range_max = [mu_y, g](GG::real v) -> GG::real { return +mu_y * g; };
-  // IY : add g_apparent argument (unused here, flat track) for compatibility with new 3D API
-  auto GG_shape1 = [mu_x, mu_y, g](GG::real ay, GG::real v, GG::real /*g_apparent*/) -> GG::real {
+  // IY : add g_apparent + slope arguments (unused here, flat track) for compatibility with new 3D API + option A
+  auto GG_shape1 = [mu_x, mu_y, g](GG::real ay, GG::real v, GG::real /*g_apparent*/, GG::real /*slope*/) -> GG::real {
     // Simple friction circle upper bound
     GG::real ay_norm = ay / g;
     return g * std::sqrt(-ay_norm*ay_norm + mu_y*mu_y)*mu_x/mu_y;
   };
 
-  auto GG_shape2 = [mu_x, mu_y, g](GG::real ay, GG::real v, GG::real /*g_apparent*/) -> GG::real {
+  auto GG_shape2 = [mu_x, mu_y, g](GG::real ay, GG::real v, GG::real /*g_apparent*/, GG::real /*slope*/) -> GG::real {
     // Simple friction circle lower bound
     GG::real ay_norm = ay / g;
     return -g * std::sqrt(-ay_norm*ay_norm + mu_y*mu_y)*mu_x/mu_y;
   };
 
-  auto gg_range_min = [mu_y, g](GG::real v, GG::real /*g_apparent*/) -> GG::real {
+  auto gg_range_min = [mu_y, g](GG::real v, GG::real /*g_apparent*/, GG::real /*slope*/) -> GG::real {
     return -mu_y * g;
   };
 
-  auto gg_range_max = [mu_y, g](GG::real v, GG::real /*g_apparent*/) -> GG::real {
+  auto gg_range_max = [mu_y, g](GG::real v, GG::real /*g_apparent*/, GG::real /*slope*/) -> GG::real {
     return +mu_y * g;
   };
   // IY : end

@@ -30,10 +30,11 @@ namespace GG
 //   std::function<real(real)> max = nullptr;
 // };
 // IY : add g (apparent gravity) argument for 3D track support
+// IY : add slope argument for 3D ggv slope-aware lookup (option A — propagate slope to FWBW lambda call sites)
 using gg_range_max_min = struct gg_range_max_min
 {
-  std::function<real(real, real)> min = nullptr;   // (v, g)
-  std::function<real(real, real)> max = nullptr;   // (v, g)
+  std::function<real(real, real, real)> min = nullptr;   // (v, g, slope)
+  std::function<real(real, real, real)> max = nullptr;   // (v, g, slope)
 };
 // IY : end
 
@@ -51,11 +52,13 @@ private:
   // std::function<real(real, real)> gg_Upper = nullptr; // Upper bound function
   // std::function<real(real, real)> gg_Lower = nullptr; // Lower bound function
   // IY : add g argument to upper/lower bound functions for 3D track
-  std::function<real(real, real, real)> gg_Upper = nullptr; // Upper bound function (ay, v, g)
-  std::function<real(real, real, real)> gg_Lower = nullptr; // Lower bound function (ay, v, g)
+  // IY : add slope argument for 3D ggv slope-aware lookup (option A)
+  std::function<real(real, real, real, real)> gg_Upper = nullptr; // Upper bound function (ay, v, g, slope)
+  std::function<real(real, real, real, real)> gg_Lower = nullptr; // Lower bound function (ay, v, g, slope)
   // IY : end
   // HJ : gg_exponent function for Vmax mu correction with exact diamond constraint
-  std::function<real(real, real)> gg_Exp = nullptr;  // (v, g) -> exponent p
+  // IY : add slope argument for 3D ggv slope-aware lookup (option A)
+  std::function<real(real, real, real)> gg_Exp = nullptr;  // (v, g, slope) -> exponent p
   gg_range_max_min gg_range;     // Range of the curvature (struct with min and max functions)
   brentdekker BD;                // Solver
   solver_params solver_p;        // Solver parameters
@@ -81,11 +84,12 @@ public:
   // );
   // IY : extend gg_Upper/gg_Lower signatures with g argument
   // HJ : add gg_Exp for Vmax mu correction
+  // IY : extend lambda signatures with slope argument for 3D ggv slope-aware lookup (option A)
   FWBW(
-    const std::function<real(real, real, real)> &gg_Upper,
-    const std::function<real(real, real, real)> &gg_Lower,
+    const std::function<real(real, real, real, real)> &gg_Upper,
+    const std::function<real(real, real, real, real)> &gg_Lower,
     const gg_range_max_min &gg_range,
-    const std::function<real(real, real)> &gg_Exp = nullptr
+    const std::function<real(real, real, real)> &gg_Exp = nullptr
   );
   // IY+HJ : end
   // main methods
@@ -113,12 +117,14 @@ public:
   // compute the distance with sign.
   // [[nodiscard]] real signed_distance(real ax, real ay, real v) const;
   // IY : add g argument
-  [[nodiscard]] real signed_distance(real ax, real ay, real v, real g) const;
+  // IY : add slope argument for 3D ggv slope-aware lookup (option A)
+  [[nodiscard]] real signed_distance(real ax, real ay, real v, real g, real slope) const;
   // IY : end
   // check if a point is in the range
   // [[nodiscard]] bool is_in_range(real ax, real ay, real v) const;
   // IY : add g argument
-  [[nodiscard]] bool is_in_range(real ax, real ay, real v, real g) const;
+  // IY : add slope argument for 3D ggv slope-aware lookup (option A)
+  [[nodiscard]] bool is_in_range(real ax, real ay, real v, real g, real slope) const;
   // IY : end
   // evaluation
   void evaluate(

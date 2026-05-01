@@ -194,9 +194,8 @@ GGTable read_gg_binary(const std::string& path) {
 struct GGModel {
   std::function<GG::real(GG::real, GG::real, GG::real, GG::real)> upper;   // (ay, v, g, slope) -> ax_max
   std::function<GG::real(GG::real, GG::real, GG::real, GG::real)> lower;   // (ay, v, g, slope) -> ax_min
-  GG::gg_range_max_min range;                                    // (v, g) -> ay_min/max
-  std::function<GG::real(GG::real, GG::real)> exp_func;          // HJ : (v, g) -> exponent p
-  bool slope_aware = false;
+  GG::gg_range_max_min range;                                    // (v, g, slope) -> ay_min/max  // IY : option A
+  std::function<GG::real(GG::real, GG::real, GG::real)> exp_func; // HJ+IY : (v, g, slope) -> exponent p
 };
 
 GGModel make_lookup(const VehicleParams& /*params*/, const GGTable& tbl) {
@@ -218,15 +217,17 @@ GGModel make_lookup(const VehicleParams& /*params*/, const GGTable& tbl) {
                                GG::real(1.0) / p);
     return ax_min_val * factor;
   };
+  // IY : option A — propagate slope to range/exp_func lambdas as well
   GG::gg_range_max_min range{
-    [&tbl](GG::real v, GG::real g) { return -tbl.ay_max_at(v, g); },
-    [&tbl](GG::real v, GG::real g) { return  tbl.ay_max_at(v, g); }
+    [&tbl](GG::real v, GG::real g, GG::real slope) { return -tbl.ay_max_at(v, g, slope); },
+    [&tbl](GG::real v, GG::real g, GG::real slope) { return  tbl.ay_max_at(v, g, slope); }
   };
   // HJ : exponent function for Vmax mu correction
-  auto exp_func = [&tbl](GG::real v, GG::real g) -> GG::real {
-    return tbl.gg_exp_at(v, g);
+  // IY : option A — propagate slope
+  auto exp_func = [&tbl](GG::real v, GG::real g, GG::real slope) -> GG::real {
+    return tbl.gg_exp_at(v, g, slope);
   };
-  return {upper, lower, range, exp_func, tbl.n_s > 1};
+  return {upper, lower, range, exp_func};
 }
 // IY+HJ : end Step B/C/D/E
 

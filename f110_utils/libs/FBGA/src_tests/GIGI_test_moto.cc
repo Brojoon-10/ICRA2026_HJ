@@ -232,23 +232,23 @@ int main(int argc, char *argv[])
   // auto gg_range_max = [&aero_data](GG::real v) -> GG::real {
   //   return +aero_data.mu_Y * aero_data.g * 0.999;
   // };
-  // IY : add g_apparent argument (unused, flat track) for compatibility with new 3D API
-  auto GG_shape1 = [&aero_data](GG::real ay, GG::real v, GG::real /*g_apparent*/) -> GG::real {
+  // IY : add g_apparent + slope arguments (unused, flat track) for compatibility with new 3D API + option A
+  auto GG_shape1 = [&aero_data](GG::real ay, GG::real v, GG::real /*g_apparent*/, GG::real /*slope*/) -> GG::real {
     return std::min(
       std::min(
         ax_max_wheeling(ay, v, aero_data),
         ax_max_adherence(ay, v, aero_data)),
       ax_max_engine(v, aero_data));
   };
-  auto GG_shape2 = [&aero_data](GG::real ay, GG::real v, GG::real /*g_apparent*/) -> GG::real {
+  auto GG_shape2 = [&aero_data](GG::real ay, GG::real v, GG::real /*g_apparent*/, GG::real /*slope*/) -> GG::real {
     return std::max(
       ax_min_stoppie(ay, v, aero_data),
       ax_min_adherence(ay, v, aero_data));
   };
-  auto gg_range_min = [&aero_data](GG::real v, GG::real /*g_apparent*/) -> GG::real {
+  auto gg_range_min = [&aero_data](GG::real v, GG::real /*g_apparent*/, GG::real /*slope*/) -> GG::real {
     return -aero_data.mu_Y * aero_data.g * 0.999;
   };
-  auto gg_range_max = [&aero_data](GG::real v, GG::real /*g_apparent*/) -> GG::real {
+  auto gg_range_max = [&aero_data](GG::real v, GG::real /*g_apparent*/, GG::real /*slope*/) -> GG::real {
     return +aero_data.mu_Y * aero_data.g * 0.999;
   };
   // IY : end
