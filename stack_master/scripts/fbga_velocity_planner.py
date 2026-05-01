@@ -253,14 +253,30 @@ class FBGAVelocityPlanner:
     ## IY : end
 
     def _read_g_range(self):
-        """gg.bin에서 g_list 범위 읽기"""
+        """gg.bin에서 g_list 범위 읽기. 2D/3D 포맷 자동 감지."""
+        ## IY 0430 : 3D gg.bin은 헤더가 (nv, ng, ns) 12바이트.
+        ##           2D 포맷으로만 읽으면 ns 필드가 v_list에 끼어들어 g_list가 깨져
+        ##           g_min≈0이 되고 g_tilde가 전부 0으로 클램프 → FBGA 전 segment NaN.
+        file_size = os.path.getsize(self.gg_bin)
         with open(self.gg_bin, 'rb') as f:
             nv, ng = struct.unpack('II', f.read(8))
-            v_list = np.frombuffer(f.read(nv * 8), dtype=np.float64)
-            g_list = np.frombuffer(f.read(ng * 8), dtype=np.float64)
-        rospy.loginfo(f"[FBGA] GGV range: v=[{v_list.min():.1f},{v_list.max():.1f}], "
-                      f"g=[{g_list.min():.2f},{g_list.max():.2f}]")
+            expected_2d = 8 + 8 * (nv + ng) + 4 * 8 * nv * ng
+            if file_size > expected_2d:
+                # 3D format: read ns next
+                ns = struct.unpack('I', f.read(4))[0]
+                v_list = np.frombuffer(f.read(nv * 8), dtype=np.float64)
+                g_list = np.frombuffer(f.read(ng * 8), dtype=np.float64)
+                rospy.loginfo(
+                    f"[FBGA] GGV range (3D): v=[{v_list.min():.1f},{v_list.max():.1f}], "
+                    f"g=[{g_list.min():.2f},{g_list.max():.2f}], ns={ns}")
+            else:
+                v_list = np.frombuffer(f.read(nv * 8), dtype=np.float64)
+                g_list = np.frombuffer(f.read(ng * 8), dtype=np.float64)
+                rospy.loginfo(
+                    f"[FBGA] GGV range (2D): v=[{v_list.min():.1f},{v_list.max():.1f}], "
+                    f"g=[{g_list.min():.2f},{g_list.max():.2f}]")
         return float(g_list.min()), float(g_list.max())
+        ## IY 0430 : end
 
     def _compute_g_tilde(self, mu, v, dmu_ds):
         """g_tilde = 9.81*cos(mu) - v^2 * dmu/ds, clamped to GGV range"""
