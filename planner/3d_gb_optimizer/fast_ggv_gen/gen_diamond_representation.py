@@ -267,7 +267,17 @@ for frame in ['vehicle', 'velocity']:
 
 ## IY : slope diamond fitting — produces 3D arrays [V_N, g_N, slope_N]
 slope_data_root = os.path.join(gg_diagram_path, vehicle_name, 'slope_data')
-if os.path.isdir(slope_data_root):
+## IY : honor enable_slope meta (skip stale slope_data/ from prior enable_slope=True run)
+enable_slope_meta = True
+_es_meta_path = os.path.join(gg_diagram_path, vehicle_name,
+                              'velocity_frame', 'enable_slope.npy')
+if os.path.isfile(_es_meta_path):
+    try:
+        enable_slope_meta = bool(np.load(_es_meta_path))
+    except Exception:
+        pass
+## IY : end
+if enable_slope_meta and os.path.isdir(slope_data_root):
     print(f'\n[gen_diamond] ===== Slope diamond fitting =====')
     for frame in ['vehicle', 'velocity']:
         slope_frame_dir = os.path.join(slope_data_root, frame + '_frame')
@@ -325,6 +335,8 @@ if os.path.isdir(slope_data_root):
         np.save(os.path.join(main_frame_dir, 'ay_max_3d.npy'), ay_max_3d)
         print(f'[gen_diamond] [{frame}_frame] 3D diamond saved: '
               f'{gg_exp_3d.shape}')
+elif not enable_slope_meta:
+    print(f'[gen_diamond] enable_slope=False meta → skip 3D diamond fitting')
 else:
     print(f'[gen_diamond] No slope_data/ found — 2D only')
 ## IY : end

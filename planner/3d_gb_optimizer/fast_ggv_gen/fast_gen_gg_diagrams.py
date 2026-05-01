@@ -757,6 +757,12 @@ if __name__ == "__main__":
             os.path.join(out_path, frame, "rho.npy"),
             np.asarray(rho_vehicle_frame) if frame == "vehicle_frame" else np.asarray(rho_velocity_frame),
         )
+        ## IY : save meta so gen_diamond/downstream can branch on enable_slope
+        np.save(os.path.join(out_path, frame, "enable_slope.npy"),
+                np.bool_(args.enable_slope))
+        np.save(os.path.join(out_path, frame, "slope_ax_scale.npy"),
+                np.float64(args.slope_ax_scale))
+        ## IY : end
 
     t_total = time.time() - t_build_start
     n_nlp = V_N * g_N * len(alpha_list)
