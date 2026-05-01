@@ -196,6 +196,23 @@ class OvertakingIYNode:
 
         self.converter = self._init_converter()
         self._load_ggv()  # 3D GGV for FBGA velocity profiling
+
+        ## IY : vel_planner_25d tunables — auto-pair slope_correction with ggv unless user overrides
+        self.grip_scale_exp     = float(pp('~grip_scale_exp', 0.7))
+        if rospy.has_param('~slope_correction'):
+            self.slope_correction = float(rospy.get_param('~slope_correction'))
+            rospy.loginfo('[OvertakingIY] slope_correction=%.2f (user override)',
+                          self.slope_correction)
+        else:
+            self.slope_correction = float(self.auto_slope_correction)
+            rospy.loginfo('[OvertakingIY] slope_correction=%.2f (auto-paired)',
+                          self.slope_correction)
+        self.slope_brake_margin = float(pp('~slope_brake_margin', 0.0))
+        self.slope_brake_vmax   = float(pp('~slope_brake_vmax', 5.0))
+        ## IY : final velocity profile uniform scale (rqt-tunable, applied at publish only)
+        self.v_scale = float(pp('~v_scale', 1.0))
+        ## IY : end
+
         rospy.loginfo('[OvertakingIY] initialized. rate=%.1fHz car=%s lambda_reg=%.3f',
                       self.rate_hz, self.racecar_version, self.lambda_reg)
 
@@ -203,6 +220,16 @@ class OvertakingIYNode:
         from dynamic_reconfigure.server import Server as DynServer
         from fast_sqp_planner.cfg import FastSQPPlannerConfig
         self._dyn_srv = DynServer(FastSQPPlannerConfig, self._dyn_reconfigure_cb)
+        ## IY : push current values (incl. auto-paired slope_correction) to cfg
+        try:
+            self._dyn_srv.update_configuration({
+                'grip_scale_exp':     float(self.grip_scale_exp),
+                'slope_correction':   float(self.slope_correction),
+                'slope_brake_margin': float(self.slope_brake_margin),
+                'slope_brake_vmax':   float(self.slope_brake_vmax),
+            })
+        except Exception as e:
+            rospy.logwarn('[OvertakingIY] dyn_recfg push failed: %s', e)
         ## IY : end
 
         # state_machine hyst override (online mode only)
@@ -218,7 +245,22 @@ class OvertakingIYNode:
         ## IY : reload GGV from disk when checkbox checked
         if getattr(config, 'reload_ggv', False):
             rospy.loginfo('[OvertakingIY] reload_ggv triggered — reloading from disk')
-            self._load_ggv()
+            self._load_ggv()        # 3D .npy + GGManager + auto_slope_correction
+            self.vp.reload()        # 2D ggv.csv + ax/b_ax_max_machines
+            # invalidate warm-start so next tick is not pinned to prev-GGV solution
+            self.prev_d = None
+            self.prev_s = None
+            self.prev_v = None
+            ## IY : re-pair slope_correction with new ggv meta (unless user overrode in cfg)
+            if hasattr(config, 'slope_correction'):
+                # if cfg's current value matches prev auto value, treat as auto-paired
+                # and update to new auto. otherwise keep user override.
+                config.slope_correction = float(self.auto_slope_correction)
+                self.slope_correction = float(self.auto_slope_correction)
+                rospy.loginfo(
+                    '[OvertakingIY] reload: slope_correction re-paired → %.2f',
+                    self.slope_correction)
+            ## IY : end
             config.reload_ggv = False
         ## IY : end
         if config.velocity_mode != self.velocity_mode:
@@ -244,6 +286,18 @@ class OvertakingIYNode:
         self.lambda_term        = config.lambda_term
         self.near_knots_K       = config.near_knots_K
         self.obs_ramp_knots     = config.obs_ramp_knots
+        ## IY : vel_planner_25d tunables sync
+        if hasattr(config, 'grip_scale_exp'):
+            self.grip_scale_exp = float(config.grip_scale_exp)
+        if hasattr(config, 'slope_correction'):
+            self.slope_correction = float(config.slope_correction)
+        if hasattr(config, 'slope_brake_margin'):
+            self.slope_brake_margin = float(config.slope_brake_margin)
+        if hasattr(config, 'slope_brake_vmax'):
+            self.slope_brake_vmax = float(config.slope_brake_vmax)
+        if hasattr(config, 'v_scale'):
+            self.v_scale = float(config.v_scale)
+        ## IY : end
         return config
     ## IY : end
 
@@ -400,6 +454,49 @@ class OvertakingIYNode:
                       gg_base, self.ggv_data['v_list'][0],
                       self.ggv_data['v_list'][-1],
                       str(self.ggv_data['g_list']))
+        ## IY : auto-switch to slope-aware ggv if *_3d.npy + slope_list.npy exist
+        ##      honor enable_slope.npy meta — stale *_3d.npy may exist when ggv was
+        ##      regenerated with enable_slope=False
+        enable_slope_meta = True  # legacy: trust file presence
+        es_path = os.path.join(gg_base, 'enable_slope.npy')
+        if os.path.isfile(es_path):
+            try:
+                enable_slope_meta = bool(np.load(es_path))
+            except (FileNotFoundError, OSError, ValueError):
+                pass
+        slope_list_path = os.path.join(gg_base, 'slope_list.npy')
+        ax_max_3d_path  = os.path.join(gg_base, 'ax_max_3d.npy')
+        ax_min_3d_path  = os.path.join(gg_base, 'ax_min_3d.npy')
+        ay_max_3d_path  = os.path.join(gg_base, 'ay_max_3d.npy')
+        if (enable_slope_meta
+                and os.path.isfile(slope_list_path) and os.path.isfile(ax_max_3d_path)
+                and os.path.isfile(ax_min_3d_path) and os.path.isfile(ay_max_3d_path)):
+            self.ggv_data['slope_list'] = np.load(slope_list_path)
+            self.ggv_data['ax_max_3d']  = np.load(ax_max_3d_path)
+            self.ggv_data['ax_min_3d']  = np.load(ax_min_3d_path)
+            self.ggv_data['ay_max_3d']  = np.load(ay_max_3d_path)
+            rospy.loginfo(
+                '[OvertakingIY] GGV mode: 3D slope-aware (n_s=%d, slope=±%.3frad / ±%.1fdeg)',
+                len(self.ggv_data['slope_list']),
+                float(self.ggv_data['slope_list'][-1]),
+                float(np.degrees(self.ggv_data['slope_list'][-1])))
+        else:
+            rospy.loginfo('[OvertakingIY] GGV mode: 2D flat')
+        ## IY : end
+        ## IY : auto-pair slope_correction with ggv slope_ax_scale (avoid double-count)
+        slope_ax_scale_path = os.path.join(gg_base, 'slope_ax_scale.npy')
+        if os.path.isfile(slope_ax_scale_path):
+            _sc_val = float(np.load(slope_ax_scale_path))
+            self.auto_slope_correction = max(0.0, 1.0 - _sc_val)
+            rospy.loginfo(
+                '[OvertakingIY] ggv slope_ax_scale=%.2f → auto slope_correction=%.2f',
+                _sc_val, self.auto_slope_correction)
+        else:
+            # legacy ggv (no meta) — assume baked-in (slope_ax_scale=1.0)
+            self.auto_slope_correction = 0.0
+            rospy.loginfo(
+                '[OvertakingIY] ggv meta missing → auto slope_correction=0.0 (assume baked-in)')
+        ## IY : end
         ## IY : load GGManager for nlp velocity mode (CasADi acc_interpolator)
         self.gg_manager = None
         try:
@@ -430,6 +527,24 @@ class OvertakingIYNode:
         g_eff = g_values if g_values is not None else 9.81 * np.cos(mu_arr)
         v_c = np.clip(v_arr, v_list[0], v_list[-1])
         g_c = np.clip(g_eff, g_list[0], g_list[-1])
+        ## IY : 3D slope-aware lookup if *_3d.npy loaded — interp per-node mu
+        if 'ax_max_3d' in self.ggv_data:
+            slope_list = self.ggv_data['slope_list']
+            slope_c = np.clip(mu_arr, slope_list[0], slope_list[-1])
+            if np.any(mu_arr != slope_c):
+                rospy.logwarn_throttle(
+                    5.0,
+                    '[OvertakingIY] mu out of slope_list range [±%.3frad], clipping',
+                    float(slope_list[-1]))
+            ax_interp = RegularGridInterpolator(
+                (v_list, g_list, slope_list), self.ggv_data['ax_max_3d'],
+                bounds_error=False, fill_value=None)
+            ay_interp = RegularGridInterpolator(
+                (v_list, g_list, slope_list), self.ggv_data['ay_max_3d'],
+                bounds_error=False, fill_value=None)
+            pts = np.column_stack([v_c, g_c, slope_c])
+            return ax_interp(pts), ay_interp(pts)
+        ## IY : end (3D branch); fall through to 2D regression path
         ax_interp = RegularGridInterpolator(
             (v_list, g_list), self.ggv_data['ax_max'], bounds_error=False, fill_value=None)
         ay_interp = RegularGridInterpolator(
@@ -1105,7 +1220,11 @@ class OvertakingIYNode:
                             s_at_knot, self.opponent_wpnts_sm, self.opponent_wpnts_d))
                     else:
                         obs_center[ii] = fallback_center
-                    # obs_min[ii] = self.width_car + self.evasion_dist  ### IY : replaced by variance-scaled version
+                    ## IY : obs_min mode toggle
+                    #   (A) fixed width: uncomment the line below + comment out the block.
+                    #       Equivalent to setting obs_sigma_k=0 in rqt.
+                    #   (B) variance-scaled (default): obs_min = base + sigma_k * sqrt(d_var)
+                    # obs_min[ii] = self.width_car + self.evasion_dist
                     base_min = self.width_car + self.evasion_dist
                     if has_dvar and self.obs_sigma_k > 0:
                         s_at_knot = s_av[ii] % self.scaled_max_s
@@ -1296,12 +1415,37 @@ class OvertakingIYNode:
                     # vel_planner_25d: ggv + slope(elevation angle) mode
                     # slope=mu_at_path (track pitch angle rad)
                     # mu not passed → defaults to friction=1.0 (ggv mode)
+                    ## IY : build track_3d_params for fbga+enable_mu parity
+                    ##      slope_correction=1, grip_scale_exp=0, omega/h=0
+                    ##      → only diamond ax_gravity + g_tilde Vmax clamp active
+                    ds_mean = float(el_lengths.mean()) if len(el_lengths) > 0 else 0.1
+                    if ds_mean > 1e-6 and len(mu_at_path) >= 2:
+                        mu_ext = np.concatenate([[mu_at_path[0]], mu_at_path,
+                                                 [mu_at_path[-1]]])
+                        dmu_ds = (mu_ext[2:] - mu_ext[:-2]) / (2.0 * ds_mean)
+                    else:
+                        dmu_ds = np.zeros_like(mu_at_path)
+                    n_pts = len(mu_at_path)
+                    track_3d_params = {
+                        'mu':                 mu_at_path,
+                        'dmu_ds':             dmu_ds,
+                        'omega_x':            np.zeros(n_pts),
+                        'omega_y':            np.zeros(n_pts),
+                        'phi':                np.zeros(n_pts),
+                        'h':                  0.0,
+                        'slope_correction':   self.slope_correction,
+                        'slope_brake_margin': self.slope_brake_margin,
+                        'slope_brake_vmax':   self.slope_brake_vmax,
+                    }
+                    ## IY : end
                     v_profile = self.vp.profile(
                         kappa=kappa_path,
                         el_lengths=el_lengths,
                         v_start=max(self.cur_v, 0.1),
                         v_max=self.scaled_vmax,
                         slope=mu_at_path,
+                        track_3d_params=track_3d_params,
+                        grip_scale_exp=self.grip_scale_exp,
                     )
                 elif self.velocity_mode == '3d':
                     ## IY : g_tilde fixed-point iteration with 3D GGV
@@ -1455,7 +1599,7 @@ class OvertakingIYNode:
                 z_m=float(evasion_z[i]),
                 psi_rad=float(psi[i]),
                 kappa_radpm=float(kappa_path[i]),
-                vx_mps=float(v_profile[i]),
+                vx_mps=float(v_profile[i] * self.v_scale),
                 ax_mps2=float(ax_profile[i]) if i < len(ax_profile) else 0.0,
             )
             wpnts.append(w)
