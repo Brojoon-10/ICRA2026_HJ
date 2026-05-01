@@ -20,22 +20,27 @@ class VelocityProfiler:
 
         veh_dyn_dir = os.path.join(stack_master_cfg_dir, racecar_version,
                                    'veh_dyn_info')
-        ggv_path = os.path.join(veh_dyn_dir, 'ggv.csv')
-        ax_path = os.path.join(veh_dyn_dir, 'ax_max_machines.csv')
-        b_ax_path = os.path.join(veh_dyn_dir, 'b_ax_max_machines.csv')
+        ## IY : keep paths so reload() can re-read CSVs at runtime
+        self._ggv_path = os.path.join(veh_dyn_dir, 'ggv.csv')
+        self._ax_path = os.path.join(veh_dyn_dir, 'ax_max_machines.csv')
+        self._b_ax_path = os.path.join(veh_dyn_dir, 'b_ax_max_machines.csv')
+        self.reload()
+        ## IY : end
 
+    ## IY : re-read CSVs from disk so rqt reload_ggv applies in 2_5d/3d modes
+    def reload(self) -> None:
         self.ggv, self.ax_max_machines = tph.import_veh_dyn_info.\
-            import_veh_dyn_info(ggv_import_path=ggv_path,
-                                ax_max_machines_import_path=ax_path)
+            import_veh_dyn_info(ggv_import_path=self._ggv_path,
+                                ax_max_machines_import_path=self._ax_path)
         _, self.b_ax_max_machines = tph.import_veh_dyn_info.\
-            import_veh_dyn_info(ggv_import_path=ggv_path,
-                                ax_max_machines_import_path=b_ax_path)
-
-        # default v_max covered by tables
+            import_veh_dyn_info(ggv_import_path=self._ggv_path,
+                                ax_max_machines_import_path=self._b_ax_path)
         self.v_max_default = float(min(self.ggv[-1, 0],
                                        self.ax_max_machines[-1, 0]))
+    ## IY : end
 
-    ## IY : add slope param for vel_planner_25d gravity correction
+    ## IY : add slope + track_3d_params + grip_scale_exp for vel_planner_25d
+    ##      slope-aware corrections (fbga+enable_mu parity)
     def profile(self,
                 kappa: np.ndarray,
                 el_lengths: np.ndarray,
@@ -45,6 +50,8 @@ class VelocityProfiler:
                 mu: np.ndarray | None = None,
                 loc_gg: np.ndarray | None = None,
                 slope: np.ndarray | None = None,
+                track_3d_params: dict | None = None,
+                grip_scale_exp: float | None = None,
                 filt_window: int | None = None) -> np.ndarray:
 
         if v_max is None:
@@ -74,6 +81,13 @@ class VelocityProfiler:
         ## IY : pass slope (track elevation angle rad) to vel_planner_25d
         if slope is not None:
             kwargs['slope'] = slope
+        ## IY : end
+        ## IY : pass track_3d_params + grip_scale_exp to enable internal mu corrections
+        ##      (ax_gravity diamond + g_tilde Vmax clamp). fbga+enable_mu parity.
+        if track_3d_params is not None:
+            kwargs['track_3d_params'] = track_3d_params
+        if grip_scale_exp is not None:
+            kwargs['grip_scale_exp'] = grip_scale_exp
         ## IY : end
         return calc_vel_profile(**kwargs)
     ## IY : end
