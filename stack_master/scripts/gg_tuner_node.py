@@ -394,6 +394,45 @@ class GGTunerNode:
         ## IY : end
         return True
 
+    ## IY : save ggv meta (slope_ax_scale, enable_slope) for downstream auto-pairing
+    ##      consumers: fast_sqp_planner._load_ggv, global_velocity_planner_3d
+    ##      also cleans stale *_3d.npy when enable_slope=False
+    def _save_ggv_meta(self, vehicle_name, slope_ax_scale, enable_slope):
+        import numpy as np
+        dst = os.path.join(self.data_path, 'gg_diagrams', vehicle_name)
+        for frame in ('velocity_frame', 'vehicle_frame'):
+            frame_dir = os.path.join(dst, frame)
+            if not os.path.isdir(frame_dir):
+                continue
+            try:
+                np.save(os.path.join(frame_dir, 'slope_ax_scale.npy'),
+                        np.float64(slope_ax_scale))
+                np.save(os.path.join(frame_dir, 'enable_slope.npy'),
+                        np.bool_(enable_slope))
+            except Exception as e:
+                rospy.logwarn(f"[GGTuner] save ggv meta failed ({frame}): {e}")
+            ## IY : cleanup stale *_3d.npy when enable_slope=False
+            ##      slope_data/ rho cache is preserved for future enable_slope=True reuse
+            if not enable_slope:
+                stale = ('ax_max_3d.npy', 'ax_min_3d.npy', 'ay_max_3d.npy',
+                         'gg_exponent_3d.npy', 'slope_list.npy',
+                         'slope_list_deg.npy')
+                removed = []
+                for fn in stale:
+                    p = os.path.join(frame_dir, fn)
+                    if os.path.isfile(p):
+                        try:
+                            os.remove(p)
+                            removed.append(fn)
+                        except OSError as e:
+                            rospy.logwarn(f"[GGTuner] cleanup failed ({fn}): {e}")
+                if removed:
+                    rospy.loginfo(
+                        f"[GGTuner] cleaned stale 3D npy in {frame}: {removed}")
+            ## IY : end
+        rospy.loginfo(f"[GGTuner] ggv meta saved: slope_ax_scale={slope_ax_scale}, enable_slope={enable_slope}")
+    ## IY : end
+
     def _copy_to_gg_diagrams(self, vehicle_name):
         src = os.path.join(self.fast_ggv_output_dir, vehicle_name)
         dst = os.path.join(self.data_path, 'gg_diagrams', vehicle_name)
@@ -693,7 +732,17 @@ class GGTunerNode:
             rospy.logwarn(f"[GGTuner] publish_gg_results: npy load failed: {e}")
             return
         # auto-load slope results from 3D diamond arrays if available
-        if slope_results is None:
+        ## IY : honor enable_slope meta — stale *_3d.npy may exist when ggv was
+        ##      regenerated with enable_slope=False (gen_diamond reuses slope_data/)
+        enable_slope_meta = True  # default: trust file presence (legacy)
+        es_path = os.path.join(vf_dir, 'enable_slope.npy')
+        if os.path.isfile(es_path):
+            try:
+                enable_slope_meta = bool(np.load(es_path))
+            except (FileNotFoundError, OSError, ValueError):
+                pass
+        ## IY : end
+        if slope_results is None and enable_slope_meta:
             slope_list_path = os.path.join(vf_dir, 'slope_list_deg.npy')
             ax_max_3d_path = os.path.join(vf_dir, 'ax_max_3d.npy')
             if os.path.exists(slope_list_path) and os.path.exists(ax_max_3d_path):
@@ -703,10 +752,15 @@ class GGTunerNode:
                         'ax_max': np.load(ax_max_3d_path).tolist(),
                         'ax_min': np.load(os.path.join(vf_dir, 'ax_min_3d.npy')).tolist(),
                         'ay_max': np.load(os.path.join(vf_dir, 'ay_max_3d.npy')).tolist(),
+                        ## IY : add gg_exponent_3d for viewer slope-aware diamond
+                        'gg_exponent': np.load(os.path.join(vf_dir, 'gg_exponent_3d.npy')).tolist(),
                     }
                     rospy.loginfo(f"[GGTuner] 3D slope diamond loaded for viewer")
                 except (FileNotFoundError, OSError):
                     pass
+        elif not enable_slope_meta:
+            rospy.loginfo(f"[GGTuner] enable_slope=False → skip 3D slope payload "
+                          f"(stale *_3d.npy ignored)")
         payload = {
             'vehicle_name': vehicle_name,
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -780,6 +834,12 @@ class GGTunerNode:
                         self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
                         return
                     self._save_meta(vehicle_name, tuning)
+                    ## IY : save ggv meta for downstream auto-pairing
+                    self._save_ggv_meta(
+                        vehicle_name,
+                        slope_ax_scale=run_opts.get('slope_ax_scale', 1.0),
+                        enable_slope=run_opts.get('enable_slope', False))
+                    ## IY : end
                     self.status_pub.publish(f"GGV_DONE: {vehicle_name}")
                     ## IY : publish fresh results for rqt_gg_viewer
                     self._publish_gg_results(vehicle_name, tuning)
