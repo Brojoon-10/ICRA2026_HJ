@@ -101,6 +101,10 @@ generate_dynamic_reconfigure_options(
   ## IY : GGTuner3D — gg_tuner_3d_node uses this (VelOpt replaces FBGA stage)
   cfg/GGTuner3D.cfg
   ## IY : end
+  ### HJ : SimpleMux launch torque controller live tuning
+  cfg/SimpleMux.cfg
+  ### HJ : test_control_publisher manual launch rig
+  cfg/TestCtrl.cfg
 )
 ## IY : end
 
