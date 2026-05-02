@@ -1,0 +1,33 @@
+<!-- -*- mode: XML -*- -->
+<!-- ### HJ : One-shot bench test for launch torque control.
+     Brings up: vesc_driver + custom_ackermann_to_vesc + simple_mux (with launch logic)
+                + joy + elrs_joy + test_control_publisher (manual ackermann source).
+     SKIPS: IMU, LiDAR, camera, microstrain (not needed for launch bench tests).
+
+     Usage flow (wheels off ground):
+       1. roslaunch stack_master test_launch_control.launch
+       2. rqt -> Dynamic Reconfigure
+            /vesc/simple_mux        : launch_current_A, launch_t_total
+            /test_control_publisher : cmd_speed_mps (post-launch target)
+       3. A button on joypad  -> arm launch (toggle)
+       4. RB                  -> autodrive on; if armed, fires launch (0.75s constant current)
+       5. test_control_publisher terminal shows real motor current + measured speed every tick
+       6. LB                  -> instant abort -->
+<launch>
+  <arg name="racecar_version" default="$(env CAR_NAME)" doc="Physical racecar (UNICORNx)" />
+
+  <!-- ===== VESC stack (driver + ackermann_to_vesc + simple_mux) ===== -->
+  <group ns="vesc">
+    <include file="$(find stack_master)/launch/vesc.launch">
+      <arg name="racecar_version" value="$(arg racecar_version)" />
+    </include>
+    <node pkg="stack_master" type="simple_mux.py" name="simple_mux" output="screen"/>
+  </group>
+
+  <!-- ===== Joy inputs (USB + ELRS) ===== -->
+  <node pkg="joy" type="joy_node" name="joy_node" output="screen"/>
+  <include file="$(find elrs_joy)/launch/elrs_joy.launch"/>
+
+  <!-- ===== Manual ackermann source (replaces autonomy stack) ===== -->
+  <node pkg="stack_master" type="test_control_publisher.py" name="test_control_publisher" output="screen" required="true"/>
+</launch>
