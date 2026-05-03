@@ -7,13 +7,6 @@ try:
 except ImportError:
     HAS_ROSPY = False
 
-### HJ : optional SG filter for noise-robust mu / dmu_ds in 3D track params
-try:
-    from scipy.signal import savgol_filter
-    HAS_SCIPY_SG = True
-except ImportError:
-    HAS_SCIPY_SG = False
-
 _g_friction_cache = None  # module-level friction cache
 
 
@@ -35,11 +28,7 @@ def calc_vel_profile(ax_max_machines: np.ndarray,
                      slope: np.ndarray = None,
                      track_3d_params: dict = None,
                      grip_scale_exp: float = 1.0,
-                     s_global: np.ndarray = None,
-                     smooth_mu: bool = True,                ### HJ : LPF mu/dmu_ds inside lib
-                     mu_smooth_window: int = 21,            ### HJ : SG window size (odd)
-                     mu_smooth_polyorder: int = 3,          ### HJ : SG polyorder
-                     ) -> np.ndarray:
+                     s_global: np.ndarray = None) -> np.ndarray:
     """
     author:
     Alexander Heilmeier
@@ -257,71 +246,6 @@ def calc_vel_profile(ax_max_machines: np.ndarray,
                     if sec['start'] <= j <= sec['end']:
                         mu[j] *= min(sec['friction'], fric_limit)
                         break
-
-    ### HJ : 3D-track-params hygiene (always run when track_3d_params is set)
-    ### Two stages:
-    ###  (1) closed-loop wrap fix for dmu_ds / omega_* boundary points.
-    ###      np.gradient at the caller side uses 1st-order diff at the seam,
-    ###      which underestimates derivatives there for closed tracks.
-    ###      We always overwrite the 2 boundary samples with wrap-central diff.
-    ###  (2) Optional SG filter on mu (default ON via smooth_mu) to suppress
-    ###      PCD-style noise. Without this, dmu/ds blows up by (2pi/lambda)^2
-    ###      and crashes v at curvature inflections via -omega_y*v^2 in g_tilde.
-    ###      SG window=21 (~2.1m at ds=0.1), polyorder=3 preserves real slope
-    ###      features (>=2m wavelength) while killing cm-scale noise.
-    if track_3d_params is not None and 'mu' in track_3d_params:
-        ds_lpf = float(el_lengths[0]) if len(el_lengths) > 0 else 0.1
-        mu_arr = np.asarray(track_3d_params['mu'], dtype=float)
-        kappa_arr = np.asarray(kappa, dtype=float)
-        N_mu = len(mu_arr)
-        phi_arr = np.asarray(track_3d_params.get('phi', np.zeros_like(mu_arr)),
-                              dtype=float)
-
-        # decide whether SG can run
-        run_sg = (smooth_mu and HAS_SCIPY_SG
-                  and N_mu >= mu_smooth_window)
-
-        if run_sg:
-            win = (mu_smooth_window if mu_smooth_window % 2 == 1
-                   else mu_smooth_window + 1)
-            poly = mu_smooth_polyorder
-            if closed:
-                pad = win // 2
-                mu_pad = np.concatenate([mu_arr[-pad:], mu_arr, mu_arr[:pad]])
-                mu_new = savgol_filter(mu_pad, win, poly)[pad:-pad]
-                dmu_new = savgol_filter(mu_pad, win, poly,
-                                          deriv=1, delta=ds_lpf)[pad:-pad]
-            else:
-                mu_new = savgol_filter(mu_arr, win, poly)
-                dmu_new = savgol_filter(mu_arr, win, poly,
-                                          deriv=1, delta=ds_lpf)
-        else:
-            # SG off: keep mu as-is, but still need dmu_ds for the closed wrap fix
-            mu_new = mu_arr
-            dmu_new = np.asarray(track_3d_params.get(
-                'dmu_ds', np.gradient(mu_arr, ds_lpf)), dtype=float).copy()
-            # closed-loop boundary fix: wrap central diff at i=0 and i=N-1
-            if closed and N_mu >= 3:
-                dmu_new[0] = (mu_arr[1] - mu_arr[-1]) / (2.0 * ds_lpf)
-                dmu_new[-1] = (mu_arr[0] - mu_arr[-2]) / (2.0 * ds_lpf)
-
-        # rebuild angular rates with refreshed mu/dmu_ds (phi=0 -> dphi_ds=0)
-        omega_y_new = (np.cos(phi_arr) * dmu_new
-                        + np.cos(mu_new) * np.sin(phi_arr) * kappa_arr)
-        omega_x_new = -np.sin(mu_new) * kappa_arr
-        omega_z_new = (-np.sin(phi_arr) * dmu_new
-                        + np.cos(mu_new) * np.cos(phi_arr) * kappa_arr)
-
-        # propagate (do not mutate caller's dict)
-        track_3d_params = dict(track_3d_params)
-        track_3d_params['mu'] = mu_new
-        track_3d_params['dmu_ds'] = dmu_new
-        track_3d_params['omega_x'] = omega_x_new
-        track_3d_params['omega_y'] = omega_y_new
-        track_3d_params['omega_z'] = omega_z_new
-        if slope is not None:
-            slope = mu_new  # slope mirrors mu in the 3D path
-    ### HJ : end 3D track params hygiene
 
     # call solver
     if not closed:
