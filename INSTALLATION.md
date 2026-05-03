@@ -59,7 +59,16 @@ sudo ./.devcontainer/.install_utils/udev_rules_imu.sh
 
 # for VESC
 sudo ./.devcontainer/.install_utils/udev_rules_vesc.sh
+
+# for ELRS receiver (CP2102 USB-TTL, VID:10c4 PID:ea60)
+sudo ./.devcontainer/.install_utils/udev_rules_elrs.sh
+
+# for T2V IR receiver (ESP32-S3 TinyUSB CDC, VID:5455 PID:1911)
+sudo ./.devcontainer/.install_utils/udev_rules_t2v.sh
 ```
+
+After installing the udev rules, **unplug and re-plug the affected USB devices** (or reboot) so the new rules are applied to the existing device nodes.
+
 Then check if the devices are correctly linked:
 
 ```bash
@@ -68,7 +77,15 @@ ls -l /dev/IMU
 
 # for VESC
 ls -l /dev/VESC
+
+# for ELRS
+ls -l /dev/ELRS
+
+# for T2V receiver
+ls -l /dev/T2V
 ```
+
+> **Note (T2V)**: The T2V ROS bridge (`t2v_node/scripts/t2v_bridge.py`) auto-detects the receiver by VID/PID, so the `/dev/T2V` symlink itself is not required for ROS use. However, the udev rule's `MODE="0666"` is **required**, because the default `cdc_acm` driver creates the device with mode `0660` (group `dialout`), and the container user is not in `dialout` — without the rule the bridge fails with `Permission denied`.
 
 ## Build with docker
 
