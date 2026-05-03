@@ -24,13 +24,6 @@ import yaml
 from dynamic_reconfigure.server import Server
 from stack_master.cfg import VelPlanner3DConfig
 
-### HJ : optional SG filter for kappa-only smoothing (for vel calc, path preserved)
-try:
-    from scipy.signal import savgol_filter
-    HAS_SCIPY_SG = True
-except ImportError:
-    HAS_SCIPY_SG = False
-
 class VelocityPlanner:
 
     SAVE_CONFIG = False  # legacy CSV save flag (now controlled via rqt save_csv)
@@ -104,14 +97,6 @@ class VelocityPlanner:
             'slope_correction': self.slope_correction,
             'slope_brake_margin': self.slope_brake_margin,
             'slope_brake_vmax': self.slope_brake_vmax,
-            ### HJ : SG mu smoothing toggle
-            'smooth_mu': self.smooth_mu,
-            'mu_smooth_window': self.mu_smooth_window,
-            'mu_smooth_polyorder': self.mu_smooth_polyorder,
-            ### HJ : SG kappa smoothing (vel-only)
-            'smooth_kappa': self.smooth_kappa,
-            'kappa_smooth_window': self.kappa_smooth_window,
-            'kappa_smooth_polyorder': self.kappa_smooth_polyorder,
         })
         self.dyn_reconfig_changed = False
 
@@ -155,14 +140,6 @@ class VelocityPlanner:
             self.slope_correction = params.get('slope_correction', 1.0)
             self.slope_brake_margin = params.get('slope_brake_margin', 0.0)
             self.slope_brake_vmax = params.get('slope_brake_vmax', 5.0)
-            ### HJ : SG mu smoothing toggle (passed to vel_planner_25d)
-            self.smooth_mu = params.get('smooth_mu', True)
-            self.mu_smooth_window = params.get('mu_smooth_window', 21)
-            self.mu_smooth_polyorder = params.get('mu_smooth_polyorder', 3)
-            ### HJ : SG kappa smoothing (vel-only, path preserved)
-            self.smooth_kappa = params.get('smooth_kappa', True)
-            self.kappa_smooth_window = params.get('kappa_smooth_window', 21)
-            self.kappa_smooth_polyorder = params.get('kappa_smooth_polyorder', 3)
             rospy.loginfo(f"[VelPlanner3D] Loaded params from {self.vel_planner_yaml}")
         else:
             rospy.logwarn(f"[VelPlanner3D] {self.vel_planner_yaml} not found, using defaults")
@@ -176,14 +153,6 @@ class VelocityPlanner:
             self.slope_correction = 1.0
             self.slope_brake_margin = 0.0
             self.slope_brake_vmax = 5.0
-            ### HJ : SG mu smoothing defaults
-            self.smooth_mu = True
-            self.mu_smooth_window = 21
-            self.mu_smooth_polyorder = 3
-            ### HJ : SG kappa smoothing defaults (vel-only)
-            self.smooth_kappa = True
-            self.kappa_smooth_window = 21
-            self.kappa_smooth_polyorder = 3
 
         ## IY : auto-pair slope_correction with ggv meta if yaml does not specify
         if 'slope_correction' not in params:
@@ -224,14 +193,6 @@ class VelocityPlanner:
             'slope_correction': float(self.slope_correction),
             'slope_brake_margin': float(self.slope_brake_margin),
             'slope_brake_vmax': float(self.slope_brake_vmax),
-            ### HJ : SG mu smoothing
-            'smooth_mu': bool(self.smooth_mu),
-            'mu_smooth_window': int(self.mu_smooth_window),
-            'mu_smooth_polyorder': int(self.mu_smooth_polyorder),
-            ### HJ : SG kappa smoothing (vel-only)
-            'smooth_kappa': bool(self.smooth_kappa),
-            'kappa_smooth_window': int(self.kappa_smooth_window),
-            'kappa_smooth_polyorder': int(self.kappa_smooth_polyorder),
         }
         with open(self.vel_planner_yaml, 'w') as f:
             yaml.dump(params, f, default_flow_style=False)
@@ -259,14 +220,6 @@ class VelocityPlanner:
         self.slope_correction = config.slope_correction
         self.slope_brake_margin = config.slope_brake_margin
         self.slope_brake_vmax = config.slope_brake_vmax
-        ### HJ : SG mu smoothing
-        self.smooth_mu = config.smooth_mu
-        self.mu_smooth_window = int(config.mu_smooth_window)
-        self.mu_smooth_polyorder = int(config.mu_smooth_polyorder)
-        ### HJ : SG kappa smoothing (vel-only)
-        self.smooth_kappa = config.smooth_kappa
-        self.kappa_smooth_window = int(config.kappa_smooth_window)
-        self.kappa_smooth_polyorder = int(config.kappa_smooth_polyorder)
 
         self._apply_params_to_ggv()
 
@@ -287,14 +240,6 @@ class VelocityPlanner:
             config.slope_correction = self.slope_correction
             config.slope_brake_margin = self.slope_brake_margin
             config.slope_brake_vmax = self.slope_brake_vmax
-            ### HJ : SG mu smoothing
-            config.smooth_mu = self.smooth_mu
-            config.mu_smooth_window = self.mu_smooth_window
-            config.mu_smooth_polyorder = self.mu_smooth_polyorder
-            ### HJ : SG kappa smoothing (vel-only)
-            config.smooth_kappa = self.smooth_kappa
-            config.kappa_smooth_window = self.kappa_smooth_window
-            config.kappa_smooth_polyorder = self.kappa_smooth_polyorder
             config.load_yaml = False
             rospy.loginfo("[VelPlanner3D] Reloaded from yaml")
 
@@ -309,9 +254,7 @@ class VelocityPlanner:
                       f"motor={self.ax_max_motor}, brake={self.ax_max_brake}, "
                       f"dyn_exp={self.dyn_model_exp}, grip_exp={self.grip_scale_exp}, "
                       f"slope_corr={self.slope_correction}, "
-                      f"brake_margin={self.slope_brake_margin}m, brake_vmax={self.slope_brake_vmax}, "
-                      f"smooth_mu={self.smooth_mu} (win={self.mu_smooth_window}, poly={self.mu_smooth_polyorder}), "
-                      f"smooth_kappa={self.smooth_kappa} (win={self.kappa_smooth_window}, poly={self.kappa_smooth_polyorder})")
+                      f"brake_margin={self.slope_brake_margin}m, brake_vmax={self.slope_brake_vmax}")
         return config
 
     def _save_modified_config(self, ggv_path, ax_max_path, b_ax_max_path):
@@ -366,26 +309,6 @@ class VelocityPlanner:
             rospy.loginfo(f"[VelPlanner3D] Saved b_ax_max_machines.csv: ax_max_brake={self.ax_max_brake}")
         except Exception as e:
             rospy.logerr(f"[VelPlanner3D] Failed to save b_ax_max_machines.csv: {e}")
-
-    ### HJ : SG-smooth kappa for vel calc only (path kappa_radpm is preserved)
-    ### Reason: SP raceline csv carries kappa noise spikes near the closed-loop
-    ### seam (i=0 ~ i=N-1) and at sharp transitions, which makes v_kappa = sqrt(ay/|k|)
-    ### plummet at otherwise-easy points. Same pattern as the MPC state machine:
-    ### keep the geometric path untouched, smooth a *copy* of kappa just for the
-    ### velocity profile. Toggleable via rqt (smooth_kappa).
-    def _smooth_kappa(self, kappa):
-        if not self.smooth_kappa or not HAS_SCIPY_SG:
-            return kappa
-        win = self.kappa_smooth_window
-        if win % 2 == 0:
-            win += 1
-        if len(kappa) < win:
-            return kappa
-        poly = max(1, min(self.kappa_smooth_polyorder, win - 1))
-        # closed loop wrap pad so SG sees continuity at the seam
-        pad = win // 2
-        k_pad = np.concatenate([kappa[-pad:], kappa, kappa[:pad]])
-        return savgol_filter(k_pad, win, poly)[pad:-pad]
 
     def _build_track_3d_params(self, wpnts):
         """
@@ -450,15 +373,13 @@ class VelocityPlanner:
         kappa = np.array([wp.kappa_radpm for wp in wpnts])
         el_lengths = 0.1 * np.ones(len(kappa))
         track_3d_params, slope = self._build_track_3d_params(wpnts)
-        ### HJ : kappa for velocity calc only — path kappa_radpm in wpnts is untouched
-        kappa_for_vel = self._smooth_kappa(kappa)
 
         # 3D velocity profile
         vx_profile = calc_vel_profile(ggv=self.ggv,
                                       ax_max_machines=self.ax_max_machines,
                                       b_ax_max_machines=self.b_ax_max_machines,
                                       v_max=self.v_max,
-                                      kappa=kappa_for_vel,
+                                      kappa=kappa,
                                       el_lengths=el_lengths,
                                       closed=True,
                                       filt_window=self.filt_window,
@@ -467,11 +388,7 @@ class VelocityPlanner:
                                       m_veh=self.m_veh,
                                       slope=slope,
                                       track_3d_params=track_3d_params,
-                                      grip_scale_exp=self.grip_scale_exp,
-                                      ### HJ : SG mu smoothing toggle
-                                      smooth_mu=self.smooth_mu,
-                                      mu_smooth_window=self.mu_smooth_window,
-                                      mu_smooth_polyorder=self.mu_smooth_polyorder)
+                                      grip_scale_exp=self.grip_scale_exp)
 
         for i in range(len(vx_profile)):
             wpnts[i].vx_mps = vx_profile[i]
@@ -488,12 +405,11 @@ class VelocityPlanner:
         self.glb_wpnts_pub.publish(msg)
 
         # 2D velocity profile (no 3D correction, with friction) for comparison markers
-        ### HJ : reuse smoothed kappa here too — same vel-calc principle
         vx_profile_2d = calc_vel_profile(ggv=self.ggv,
                                           ax_max_machines=self.ax_max_machines,
                                           b_ax_max_machines=self.b_ax_max_machines,
                                           v_max=self.v_max,
-                                          kappa=kappa_for_vel,
+                                          kappa=kappa,
                                           el_lengths=el_lengths,
                                           closed=True,
                                           filt_window=self.filt_window,
@@ -512,14 +428,12 @@ class VelocityPlanner:
         el_lengths = 0.1 * np.ones(len(kappa))
 
         track_3d_params, slope = self._build_track_3d_params(wpnts)
-        ### HJ : kappa for velocity calc only — path kappa_radpm in wpnts is untouched
-        kappa_for_vel = self._smooth_kappa(kappa)
 
         vx_profile = calc_vel_profile(ggv=self.ggv,
                                       ax_max_machines=self.ax_max_machines,
                                       b_ax_max_machines=self.b_ax_max_machines,
                                       v_max=self.v_max,
-                                      kappa=kappa_for_vel,
+                                      kappa=kappa,
                                       el_lengths=el_lengths,
                                       closed=True,
                                       filt_window=self.filt_window,
@@ -528,11 +442,7 @@ class VelocityPlanner:
                                       m_veh=self.m_veh,
                                       slope=slope,
                                       track_3d_params=track_3d_params,
-                                      grip_scale_exp=self.grip_scale_exp,
-                                      ### HJ : SG mu smoothing toggle
-                                      smooth_mu=self.smooth_mu,
-                                      mu_smooth_window=self.mu_smooth_window,
-                                      mu_smooth_polyorder=self.mu_smooth_polyorder)
+                                      grip_scale_exp=self.grip_scale_exp)
 
         for i in range(len(vx_profile)):
             wpnts[i].vx_mps = vx_profile[i]
