@@ -39,8 +39,7 @@ class VelocityProfiler:
                                        self.ax_max_machines[-1, 0]))
     ## IY : end
 
-    ## IY : add slope + track_3d_params + grip_scale_exp for vel_planner_25d
-    ##      slope-aware corrections (fbga+enable_mu parity)
+    ## IY : add slope param for vel_planner_25d gravity correction
     def profile(self,
                 kappa: np.ndarray,
                 el_lengths: np.ndarray,
@@ -50,8 +49,6 @@ class VelocityProfiler:
                 mu: np.ndarray | None = None,
                 loc_gg: np.ndarray | None = None,
                 slope: np.ndarray | None = None,
-                track_3d_params: dict | None = None,
-                grip_scale_exp: float | None = None,
                 filt_window: int | None = None) -> np.ndarray:
 
         if v_max is None:
@@ -78,16 +75,7 @@ class VelocityProfiler:
             kwargs['ggv'] = self.ggv
             if mu is not None:
                 kwargs['mu'] = mu
-        ## IY : pass slope (track elevation angle rad) to vel_planner_25d
         if slope is not None:
             kwargs['slope'] = slope
-        ## IY : end
-        ## IY : pass track_3d_params + grip_scale_exp to enable internal mu corrections
-        ##      (ax_gravity diamond + g_tilde Vmax clamp). fbga+enable_mu parity.
-        if track_3d_params is not None:
-            kwargs['track_3d_params'] = track_3d_params
-        if grip_scale_exp is not None:
-            kwargs['grip_scale_exp'] = grip_scale_exp
-        ## IY : end
         return calc_vel_profile(**kwargs)
     ## IY : end

@@ -73,6 +73,9 @@ params = {
     #       lower (1.5 or 1.8) if feasibility is uncertain.
     'V_min': 2.0,
     ## IY : end
+    ## IY : bridge mu scale baked into raceline (1.0=as-is, 0=flat, 1.5=amplify)
+    'g_weight': 1.0,
+    ## IY : end
     'w_jx': 1e-2,  # cost weight for jerk x-direction
     'w_jy': 1e-2,  # cost weight for jerk y-direction
     # min time
@@ -164,6 +167,9 @@ def calc_global_raceline(
         ## IY : V_min enforced as NLP lower bound on velocity state
         V_min: float,
         ## IY : end
+        ## IY : bridge mu scale (forwarded to Track3D)
+        g_weight: float,
+        ## IY : end
         neglect_w_omega_x: bool,
         neglect_w_omega_y: bool,
         neglect_euler: bool,
@@ -175,7 +181,10 @@ def calc_global_raceline(
         step_size_opt: float = 0.2,
 ):
     track_handler = Track3D(
-        path=os.path.join(track_path, track_name)
+        path=os.path.join(track_path, track_name),
+        ## IY : bake bridge mu scale into Track3D
+        g_weight=g_weight,
+        ## IY : end
     )
 
     ### HJ : resample to optimization grid (coarser than smooth for NLP performance)
@@ -446,6 +455,9 @@ if __name__ == '__main__':
             V_guess=params['V_guess'],
             ## IY : pass V_min from params dict to NLP
             V_min=params['V_min'],
+            ## IY : end
+            ## IY : bridge mu scale baked into raceline
+            g_weight=params['g_weight'],
             ## IY : end
             neglect_w_omega_x=params['neglect_w_omega_x'],
             neglect_w_omega_y=params['neglect_w_omega_y'],

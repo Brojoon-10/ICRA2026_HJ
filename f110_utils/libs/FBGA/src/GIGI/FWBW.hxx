@@ -74,6 +74,10 @@ private:
   // HJ : slope rate per node for g_tilde Vmax constraint (v < sqrt(g*cos(mu)/dmu_ds))
   std::vector<real> DMU_vec;     // Vector of dmu/ds [rad/m]
   real v_I{0.0};                 // Initial velocity
+  // IY : 2.5d_vel_planner slope_correction (1=physics, higher=more conservative)
+  //   Multiplies g*sin(mu) ax_gravity in Vmax/FW/BW. Set via set_slope_corr().
+  real slope_corr_{1.0};
+  // IY : end
   std::vector<int> dump_seg_id;  // Vector of segments with problems for debug
 public:
   // constructors
@@ -138,6 +142,10 @@ public:
 
   // get dump
   [[nodiscard]] std::vector<int> get_dump() const { return this->dump_seg_id; }
+
+  // IY : 2.5d_vel_planner slope_correction setter
+  void set_slope_corr(real c) { this->slope_corr_ = c; }
+  // IY : end
 
   void check_segments();
 };

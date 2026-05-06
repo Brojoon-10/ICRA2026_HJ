@@ -22,6 +22,9 @@ SMOOTH_STEP="0.05"
 OPT_STEP="0.2"
 OUTPUT="global_waypoints"
 START_FROM="1"
+## IY : bridge mu scale baked into raceline (1.0=as-is)
+G_WEIGHT="1.0"
+## IY : end
 RAW_CSV="auto"
 GEN3D_CSV="auto"
 SMOOTHED_CSV="auto"
@@ -39,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --opt-step)        OPT_STEP="$2"; shift 2 ;;
         --output)          OUTPUT="$2"; shift 2 ;;
         --start-from)      START_FROM="$2"; shift 2 ;;
+        --g-weight)        G_WEIGHT="$2"; shift 2 ;;
         --raw-csv)         RAW_CSV="$2"; shift 2 ;;
         --gen3d-csv)       GEN3D_CSV="$2"; shift 2 ;;
         --smoothed-csv)    SMOOTHED_CSV="$2"; shift 2 ;;
@@ -94,6 +98,7 @@ echo "  raw_csv : ${RAW_CSV}"
 echo "  gen3d   : ${GEN3D_CSV}"
 echo "  smoothed: ${SMOOTHED_CSV}"
 echo "  raceline: ${RACELINE_CSV}"
+echo "  g_weight: ${G_WEIGHT}"
 echo "======================================================"
 
 # ─── Step 1: Bag + wall.pcd → boundary CSV ─────────────────────────────────────
@@ -210,6 +215,9 @@ src = re.sub(r"'gg_vehicle_name'\s*:.*", f"'gg_vehicle_name': '${GG_VEHICLE}',",
 src = re.sub(r"'safety_distance'\s*:.*", f"'safety_distance': ${SAFETY_DISTANCE},", src)
 src = re.sub(r"'gg_mode'\s*:.*", f"'gg_mode': '${GG_MODE}',", src)
 src = re.sub(r"'step_size_opt'\s*:.*", f"'step_size_opt': ${OPT_STEP},", src)
+## IY : override bridge mu scale
+src = re.sub(r"'g_weight'\s*:.*", f"'g_weight': ${G_WEIGHT},", src)
+## IY : end
 
 # Override data directories when using map-dir mode
 map_dir = '${MAP_DIR}'

@@ -11,7 +11,6 @@ class GGManager():
             gg_margin: float = 0.05,
     ):
         self.gg_margin = gg_margin
-        self.slope_aware = False  ## IY : 3D slope flag
 
         self.__load_gggv_data(gg_path)
 
@@ -48,31 +47,6 @@ class GGManager():
         self.ay_max_list = np.insert(self.ay_max_list, 0, self.ay_max_list[0], axis=0)
         self.ay_max_list = np.insert(self.ay_max_list, 0, 1e-3*np.ones_like(self.ay_max_list[0, 1]), axis=1)
 
-        ## IY : load 3D slope diamond if available
-        slope_path = os.path.join(gggv_path, 'slope_list.npy')
-        ax_max_3d_path = os.path.join(gggv_path, 'ax_max_3d.npy')
-        if os.path.exists(slope_path) and os.path.exists(ax_max_3d_path):
-            self.slope_aware = True
-            self.slope_list = np.load(slope_path)
-            self.gg_exponent_3d = np.load(os.path.join(gggv_path, 'gg_exponent_3d.npy'))
-            self.ax_min_3d = np.load(os.path.join(gggv_path, 'ax_min_3d.npy'))
-            self.ax_max_3d = np.load(os.path.join(gggv_path, 'ax_max_3d.npy'))
-            self.ay_max_3d = np.load(os.path.join(gggv_path, 'ay_max_3d.npy'))
-            # Pad V=0 and g=0 boundaries (same logic as 2D)
-            for attr in ['gg_exponent_3d', 'ax_min_3d', 'ax_max_3d', 'ay_max_3d']:
-                arr = getattr(self, attr)
-                arr = np.insert(arr, 0, arr[0], axis=0)  # V=0
-                if attr == 'gg_exponent_3d':
-                    arr = np.insert(arr, 0, arr[:, 0:1, :], axis=1)  # g=0
-                else:
-                    arr = np.insert(arr, 0, 1e-3 * np.ones_like(arr[:, 0:1, :]), axis=1)
-                setattr(self, attr, arr)
-            print(f'[GGManager] 3D slope-aware GGV loaded: '
-                  f'slope_N={len(self.slope_list)}, '
-                  f'range=[{np.degrees(self.slope_list[0]):.1f}°, '
-                  f'{np.degrees(self.slope_list[-1]):.1f}°]')
-        ## IY : end
-
     def __get_diamond_interpolators(self):
         gg_exponent_interpolator = ca.interpolant(
             'gg_exponent_interpolator', 'linear', [self.V_list, self.g_list], self.gg_exponent_list.ravel(order='F')
@@ -91,21 +65,6 @@ class GGManager():
             'acc_interpolator', 'linear', [self.V_list, self.g_list],
             np.array([self.gg_exponent_list, self.ax_min_list * (1.0 - self.gg_margin), self.ax_max_list * (1.0 - self.gg_margin), self.ay_max_list * (1.0 - self.gg_margin)]).ravel(order='F')
         )
-
-        ## IY : 3D slope-aware interpolator
-        if self.slope_aware:
-            m = 1.0 - self.gg_margin
-            self.acc_interpolator_3d = ca.interpolant(
-                'acc_interpolator_3d', 'linear',
-                [self.V_list, self.g_list, self.slope_list],
-                np.array([
-                    self.gg_exponent_3d,
-                    self.ax_min_3d * m,
-                    self.ax_max_3d * m,
-                    self.ay_max_3d * m,
-                ]).ravel(order='F')
-            )
-        ## IY : end
 
         return gg_exponent_interpolator, ax_max_interpolator, ax_min_interpolator, ay_max_interpolator, acc_interpolator
 
