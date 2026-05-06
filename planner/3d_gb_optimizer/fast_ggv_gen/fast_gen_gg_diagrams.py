@@ -55,18 +55,6 @@ parser.add_argument('--fast', action='store_true', default=True,
                     help='Use reduced resolution for fast tuning (default: True)')
 parser.add_argument('--full', action='store_true', default=False,
                     help='Use full resolution (override --fast)')
-## IY : slope sweep for rqt_gg_viewer visualization
-parser.add_argument('--enable_slope', action='store_true', default=False,
-                    help='Compute GGV at multiple slope angles (visualization only)')
-parser.add_argument('--slope_max_deg', type=float, default=15.0,
-                    help='Max slope angle [deg] for sweep (default: 15)')
-parser.add_argument('--slope_N', type=int, default=5,
-                    help='Number of slope angles (default: 5)')
-parser.add_argument('--slope_ax_scale', type=float, default=1.0,
-                    help='Slope longitudinal bias scale (1.0=physics)')
-parser.add_argument('--slope_normal_scale', type=float, default=1.0,
-                    help='Slope normal force reduction scale (1.0=physics)')
-## IY : end
 args, _ = parser.parse_known_args()
 
 vehicle_name = args.vehicle_name
@@ -92,25 +80,28 @@ g_earth = 9.81
 #       V lookups to the nearest v_list entry, so V=1.0~1.99 queries return
 #       the V=2.0 envelope — equivalent to a hard floor at V=2, but much
 #       cleaner than the original clamp hack.
-## IY : V_max bound to vehicle_params['v_max'] after yml load
+## IY : g range [1.81, 21.81] = step 2.0, g_N 6/11 → flat 9.81 on grid,
+##      covers weight=1.5 amplify at v_max=9 valley (19.68) clip-free.
+##      fast=full[::2] subset preserved.
+##      V uses fixed step (fast=1.0, full=0.5) → prefix-compatible across v_max.
 if fast_mode:
     V_min = 2.0
-    V_N = 5
-    g_factor_min = 1.0 / g_earth
-    g_factor_max = 20.0 / g_earth
-    g_N = 3
-    alpha_N_nlp = 20
+    V_step = 1.0
+    g_factor_min = 1.81 / g_earth
+    g_factor_max = 21.81 / g_earth
+    g_N = 6
+    alpha_N_nlp = 60
     alpha_N_interp = 125
-    print(f'[fast_gg] FAST mode: V_N={V_N} g_N={g_N} alpha_N={alpha_N_nlp}')
+    print(f'[fast_gg] FAST mode: V_step={V_step} g_N={g_N} alpha_N={alpha_N_nlp}')
 else:
     V_min = 2.0
-    V_N = 15
-    g_factor_min = 1.0 / g_earth
-    g_factor_max = 20.0 / g_earth
-    g_N = 9
+    V_step = 0.5
+    g_factor_min = 1.81 / g_earth
+    g_factor_max = 21.81 / g_earth
+    g_N = 11
     alpha_N_nlp = 125
     alpha_N_interp = 125
-    print(f'[fast_gg] FULL mode: V_N={V_N} g_N={g_N} alpha_N={alpha_N_nlp}')
+    print(f'[fast_gg] FULL mode: V_step={V_step} g_N={g_N} alpha_N={alpha_N_nlp}')
 ## IY : end
 
 g_list = np.round(np.linspace(g_earth * g_factor_min, g_earth * g_factor_max, g_N), 6)
@@ -182,12 +173,15 @@ if args.tuning:
     else:
         print(f'[fast_gg] WARNING: --tuning specified but {tuning_path} not found')
 
-## IY : V_max = v_max exactly — no overshoot so downstream (raceline NLP, FBGA) respects v_max
+## IY : V_max = v_max exactly — no overshoot so downstream (raceline NLP, FBGA) respects v_max.
+##      V_list built with fixed V_step → grows with v_max, prefix-compatible across vehicles.
 _v_max_cfg = float(vehicle_params['v_max'])
 V_max = _v_max_cfg
 if V_max <= V_min:
     raise ValueError(f'[fast_gg] v_max ({_v_max_cfg}) must be > V_min ({V_min})')
-print(f'[fast_gg] v_max={_v_max_cfg} → V_max={V_max:.2f} m/s (V_list={V_min}~{V_max:.2f}, N={V_N})')
+V_list = np.arange(V_min, V_max + V_step / 2.0, V_step)
+V_N = len(V_list)
+print(f'[fast_gg] v_max={_v_max_cfg} → V_list={V_list.tolist()} (V_N={V_N})')
 
 # calculate maximum slip maps
 N_list, kappa_max_list, lambda_max_list = calc_max_slip_map(tire_params=tire_params)
@@ -200,16 +194,11 @@ lambda_max = interpolant("lambda_max", "bspline", [N_list], np.abs(lambda_max_li
 print('[fast_gg] Building parametric NLP solver (one-time cost)...')
 t_build_start = time.time()
 
-# --- Parameters: V, g_force, alpha, slope ---
+# --- Parameters: V, g_force, alpha ---
 p_V = MX.sym("p_V")
 p_g = MX.sym("p_g")
 p_alpha = MX.sym("p_alpha")
-## IY : slope parameter + heuristic scale factors
-p_slope = MX.sym("p_slope")
-p_slope_ax_scale = MX.sym("p_slope_ax_scale")
-p_slope_normal_scale = MX.sym("p_slope_normal_scale")
-p = vertcat(p_V, p_g, p_alpha, p_slope, p_slope_ax_scale, p_slope_normal_scale)
-## IY : end
+p = vertcat(p_V, p_g, p_alpha)
 
 # --- Decision variables with scaling ---
 mu_x_max = tire_params["p_Dx_1"] * tire_params["lambda_mu_x"]
@@ -465,16 +454,12 @@ g_con += [F_x_rr - 0.5 * k_t(a_x) * F_x]
 lbg += [0, 0, 0, 0]
 ubg += [0, 0, 0, 0]
 
-# --- Steady state equations --- ## IY : slope decomposition with heuristic scales
-_slope_ax_bias = vehicle_params["m"] * p_g * sin(p_slope) * p_slope_ax_scale
-_slope_normal = p_g * (1.0 - (1.0 - cos(p_slope)) * p_slope_normal_scale)
-g_con += [vehicle_params["m"] * a_x - (F_x_fl + F_x_fr + F_x_rl + F_x_rr) + (F_y_fl + F_y_fr) * delta + F_D
-          + _slope_ax_bias]
+# --- Steady state equations ---
+g_con += [vehicle_params["m"] * a_x - (F_x_fl + F_x_fr + F_x_rl + F_x_rr) + (F_y_fl + F_y_fr) * delta + F_D]
 g_con += [vehicle_params["m"] * a_y - (F_y_fl + F_y_fr + F_y_rl + F_y_rr) - (F_x_fl + F_x_fr) * delta]
-g_con += [vehicle_params["m"] * _slope_normal + F_Lf + F_Lr - N_fl - N_fr - N_rl - N_rr]
+g_con += [vehicle_params["m"] * p_g + F_Lf + F_Lr - N_fl - N_fr - N_rl - N_rr]
 g_con += [vehicle_params["m"] * a_y * vehicle_params["h"] - 0.5 * vehicle_params["T"] * (N_fl - N_fr + N_rl - N_rr)]
 g_con += [vehicle_params["m"] * a_x * vehicle_params["h"]
-          + _slope_ax_bias * vehicle_params["h"]
           - vehicle_params["a"] * F_Lf + vehicle_params["b"] * F_Lr
           + vehicle_params["a"] * (N_fl + N_fr) - vehicle_params["b"] * (N_rl + N_rr)]
 g_con += [0.5 * vehicle_params["T"] * (F_y_fl - F_y_fr) * delta
@@ -574,9 +559,8 @@ print(f'[fast_gg] Solver built in {t_build:.2f}s')
 # ============================================================
 # Solve functions (same physics, just calls solver with params)
 # ============================================================
-def calc_gg_points(V, g_force, alpha_list_local, slope=0.0,
-                   slope_ax_scale=1.0, slope_normal_scale=1.0):
-    """Solve GG points for given V, g_force, slope across all alpha values."""
+def calc_gg_points(V, g_force, alpha_list_local):
+    """Solve GG points for given V, g_force across all alpha values."""
     wb = vehicle_params["a"] + vehicle_params["b"]
     mu_x_max_val = tire_params["p_Dx_1"] * tire_params["lambda_mu_x"]
     N_ij0 = vehicle_params["m"] * g_force / 4.0
@@ -619,8 +603,7 @@ def calc_gg_points(V, g_force, alpha_list_local, slope=0.0,
         #                p=vertcat(V, g_force, alpha))
         x_opt = solver(x0=x0_n, lbx=lbx_vec, ubx=ubx_vec,
                        lbg=lbg_vec, ubg=ubg_vec,
-                       p=vertcat(V, g_force, alpha, slope,
-                                 slope_ax_scale, slope_normal_scale))
+                       p=vertcat(V, g_force, alpha))
         ## IY : end
 
         if solver.stats()["success"]:
@@ -657,13 +640,11 @@ def rotate_by_beta(ax_vf, ay_vf, beta):
 
 
 def calc_rho_for_V(V):
-    """Compute rho for all g values at given V (slope=0)."""
+    """Compute rho for all g values at given V."""
     rho_veh = []
     rho_vel = []
     for g_force in g_list:
-        ax_vf, ay_vf, beta = calc_gg_points(V, g_force, alpha_list,
-                                             slope=0.0, slope_ax_scale=1.0,
-                                             slope_normal_scale=1.0)
+        ax_vf, ay_vf, beta = calc_gg_points(V, g_force, alpha_list)
         ax_velf, ay_velf = rotate_by_beta(ax_vf, ay_vf, beta)
         rho_veh.append(gen_gg_polar(np.column_stack((ax_vf, ay_vf)), alpha_list_interp))
         rho_vel.append(gen_gg_polar(np.column_stack((ax_velf, ay_velf)), alpha_list_interp))
@@ -674,8 +655,7 @@ def calc_rho_for_V(V):
 # Main
 # ============================================================
 if __name__ == "__main__":
-    V_list = np.linspace(V_min, V_max, V_N)
-
+    # V_list / V_N already defined above (after V_max load) using V_step.
     print(f'[fast_gg] Starting GGV computation ({V_N} velocities, {num_cores} cores)...')
     t_solve_start = time.time()
 
@@ -757,12 +737,6 @@ if __name__ == "__main__":
             os.path.join(out_path, frame, "rho.npy"),
             np.asarray(rho_vehicle_frame) if frame == "vehicle_frame" else np.asarray(rho_velocity_frame),
         )
-        ## IY : save meta so gen_diamond/downstream can branch on enable_slope
-        np.save(os.path.join(out_path, frame, "enable_slope.npy"),
-                np.bool_(args.enable_slope))
-        np.save(os.path.join(out_path, frame, "slope_ax_scale.npy"),
-                np.float64(args.slope_ax_scale))
-        ## IY : end
 
     t_total = time.time() - t_build_start
     n_nlp = V_N * g_N * len(alpha_list)
@@ -771,63 +745,5 @@ if __name__ == "__main__":
     print(f'[fast_gg] NLP solve:    {t_solve:.2f}s  ({n_nlp} calls)')
     print(f'[fast_gg] Total:        {t_total:.2f}s')
     print(f'[fast_gg] Output: {out_path}')
-
-    ## IY : slope sweep — compute rho at each slope angle for diamond fitting + 3D gg.bin
-    if args.enable_slope:
-        slope_max_rad = np.radians(args.slope_max_deg)
-        slope_list = np.linspace(-slope_max_rad, slope_max_rad, args.slope_N)
-        slope_list_deg = np.degrees(slope_list)
-        print(f'\n[fast_gg] ===== Slope sweep: {args.slope_N} angles, '
-              f'±{args.slope_max_deg}° =====')
-
-        _ax_sc = args.slope_ax_scale
-        _nm_sc = args.slope_normal_scale
-        print(f'[fast_gg] Slope scales: ax={_ax_sc}, normal={_nm_sc}')
-
-        def calc_rho_for_V_slope(V, slope_rad):
-            """Compute rho for all g values at given V and slope."""
-            rho_veh, rho_vel = [], []
-            for g_force in g_list:
-                ax_vf, ay_vf, beta = calc_gg_points(
-                    V, g_force, alpha_list, slope=slope_rad,
-                    slope_ax_scale=_ax_sc, slope_normal_scale=_nm_sc)
-                ax_velf, ay_velf = rotate_by_beta(ax_vf, ay_vf, beta)
-                rho_veh.append(gen_gg_polar(np.column_stack((ax_vf, ay_vf)), alpha_list_interp))
-                rho_vel.append(gen_gg_polar(np.column_stack((ax_velf, ay_velf)), alpha_list_interp))
-            return rho_veh, rho_vel
-
-        t_slope_start = time.time()
-        # rho_slope_*[slope_idx][v_idx][g_idx][alpha_idx]
-        rho_slope_veh = []
-        rho_slope_vel = []
-        for si, slope_rad in enumerate(slope_list):
-            rho_veh_all_V = []
-            rho_vel_all_V = []
-            for vi, V in enumerate(V_list):
-                rho_veh, rho_vel = calc_rho_for_V_slope(V, slope_rad)
-                rho_veh_all_V.append(rho_veh)
-                rho_vel_all_V.append(rho_vel)
-            rho_slope_veh.append(rho_veh_all_V)
-            rho_slope_vel.append(rho_vel_all_V)
-            print(f'[fast_gg] slope {slope_list_deg[si]:+.1f}°: done')
-
-        # Save per-slope rho + slope_list for gen_diamond_representation
-        for frame_name, rho_data in [("vehicle_frame", rho_slope_veh),
-                                      ("velocity_frame", rho_slope_vel)]:
-            slope_frame_dir = os.path.join(out_path, 'slope_data', frame_name)
-            os.makedirs(slope_frame_dir, exist_ok=True)
-            np.save(os.path.join(slope_frame_dir, 'slope_list.npy'), slope_list)
-            np.save(os.path.join(slope_frame_dir, 'slope_list_deg.npy'), slope_list_deg)
-            np.save(os.path.join(slope_frame_dir, 'v_list.npy'), V_list)
-            np.save(os.path.join(slope_frame_dir, 'g_list.npy'), g_list)
-            np.save(os.path.join(slope_frame_dir, 'alpha_list.npy'), alpha_list_interp)
-            # rho shape: [slope_N, V_N, g_N, alpha_N]
-            np.save(os.path.join(slope_frame_dir, 'rho.npy'),
-                    np.asarray(rho_data))
-
-        t_slope = time.time() - t_slope_start
-        print(f'[fast_gg] Slope sweep done in {t_slope:.1f}s')
-        print(f'[fast_gg] Slope rho output: {os.path.join(out_path, "slope_data")}')
-    ## IY : end
 
 # EOF

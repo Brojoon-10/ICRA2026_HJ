@@ -50,16 +50,7 @@ echo "[1/3] Generating GGV diagrams..."
 ## IY : pass tuning flag and optional tuning_name override
 #       Empty strings collapse cleanly when unset, so defaults behave
 #       identically to the original.
-# python3 fast_gen_gg_diagrams.py --vehicle_name $VEHICLE_NAME $RESOLUTION
-## IY : slope sweep forwarding
-SLOPE_ARGS=""
-if [[ "${ENABLE_SLOPE:-0}" == "1" ]]; then
-    SLOPE_ARGS="--enable_slope --slope_max_deg=${SLOPE_MAX_DEG:-15} --slope_N=${SLOPE_N:-5}"
-    SLOPE_ARGS="${SLOPE_ARGS} --slope_ax_scale=${SLOPE_AX_SCALE:-1.0} --slope_normal_scale=${SLOPE_NORMAL_SCALE:-1.0}"
-    echo " Slope:      ON (±${SLOPE_MAX_DEG:-15}°, N=${SLOPE_N:-5}, ax_sc=${SLOPE_AX_SCALE:-1.0}, nm_sc=${SLOPE_NORMAL_SCALE:-1.0})"
-fi
-## IY : end
-python3 fast_gen_gg_diagrams.py --vehicle_name $VEHICLE_NAME $RESOLUTION $TUNING_FLAG $TUNING_NAME_ARG $SLOPE_ARGS
+python3 fast_gen_gg_diagrams.py --vehicle_name $VEHICLE_NAME $RESOLUTION $TUNING_FLAG $TUNING_NAME_ARG
 ## IY : end
 
 # 2. Diamond fitting
