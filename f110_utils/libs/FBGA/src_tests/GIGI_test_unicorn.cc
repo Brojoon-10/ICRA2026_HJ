@@ -258,7 +258,10 @@ int main(int argc, char *argv[])
     ("params",  "Vehicle params file (key=value)",        cxxopts::value<std::string>())
     ("gg",      "GG table binary (lookup mode)",          cxxopts::value<std::string>()->default_value(""))
     ("output",  "Output CSV (s, v, ax, ay)",              cxxopts::value<std::string>())
-    ("v0",      "Initial velocity [m/s]",                 cxxopts::value<GG::real>()->default_value("1.0"));
+    ("v0",      "Initial velocity [m/s]",                 cxxopts::value<GG::real>()->default_value("1.0"))
+    // IY : 2.5d_vel_planner slope_correction (1.0 = physics)
+    ("slope-corr", "Slope ax_grav scale (1=physics, higher=more conservative)",
+                cxxopts::value<GG::real>()->default_value("1.0"));
 
   auto result = options.parse(argc, argv);
   // Print help
@@ -277,6 +280,8 @@ int main(int argc, char *argv[])
   const std::string output_path = result["output"].as<std::string>();
   const std::string gg_path     = result["gg"].as<std::string>();
   const GG::real    v_initial   = result["v0"].as<GG::real>();
+  // IY : 2.5d_vel_planner slope_correction
+  const GG::real    slope_corr  = result["slope-corr"].as<GG::real>();
 
   // input CSV: comma-separated, header row, '#' = comment
   rapidcsv::Document doc(
@@ -368,6 +373,9 @@ int main(int argc, char *argv[])
   // IY : Step H — instantiate FWBW with the selected model and compute
   // HJ : pass gg_Exp for Vmax mu correction
   GG::FWBW fwbw(model.upper, model.lower, model.range, model.exp_func);
+  // IY : push 2.5d_vel_planner slope_correction into FWBW
+  fwbw.set_slope_corr(slope_corr);
+  std::cout << " > slope_corr: " << slope_corr << "\n";
 
   std::cout << " + FWBW computation started\n";
   auto start = std::chrono::steady_clock::now();

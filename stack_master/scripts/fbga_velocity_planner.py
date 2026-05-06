@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 ### HJ : FBGA-based 3D velocity planner ROS node
-### global_waypoints 토픽에서 waypoint를 받아 FBGA로 속도 재계산 후 publish
 
 import rospy
 import os
@@ -16,49 +15,17 @@ import threading
 from std_srvs.srv import Trigger, TriggerResponse
 ## IY : end
 
+## IY (origin/main f19f8fe+12b3397) : SG filter on mu/dmu_ds/kappa
+try:
+    from scipy.signal import savgol_filter
+    HAS_SCIPY_SG = True
+except ImportError:
+    HAS_SCIPY_SG = False
+
 from f110_msgs.msg import WpntArray, Wpnt
 import trajectory_planning_helpers as tph
-
-
-## IY : per-sector GGV support for FBGA.
-#   FBGA C++ binary takes a single gg.bin, so multi-GGV is emulated by running
-#   FBGA once per unique source bin and picking per-waypoint results.
-#   Source priority per sector_idx: /gg_tuner/sector_ggv_map/sector<i> snapshot
-#   → legacy <base>_sec<i>/velocity_frame/gg.bin → default gg.bin.
-def _read_friction_sectors_from_yaml(maps_dir, map_name):
-    """Read friction sectors from friction_scaling.yaml. Returns [] on failure."""
-    yaml_path = os.path.join(maps_dir, map_name, 'friction_scaling.yaml')
-    if not os.path.exists(yaml_path):
-        return []
-    try:
-        with open(yaml_path) as f:
-            data = yaml.safe_load(f)
-        sectors = []
-        for i in range(data.get('n_sectors', 0)):
-            sec = data.get(f'Sector{i}', {})
-            fric = sec.get('friction', -1.0)
-            if fric > 0:
-                sectors.append({'sector_idx': i,
-                                'start': sec.get('start', 0),
-                                'end': sec.get('end', 0),
-                                'friction': float(fric)})
-        return sectors
-    except Exception:
-        return []
-
-
-def _build_wpnt_sector_idx_map(sectors, n_waypoints):
-    """Per-waypoint sector_idx int array (-1 = no sector). Returns None if empty."""
-    if not sectors:
-        return None
-    arr = np.full(n_waypoints, -1, dtype=int)
-    for sec in sectors:
-        s = max(0, int(sec['start']))
-        e = min(int(sec['end']) + 1, n_waypoints)
-        if e > s:
-            arr[s:e] = int(sec['sector_idx'])
-    return arr
-## IY : end
+## IY : rqt sliders are owned by gg_tuner_node (GGTuner.cfg FBGA group);
+##   gg_tuner forwards values via /fbga_planner/* rosparam + /fbga/reload.
 
 
 class FBGAVelocityPlanner:
@@ -66,7 +33,6 @@ class FBGAVelocityPlanner:
     def __init__(self):
         rospy.loginfo("[FBGA] Initializing...")
 
-        # === 경로 설정 ===
         ### HJ : derive race_stack root from this script's path to avoid hardcoded /home/unicorn
         race_stack = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
         self.fbga_bin = rospy.get_param(
@@ -94,7 +60,6 @@ class FBGAVelocityPlanner:
         params_yml = rospy.get_param("~params_yml", params_yml_default)
         ## IY : end
 
-        # 경로 검증 (gg.bin 없으면 npy에서 자동 생성)
         for name, path in [('fbga_bin', self.fbga_bin), ('params_yml', params_yml)]:
             if not os.path.exists(path):
                 rospy.logerr(f"[FBGA] File not found: {name}={path}")
@@ -103,48 +68,74 @@ class FBGAVelocityPlanner:
         if not os.path.exists(self.gg_bin):
             self._generate_gg_bin(self.gg_bin)
 
-        # === params.txt 생성 (tmp) ===
         self.params_txt = os.path.join(tempfile.gettempdir(), 'fbga_params.txt')
         self._convert_params_yml(params_yml)
 
-        # === FBGA 설정 ===
         self.n_laps = rospy.get_param("~n_laps", 3)
         self.max_iter = rospy.get_param("~max_iter", 50)
         self.tol = rospy.get_param("~tol", 0.05)        # m/s
-        self.alpha = rospy.get_param("~alpha", 1.0)      # under-relaxation
+        ## IY : under-relax to break limit-cycle oscillation on bridge
+        #       (g_tilde clip + binary nonlinearity → 2-cycle without alpha<1)
+        self.alpha = rospy.get_param("~alpha", 0.5)
+        ## IY : end
         self.v0 = rospy.get_param("~v0", 1.0)
-        ### HJ : mu 보정 on/off (True: ax_tilde + Vmax mu 보정, False: g_tilde만)
         self.enable_mu = rospy.get_param("~enable_mu", True)
 
-        # GGV g_list 범위 (clamp용)
+        ## IY : legacy g_weight kept only for backward compat (not applied)
+        self.g_weight = float(rospy.get_param("~g_weight", 1.0))
+        if self.g_weight != 1.0:
+            rospy.logwarn(
+                "[FBGA] ~g_weight is legacy; bridge_effect now controls slope effect")
+
+        ## IY : bridge_effect = 2.5d_vel_planner slope_correction
+        ##   1.0 = physics, 0.0 = treat as flat, >1.0 = more conservative.
+        ##   Applied in C++ FWBW (sin(mu)*slope_corr) via --slope-corr CLI.
+        self.bridge_effect = float(rospy.get_param("~bridge_effect", 1.0))
+
+        ## IY : softplus floor sharpness for g_tilde (1/beta = transition width)
+        self.g_tilde_soft_beta = float(rospy.get_param("~g_tilde_soft_beta", 20.0))
+
+        ## IY : SG filter params (origin/main f19f8fe defaults)
+        self.smooth_mu = bool(rospy.get_param("~smooth_mu", True))
+        self.mu_smooth_window = int(rospy.get_param("~mu_smooth_window", 21))
+        self.mu_smooth_polyorder = int(rospy.get_param("~mu_smooth_polyorder", 3))
+        self.smooth_kappa = bool(rospy.get_param("~smooth_kappa", True))
+        self.kappa_smooth_window = int(rospy.get_param("~kappa_smooth_window", 21))
+        self.kappa_smooth_polyorder = int(rospy.get_param("~kappa_smooth_polyorder", 3))
+
+        ## IY : pre-slope brake (off by default, 2.5d_vel_planner pattern)
+        self.slope_brake_margin = float(rospy.get_param("~slope_brake_margin", 0.0))
+        self.slope_brake_vmax = float(rospy.get_param("~slope_brake_vmax", 5.0))
+
+        if self.smooth_mu and not HAS_SCIPY_SG:
+            rospy.logwarn("[FBGA] scipy unavailable — SG smoothing disabled")
+            self.smooth_mu = False
+            self.smooth_kappa = False
+
         self.g_min, self.g_max = self._read_g_range()
 
         # === Pub/Sub ===
-        self.processed = False  ### HJ : 한번만 처리 (자기 출력 재수신 방지)
+        self.processed = False
         self.pub = rospy.Publisher('/global_waypoints', WpntArray, queue_size=10)
         rospy.Subscriber('/global_waypoints', WpntArray, self.wpnts_callback)
 
         ## IY : hot-reload — cache last input wpnts + mutex + /fbga/reload service
-        #       gg_tuner 가 GGV 재생성 후 프로세스 재시작 없이
-        #       갈아끼우기 위해 사용 (Python boot ~3-4s 절감).
         self.last_wpnts_msg = None
         self.process_lock = threading.Lock()
         self.reload_srv = rospy.Service('/fbga/reload', Trigger, self.reload_cb)
         ## IY : end
 
-        ## IY : per-sector GGV — map sector_idx → gg.bin path
-        self.race_stack = race_stack
-        self.gg_base_dir = os.path.dirname(os.path.dirname(self.gg_bin))  # gg_diagrams/rc_car_10th_latest
-        self.sector_gg_bins = {}  # sector_idx(int) → gg.bin path
-        self._load_friction_sectors()
-        ## IY : end
-
         rospy.loginfo(f"[FBGA] Ready. bin={self.fbga_bin}")
         rospy.loginfo(f"[FBGA] gg.bin={self.gg_bin}")
         rospy.loginfo(f"[FBGA] n_laps={self.n_laps}, max_iter={self.max_iter}, tol={self.tol}")
+        rospy.loginfo(
+            f"[FBGA] bridge_effect={self.bridge_effect:.2f}, "
+            f"g_tilde_soft_beta={self.g_tilde_soft_beta:.1f}, "
+            f"smooth_mu={self.smooth_mu}/win{self.mu_smooth_window}, "
+            f"smooth_kappa={self.smooth_kappa}/win{self.kappa_smooth_window}, "
+            f"slope_brake_margin={self.slope_brake_margin:.2f}m")
 
     def _generate_gg_bin(self, bin_path):
-        """npy 파일에서 gg.bin 자동 생성"""
         npy_dir = os.path.dirname(bin_path)
         rospy.loginfo(f"[FBGA] gg.bin not found, generating from {npy_dir}")
 
@@ -178,85 +169,7 @@ class FBGAVelocityPlanner:
         self.v_max = float(vp['v_max'])
         rospy.loginfo(f"[FBGA] params.txt saved: m={vp['m']}, P_max={vp['P_max']}, v_max={vp['v_max']}")
 
-    ## IY : resolve per-sector gg.bin (rosparam snapshot → legacy _sec<i> → default)
-    def _load_friction_sectors(self):
-        """Build sector_idx → gg.bin map using rosparam snapshot names first."""
-        map_name = rospy.get_param('/map', '')
-        maps_dir = os.path.join(self.race_stack, 'stack_master', 'maps')
-        sectors = _read_friction_sectors_from_yaml(maps_dir, map_name)
-
-        try:
-            with open(rospy.get_param('~params_yml',
-                      os.path.join(self.race_stack, 'planner', '3d_gb_optimizer',
-                                   'global_line', 'data', 'vehicle_params',
-                                   'params_rc_car_10th_latest.yml'))) as f:
-                self.base_p_Dx_1 = yaml.safe_load(f).get(
-                    'tire_params', {}).get('p_Dx_1', 0.56)
-        except Exception:
-            self.base_p_Dx_1 = 0.56
-
-        self.sector_gg_bins = {}
-
-        if not sectors:
-            rospy.loginfo("[FBGA] No friction sectors → single GGV mode")
-            return
-
-        self._friction_sectors_raw = sectors
-
-        gg_parent = os.path.dirname(self.gg_base_dir)
-        base_name = os.path.basename(self.gg_base_dir)
-
-        for sec in sectors:
-            sidx = int(sec['sector_idx'])
-            sec_bin = None
-
-            # 1) rosparam snapshot selector
-            snap = ''
-            try:
-                snap = rospy.get_param(
-                    f'/gg_tuner/sector_ggv_map/sector{sidx}', '')
-            except Exception:
-                snap = ''
-            snap = (snap or '').strip()
-            if snap:
-                snap_bin = os.path.join(
-                    gg_parent, snap, 'velocity_frame', 'gg.bin')
-                if os.path.exists(snap_bin):
-                    sec_bin = snap_bin
-                    rospy.loginfo(
-                        f"[FBGA] sector{sidx}: snapshot '{snap}' → {snap_bin}")
-                else:
-                    rospy.logwarn(
-                        f"[FBGA] sector{sidx} snapshot missing: {snap_bin} "
-                        f"→ fallback")
-
-            # 2) legacy <base>_sec<i>
-            if sec_bin is None:
-                legacy_bin = os.path.join(
-                    gg_parent, f'{base_name}_sec{sidx}',
-                    'velocity_frame', 'gg.bin')
-                if os.path.exists(legacy_bin):
-                    sec_bin = legacy_bin
-                    rospy.loginfo(
-                        f"[FBGA] sector{sidx}: legacy dir → {legacy_bin}")
-
-            # 3) no override → uses default self.gg_bin (not stored)
-            if sec_bin is not None and sec_bin != self.gg_bin:
-                self.sector_gg_bins[sidx] = sec_bin
-
-        if not self.sector_gg_bins:
-            rospy.loginfo("[FBGA] No per-sector overrides → single GGV mode")
-        else:
-            rospy.loginfo(
-                f"[FBGA] Per-sector GGVs: {len(self.sector_gg_bins)} override(s) "
-                f"across {len(sectors)} sectors")
-    ## IY : end
-
     def _read_g_range(self):
-        """gg.bin에서 g_list 범위 읽기. 2D/3D 포맷 자동 감지."""
-        ## IY 0430 : 3D gg.bin은 헤더가 (nv, ng, ns) 12바이트.
-        ##           2D 포맷으로만 읽으면 ns 필드가 v_list에 끼어들어 g_list가 깨져
-        ##           g_min≈0이 되고 g_tilde가 전부 0으로 클램프 → FBGA 전 segment NaN.
         file_size = os.path.getsize(self.gg_bin)
         with open(self.gg_bin, 'rb') as f:
             nv, ng = struct.unpack('II', f.read(8))
@@ -279,31 +192,51 @@ class FBGAVelocityPlanner:
         ## IY 0430 : end
 
     def _compute_g_tilde(self, mu, v, dmu_ds):
-        """g_tilde = 9.81*cos(mu) - v^2 * dmu/ds, clamped to GGV range"""
-        gt = 9.81 * np.cos(mu) - v**2 * dmu_ds
-        return np.clip(gt, self.g_min, self.g_max)
+        """g_tilde = 9.81*cos(mu) - v^2 * dmu_ds, with softplus floor at g_min."""
+        ## IY (legacy g_weight scaling — replaced by C++ slope_corr in FWBW.cc):
+        # mu_eff = mu * self.g_weight
+        # dmu_ds_eff = dmu_ds * self.g_weight
+        mu_eff = mu
+        dmu_ds_eff = dmu_ds
+        gt = 9.81 * np.cos(mu_eff) - v**2 * dmu_ds_eff
+        # softplus lower bound (smooth replacement of np.clip's hard floor)
+        beta = self.g_tilde_soft_beta
+        gt_soft = self.g_min + np.log1p(np.exp(beta * (gt - self.g_min))) / beta
+        return np.minimum(gt_soft, self.g_max)
 
     def _initial_speed_estimate(self, kappa, mu, dmu_ds):
-        """XY곡률 + 수직곡률 결합 초기 속도 추정"""
-        ay_max = 4.5  # TODO: GGV에서 읽기
+        ay_max = 4.5
         v_max = 12.0
 
-        # XY 곡률 한계
         radius = np.where(np.abs(kappa) > 1e-4, 1.0 / np.abs(kappa), 1e4)
         v_lat = np.clip(np.sqrt(ay_max * radius), 0, v_max)
 
-        # 수직 곡률 한계 (crest에서 g_tilde > 0 조건)
+        ## IY (legacy g_weight scaling — replaced by C++ slope_corr):
+        # mu_eff = mu * self.g_weight
+        # dmu_ds_eff = dmu_ds * self.g_weight
+        mu_eff = mu
+        dmu_ds_eff = dmu_ds
         v_vert = np.full_like(kappa, v_max)
-        crest = dmu_ds > 1e-4
+        crest = dmu_ds_eff > 1e-4
         v_vert[crest] = np.clip(
-            np.sqrt(9.81 * np.cos(mu[crest]) / dmu_ds[crest]), 0.5, v_max)
+            np.sqrt(9.81 * np.cos(mu_eff[crest]) / dmu_ds_eff[crest]), 0.5, v_max)
 
         return np.minimum(v_lat, v_vert)
 
+    def _smooth_kappa(self, kappa):
+        """SG-smooth a *copy* of kappa for vel calc only (path is preserved)."""
+        if not self.smooth_kappa or not HAS_SCIPY_SG:
+            return kappa
+        win = self.kappa_smooth_window | 1   # force odd
+        if len(kappa) < win:
+            return kappa
+        poly = max(1, min(self.kappa_smooth_polyorder, win - 1))
+        pad = win // 2
+        k_pad = np.concatenate([kappa[-pad:], kappa, kappa[:pad]])
+        return savgol_filter(k_pad, win, poly)[pad:-pad]
+
     def _stack_laps(self, s, kappa, g_tilde, mu, dmu_ds):
-        """N-laps 이어붙이기 (closed loop 보완)"""
         n_pts = len(s)
-        ### HJ : 첫 두 점 간격 사용
         ds = s[1] - s[0] if n_pts > 1 else 0.1
         lap_length = s[-1] - s[0] + ds
 
@@ -311,46 +244,39 @@ class FBGAVelocityPlanner:
         k_stack = np.tile(kappa, self.n_laps)
         g_stack = np.tile(g_tilde, self.n_laps)
         mu_stack = np.tile(mu, self.n_laps)
-        dmu_stack = np.tile(dmu_ds, self.n_laps)  ### HJ : dmu_ds도 같이 stack
+        dmu_stack = np.tile(dmu_ds, self.n_laps) 
         return s_stack, k_stack, g_stack, mu_stack, dmu_stack, lap_length, n_pts
 
-    # --- (original _run_fbga signature, kept for reference) ---
-    # def _run_fbga(self, s, kappa, g_tilde, mu, dmu_ds, v0):
-    # --- (end) ---
-    ## IY(0416) : add gg_bin_override for per-friction FBGA runs
-    def _run_fbga(self, s, kappa, g_tilde, mu, dmu_ds, v0, gg_bin_override=None):
-        """Run FBGA C++ binary. gg_bin_override selects friction-specific GGV."""
+    def _run_fbga(self, s, kappa, g_tilde, mu, dmu_ds, v0):
+        """Run FBGA C++ binary on a single stacked-lap input."""
         input_csv = os.path.join(tempfile.gettempdir(), 'fbga_input.csv')
         output_csv = os.path.join(tempfile.gettempdir(), 'fbga_output.csv')
 
-        ### HJ : enable_mu flag로 mu 보정 여부 제어
+        ## IY (legacy g_weight scaling — replaced by --slope-corr CLI):
+        # mu_csv = mu * self.g_weight
+        # dmu_ds_csv = dmu_ds * self.g_weight
+        mu_csv = mu
+        dmu_ds_csv = dmu_ds
         with open(input_csv, 'w') as f:
             if self.enable_mu:
                 f.write('s,kappa,g_tilde,mu,dmu_ds\n')
                 for i in range(len(s)):
-                    f.write(f'{s[i]:.6f},{kappa[i]:.8f},{g_tilde[i]:.6f},{mu[i]:.8f},{dmu_ds[i]:.8f}\n')
+                    f.write(f'{s[i]:.6f},{kappa[i]:.8f},{g_tilde[i]:.6f},{mu_csv[i]:.8f},{dmu_ds_csv[i]:.8f}\n')
             else:
                 f.write('s,kappa,g_tilde\n')
                 for i in range(len(s)):
                     f.write(f'{s[i]:.6f},{kappa[i]:.8f},{g_tilde[i]:.6f}\n')
 
-        ## IY(0416) : use override gg.bin if provided (multi-friction)
-        # --- (original cmd, kept for reference) ---
-        # cmd = [self.fbga_bin, '--model', 'lookup', '--input', input_csv,
-        #        '--params', self.params_txt, '--gg', self.gg_bin,
-        #        '--output', output_csv, '--v0', f'{v0:.4f}']
-        # --- (end) ---
-        gg_file = gg_bin_override if gg_bin_override else self.gg_bin
         cmd = [
             self.fbga_bin,
             '--model', 'lookup',
             '--input', input_csv,
             '--params', self.params_txt,
-            '--gg', gg_file,
+            '--gg', self.gg_bin,
             '--output', output_csv,
             '--v0', f'{v0:.4f}',
+            '--slope-corr', f'{self.bridge_effect:.4f}',
         ]
-        ## IY(0416) : end
 
         try:
             rospy.loginfo(f"[FBGA] Running: {' '.join(cmd)}")
@@ -366,7 +292,6 @@ class FBGAVelocityPlanner:
             rospy.logerr(f"[FBGA] exe error: {e}")
             return None
 
-        # 결과 읽기
         v_out = []
         ax_out = []
         with open(output_csv) as f:
@@ -378,7 +303,6 @@ class FBGAVelocityPlanner:
                     v_out.append(float(parts[1]))
                     ax_out.append(float(parts[2]))
 
-        ### HJ : tmp 파일 정리 (디버깅용 비활성화)
         try:
             os.remove(input_csv)
             os.remove(output_csv)
@@ -388,24 +312,11 @@ class FBGAVelocityPlanner:
         return np.array(v_out), np.array(ax_out)
 
     def _extract_middle_lap(self, v_full, ax_full, n_pts_per_lap):
-        """N-laps 결과에서 중간 바퀴 추출"""
         middle = self.n_laps // 2
         start = middle * n_pts_per_lap
         end = start + n_pts_per_lap
         return v_full[start:end], ax_full[start:end]
 
-    ## IY : split callback → cache input + delegate to _process_and_publish.
-    #       self.processed 는 self-echo 방지용으로 유지.
-    #       reload_cb 에서 캐시된 입력으로 재계산할 수 있도록 last_wpnts_msg 저장.
-    # --- (기존 wpnts_callback 원본, 보존용 주석) ---
-    # def wpnts_callback(self, msg):
-    #     if self.processed:
-    #         return
-    #     self.processed = True
-    #
-    #     wpnts = msg.wpnts
-    #     n = len(wpnts)
-    # --- (원본 끝) ---
     def wpnts_callback(self, msg):
         with self.process_lock:
             if self.processed:
@@ -415,30 +326,46 @@ class FBGAVelocityPlanner:
             self._process_and_publish(msg)
 
     def reload_cb(self, req):
-        """Hot-reload: re-read gg.bin + params.yml + enable_mu, reprocess cached wpnts.
-
-        gg_tuner_node 가 새 GGV 생성 후 호출. Python import/boot 없이
-        0.5초 이내에 새 파라미터로 /global_waypoints 갱신.
-        """
         try:
             new_gg = rospy.get_param('~gg_bin', self.gg_bin)
             new_params = rospy.get_param('~params_yml', None)
             new_enable_mu = rospy.get_param('~enable_mu', self.enable_mu)
 
+            ## IY : refresh runtime knobs from rosparam (rqt sliders also write here)
+            new_bridge_effect = float(rospy.get_param('~bridge_effect', self.bridge_effect))
+            new_g_tilde_soft_beta = float(rospy.get_param('~g_tilde_soft_beta', self.g_tilde_soft_beta))
+            new_smooth_mu = bool(rospy.get_param('~smooth_mu', self.smooth_mu))
+            new_mu_smooth_window = int(rospy.get_param('~mu_smooth_window', self.mu_smooth_window))
+            new_mu_smooth_polyorder = int(rospy.get_param('~mu_smooth_polyorder', self.mu_smooth_polyorder))
+            new_smooth_kappa = bool(rospy.get_param('~smooth_kappa', self.smooth_kappa))
+            new_kappa_smooth_window = int(rospy.get_param('~kappa_smooth_window', self.kappa_smooth_window))
+            new_kappa_smooth_polyorder = int(rospy.get_param('~kappa_smooth_polyorder', self.kappa_smooth_polyorder))
+            new_slope_brake_margin = float(rospy.get_param('~slope_brake_margin', self.slope_brake_margin))
+            new_slope_brake_vmax = float(rospy.get_param('~slope_brake_vmax', self.slope_brake_vmax))
+
             with self.process_lock:
                 self.gg_bin = new_gg
                 self.enable_mu = new_enable_mu
+                self.bridge_effect = new_bridge_effect
+                self.g_tilde_soft_beta = new_g_tilde_soft_beta
+                self.smooth_mu = new_smooth_mu and HAS_SCIPY_SG
+                self.mu_smooth_window = new_mu_smooth_window | 1
+                self.mu_smooth_polyorder = new_mu_smooth_polyorder
+                self.smooth_kappa = new_smooth_kappa and HAS_SCIPY_SG
+                self.kappa_smooth_window = new_kappa_smooth_window | 1
+                self.kappa_smooth_polyorder = new_kappa_smooth_polyorder
+                self.slope_brake_margin = new_slope_brake_margin
+                self.slope_brake_vmax = new_slope_brake_vmax
                 self.g_min, self.g_max = self._read_g_range()
                 if new_params and os.path.exists(new_params):
                     self._convert_params_yml(new_params)
 
-                ## IY(0416) : reload friction sectors on hot-reload
-                self.gg_base_dir = os.path.dirname(os.path.dirname(new_gg))
-                self._load_friction_sectors()
-                ## IY(0416) : end
-
                 rospy.loginfo(
-                    f"[FBGA] Reloaded: gg={new_gg}, enable_mu={new_enable_mu}")
+                    f"[FBGA] Reloaded: bridge_effect={self.bridge_effect:.2f}, "
+                    f"soft_beta={self.g_tilde_soft_beta:.1f}, "
+                    f"smooth_mu={self.smooth_mu}/win{self.mu_smooth_window}, "
+                    f"smooth_kappa={self.smooth_kappa}/win{self.kappa_smooth_window}, "
+                    f"slope_brake_margin={self.slope_brake_margin:.2f}m")
 
                 if self.last_wpnts_msg is not None:
                     self._process_and_publish(self.last_wpnts_msg)
@@ -454,116 +381,58 @@ class FBGAVelocityPlanner:
             return TriggerResponse(success=False, message=str(e)[:200])
 
     def _process_and_publish(self, msg):
-        """FBGA 반복 계산 + /global_waypoints publish. 기존 wpnts_callback 본문."""
         wpnts = msg.wpnts
         n = len(wpnts)
-    ## IY : end
 
-        # waypoint 데이터 추출
         s = np.array([wp.s_m for wp in wpnts])
         kappa = np.array([wp.kappa_radpm for wp in wpnts])
         mu = np.array([wp.mu_rad for wp in wpnts])
         v_existing = np.array([wp.vx_mps for wp in wpnts])
 
-        ### HJ : periodic central difference (run_fwbw.py와 동일)
-        ### HJ : ds를 첫 두 점 간격으로 계산
         ds_grid = s[1] - s[0] if n > 1 else 0.1
-        mu_wrap = np.concatenate([[mu[-1]], mu, [mu[0]]])
-        dmu_ds = (mu_wrap[2:] - mu_wrap[:-2]) / (2.0 * ds_grid)
 
-        # 초기 속도: waypoint에 이미 있으면 사용, 없으면 추정
+        ## IY (origin/main f19f8fe) : SG filter on mu, deriv=1 on padded mu for dmu_ds.
+        ##   Replaces the central diff that overestimates derivatives at the seam
+        ##   and leaks cm-scale PCD noise into v at curvature inflections.
+        if self.smooth_mu and HAS_SCIPY_SG and n >= self.mu_smooth_window:
+            win = self.mu_smooth_window | 1
+            poly = max(1, min(self.mu_smooth_polyorder, win - 1))
+            pad = win // 2
+            mu_pad = np.concatenate([mu[-pad:], mu, mu[:pad]])
+            mu = savgol_filter(mu_pad, win, poly)[pad:-pad]
+            dmu_ds = savgol_filter(mu_pad, win, poly,
+                                   deriv=1, delta=ds_grid)[pad:-pad]
+        else:
+            mu_pad = np.concatenate([mu[-1:], mu, mu[:1]])
+            dmu_ds = (mu_pad[2:] - mu_pad[:-2]) / (2.0 * ds_grid)
+
+        ## IY (origin/main 12b3397) : SG filter on kappa for vel calc only
+        ##   wpnts[i].kappa_radpm (path) is preserved.
+        kappa_for_fbga = self._smooth_kappa(kappa)
+
         if np.any(v_existing > 0.1):
             v_prev = v_existing.copy()
             rospy.loginfo("[FBGA] Using existing waypoint speeds as initial estimate")
         else:
-            v_prev = self._initial_speed_estimate(kappa, mu, dmu_ds)
+            v_prev = self._initial_speed_estimate(kappa_for_fbga, mu, dmu_ds)
             rospy.loginfo("[FBGA] Using curvature+slope initial speed estimate")
-
-        ## IY : per-waypoint sector_idx map (only built when overrides exist)
-        sector_idx_per_wpnt = None
-        if self.sector_gg_bins and hasattr(self, '_friction_sectors_raw'):
-            sector_idx_per_wpnt = _build_wpnt_sector_idx_map(
-                self._friction_sectors_raw, n)
-        ## IY : end
 
         # === Fixed-point iteration ===
         for it in range(self.max_iter):
-            # g_tilde 계산
             g_tilde = self._compute_g_tilde(mu, v_prev, dmu_ds)
 
-            # N-laps stack (mu, dmu_ds도 같이)
-            s_stack, k_stack, g_stack, mu_stack, dmu_stack, lap_length, n_pts = self._stack_laps(s, kappa, g_tilde, mu, dmu_ds)
+            s_stack, k_stack, g_stack, mu_stack, dmu_stack, lap_length, n_pts = self._stack_laps(s, kappa_for_fbga, g_tilde, mu, dmu_ds)
 
             v0 = max(float(v_prev[0]), 1.0)
 
-            # --- (original single-FBGA run, kept for reference) ---
-            # result = self._run_fbga(s_stack, k_stack, g_stack, mu_stack, dmu_stack, v0)
-            # if result is None:
-            #     rospy.logwarn("[FBGA] Failed, keeping existing speeds")
-            #     return
-            # v_full, ax_full = result
-            # v_new, ax_new = self._extract_middle_lap(v_full, ax_full, n_pts)
-            # --- (end) ---
+            result = self._run_fbga(s_stack, k_stack, g_stack,
+                                    mu_stack, dmu_stack, v0)
+            if result is None:
+                rospy.logwarn("[FBGA] Failed, keeping existing speeds")
+                return
+            v_full, ax_full = result
+            v_new, ax_new = self._extract_middle_lap(v_full, ax_full, n_pts)
 
-            ## IY : multi-GGV FBGA
-            #   Run FBGA per unique source bin (sector overrides + default).
-            #   Per waypoint: pick the run matching that waypoint's sector_idx,
-            #   falling back to the default run for unmapped indices.
-            if sector_idx_per_wpnt is not None and self.sector_gg_bins:
-                unique_sidx = set(int(x) for x in np.unique(sector_idx_per_wpnt))
-                sidx_results = {}   # sector_idx (or -1 for default) → (v_1lap, ax_1lap)
-
-                # Build runs set: default plus each sector override in use
-                need_default = (-1 in unique_sidx) or any(
-                    s not in self.sector_gg_bins for s in unique_sidx if s != -1)
-
-                if need_default:
-                    res = self._run_fbga(s_stack, k_stack, g_stack,
-                                         mu_stack, dmu_stack, v0)
-                    if res is not None:
-                        v_f, ax_f = res
-                        sidx_results[-1] = self._extract_middle_lap(
-                            v_f, ax_f, n_pts)
-                    else:
-                        rospy.logwarn("[FBGA] default run failed")
-
-                for sidx, gg_bin in self.sector_gg_bins.items():
-                    if sidx not in unique_sidx:
-                        continue
-                    res = self._run_fbga(s_stack, k_stack, g_stack,
-                                         mu_stack, dmu_stack, v0,
-                                         gg_bin_override=gg_bin)
-                    if res is None:
-                        rospy.logwarn(f"[FBGA] sector{sidx} run failed")
-                        continue
-                    v_f, ax_f = res
-                    sidx_results[sidx] = self._extract_middle_lap(
-                        v_f, ax_f, n_pts)
-
-                if not sidx_results:
-                    rospy.logwarn("[FBGA] All multi-GGV runs failed")
-                    return
-
-                v_new = np.zeros(n)
-                ax_new = np.zeros(n)
-                fallback_key = -1 if -1 in sidx_results else next(iter(sidx_results))
-                for i in range(n):
-                    sidx_i = int(sector_idx_per_wpnt[i])
-                    key = sidx_i if sidx_i in sidx_results else fallback_key
-                    v_new[i] = sidx_results[key][0][i]
-                    ax_new[i] = sidx_results[key][1][i]
-            else:
-                # single GGV (original path)
-                result = self._run_fbga(s_stack, k_stack, g_stack,
-                                        mu_stack, dmu_stack, v0)
-                if result is None:
-                    rospy.logwarn("[FBGA] Failed, keeping existing speeds")
-                    return
-                v_full, ax_full = result
-                v_new, ax_new = self._extract_middle_lap(v_full, ax_full, n_pts)
-            ## IY(0416) : end
-
-            # NaN 처리
             nan_mask = np.isnan(v_new)
             if nan_mask.any():
                 n_nan = nan_mask.sum()
@@ -573,7 +442,6 @@ class FBGAVelocityPlanner:
                 valid = np.where(~nan_mask)[0]
                 v_new[nan_mask] = np.interp(np.where(nan_mask)[0], valid, v_new[valid])
 
-            # 수렴 체크
             delta = float(np.max(np.abs(v_new - v_prev)))
             rospy.loginfo(f"[FBGA] iter {it}: max|dv|={delta:.4f} m/s, "
                           f"g_tilde=[{g_tilde.min():.2f},{g_tilde.max():.2f}]")
@@ -592,6 +460,22 @@ class FBGAVelocityPlanner:
 
         ## IY : hard v_max clamp (belt-and-suspenders; GGV grid already saturates)
         v_new = np.minimum(v_new, self.v_max)
+
+        ## IY (origin/main 2.5d_vel_planner pattern) : optional pre-slope brake.
+        ##   off when slope_brake_margin == 0. Heuristic safety cap that
+        ##   forces v <= slope_brake_vmax from `margin` meters before slope
+        ##   entry through slope exit (slope = |mu| > 2 deg).
+        if self.slope_brake_margin > 0:
+            in_slope = np.abs(mu) > np.radians(2.0)
+            diffs = np.diff(in_slope.astype(int))
+            entries = np.where(diffs == 1)[0] + 1
+            exits = np.where(diffs == -1)[0] + 1
+            margin_pts = max(1, int(round(self.slope_brake_margin / ds_grid)))
+            for entry in entries:
+                ex = exits[exits > entry]
+                end = ex[0] if len(ex) > 0 else n
+                start = max(0, entry - margin_pts)
+                v_new[start:end] = np.minimum(v_new[start:end], self.slope_brake_vmax)
 
         for i in range(n):
             wpnts[i].vx_mps = float(v_new[i])
