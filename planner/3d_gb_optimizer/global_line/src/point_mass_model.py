@@ -100,9 +100,7 @@ def export_point_mass_ode_model(
     model.cost_expr_ext_cost = 1.0 / s_dot + weight_jx * (jx / s_dot)**2 + weight_jy * (jy / s_dot)**2 + weight_dOmega_z * f_dOmega_z ** 2 + \
                                w_slack_V/optimization_horizon*(epsilon_V / s_dot) + w_slack_V/10.0/optimization_horizon*(epsilon_V / s_dot)**2
 
-    ## IY : slope-aware 3D GGV support
-    _slope_aware = getattr(gg_handler, 'slope_aware', False)
-    _common_kwargs = dict(
+    ax_tilde, ay_tilde, g_tilde = track_handler.calc_apparent_accelerations(
         V=V, n=n, chi=chi, ax=ax, ay=ay, s=s,
         h=vehicle_params['h'],
         neglect_w_omega_y=neglect_w_terms,
@@ -111,13 +109,6 @@ def export_point_mass_ode_model(
         neglect_centrifugal=neglect_centrifugal,
         neglect_w_dot=neglect_w_dot,
     )
-    if _slope_aware:
-        ax_tilde, ay_tilde, g_tilde, mu_slope = \
-            track_handler.calc_apparent_accelerations_no_slope(**_common_kwargs)
-    else:
-        ax_tilde, ay_tilde, g_tilde = \
-            track_handler.calc_apparent_accelerations(**_common_kwargs)
-    ## IY : end
 
     # gggv-diagram constraints
     if gg_mode == 'polar':
@@ -128,12 +119,7 @@ def export_point_mass_ode_model(
             adherence_radius - rho,
         )
     elif gg_mode == 'diamond':
-        ## IY : 3D slope-aware lookup
-        if _slope_aware:
-            acc_max = gg_handler.acc_interpolator_3d(ca.vertcat(V, g_tilde, mu_slope))
-        else:
-            acc_max = gg_handler.acc_interpolator(ca.vertcat(V, g_tilde))
-        ## IY : end
+        acc_max = gg_handler.acc_interpolator(ca.vertcat(V, g_tilde))
         gg_exponent = acc_max[0]
         ax_min = acc_max[1]
         ax_max = acc_max[2]
