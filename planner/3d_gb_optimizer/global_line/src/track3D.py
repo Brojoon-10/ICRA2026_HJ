@@ -21,8 +21,11 @@ def deg2rad(deg):
 
 class Track3D:
 
-    def __init__(self, path=None):
+    def __init__(self, path=None, g_weight=1.0):
         self.__path = path
+        ## IY : mu scale (mu=0 stays flat for any g_weight)
+        self.g_weight = float(g_weight)
+        ## IY : end
 
         if self.__path:
             self.__track_data_frame = pd.read_csv(path, sep=',')
@@ -56,6 +59,15 @@ class Track3D:
         self.Omega_y = self.__track_data_frame['omega_y_radpm'].to_numpy()
         self.Omega_z = self.__track_data_frame['omega_z_radpm'].to_numpy()
 
+        ## IY : dmu/ds (bridge change rate) — used to split Omega_y into
+        ##   bridge vs banking, so bridge_effect scales bridge part only.
+        if 'dmu_radpm' in self.__track_data_frame.columns:
+            self.dmu_ds = self.__track_data_frame['dmu_radpm'].to_numpy()
+        else:
+            # Fallback: finite diff of mu
+            self.dmu_ds = np.diff(self.mu) / self.ds
+            self.dmu_ds = np.append(self.dmu_ds, self.dmu_ds[0])
+
         # derivatives of omega with finite differencing
         self.dOmega_x = np.diff(self.Omega_x) / self.ds
         self.dOmega_x = np.append(self.dOmega_x, self.dOmega_x[0])
@@ -84,6 +96,8 @@ class Track3D:
         self.dOmega_x_interpolator = ca.interpolant('domega_x', 'linear', [s_augmented], concatenate_arr(self.dOmega_x))
         self.dOmega_y_interpolator = ca.interpolant('domega_y', 'linear', [s_augmented], concatenate_arr(self.dOmega_y))
         self.dOmega_z_interpolator = ca.interpolant('domega_z', 'linear', [s_augmented], concatenate_arr(self.dOmega_z))
+        ## IY : dmu/ds interpolator (for bridge-only g_weight scaling)
+        self.dmu_ds_interpolator = ca.interpolant('dmu_ds', 'linear', [s_augmented], concatenate_arr(self.dmu_ds))
 
     ### HJ : resample to separate smooth step_size from optimization grid
     def resample(self, step_size: float):
@@ -109,12 +123,15 @@ class Track3D:
         omega_x_new = np.array([float(self.Omega_x_interpolator(si)) for si in s_new])
         omega_y_new = np.array([float(self.Omega_y_interpolator(si)) for si in s_new])
         omega_z_new = np.array([float(self.Omega_z_interpolator(si)) for si in s_new])
+        ## IY : preserve dmu_radpm on resampled grid
+        dmu_ds_new = np.array([float(self.dmu_ds_interpolator(si)) for si in s_new])
 
         # Replace DataFrame and re-lock to rebuild interpolators
         self.__track_data_frame = pd.DataFrame({
             's_m': s_new,
             'x_m': x_new, 'y_m': y_new, 'z_m': z_new,
             'theta_rad': theta_new, 'mu_rad': mu_new, 'phi_rad': phi_new,
+            'dmu_radpm': dmu_ds_new,
             'w_tr_right_m': w_tr_right_new, 'w_tr_left_m': w_tr_left_new,
             'omega_x_radpm': omega_x_new, 'omega_y_radpm': omega_y_new, 'omega_z_radpm': omega_z_new,
         })
@@ -809,14 +826,29 @@ class Track3D:
         if not self.track_locked:
             raise RuntimeError('Cannot calculate apparent accelerations. Track is not locked.')
         
+        ## IY (legacy: mu * g_weight, kept for rollback)
+        # mu = self.mu_interpolator(s) * self.g_weight
+        ## IY : bridge_effect scales bridge contribution only.
+        ##   Omega_y = cos(phi)*dmu/ds (bridge) + cos(mu)*sin(phi)*kappa (banking).
+        ##   Split, scale bridge part by g_weight, keep banking raw.
+        ##   ax_tilde / ay_tilde sin(mu) term is also scaled (see below).
         mu = self.mu_interpolator(s)
         phi = self.phi_interpolator(s)
+        dmu_ds = self.dmu_ds_interpolator(s)
         Omega_x = self.Omega_x_interpolator(s)
         dOmega_x = self.dOmega_x_interpolator(s)
-        Omega_y = self.Omega_y_interpolator(s)
-        dOmega_y = self.dOmega_y_interpolator(s)
+        Omega_y_raw = self.Omega_y_interpolator(s)
+        dOmega_y_raw = self.dOmega_y_interpolator(s)
+        # bridge part (vanishes at flat banking-only sections)
+        Omega_y_bridge = ca.cos(phi) * dmu_ds
+        Omega_y_banking = Omega_y_raw - Omega_y_bridge
+        Omega_y = Omega_y_bridge * self.g_weight + Omega_y_banking
+        # dOmega_y: scale full term (Euler is neglected by default;
+        # exact split would need d/ds of bridge part, marginal benefit)
+        dOmega_y = dOmega_y_raw * self.g_weight
         Omega_z = self.Omega_z_interpolator(s)
         dOmega_z = self.dOmega_z_interpolator(s)
+        ## IY : end
 
         s_dot = (V * ca.cos(chi)) / (1.0 - n * Omega_z)
         w = n * Omega_x * s_dot
@@ -855,68 +887,21 @@ class Track3D:
         if not neglect_V_omega:
             V_omega = (- Omega_x * ca.sin(chi) + Omega_y * ca.cos(chi)) * s_dot * V
 
-        ax_tilde = ax + omega_y_dot * h - omega_z * omega_x * h + g_earth * (- ca.sin(mu) * ca.cos(chi) + ca.cos(mu) * ca.sin(phi) * ca.sin(chi))
-        ay_tilde = ay + omega_x_dot * h + omega_z * omega_y * h + g_earth * (ca.sin(mu) * ca.sin(chi) + ca.cos(mu) * ca.sin(phi) * ca.cos(chi))
-        g_tilde = ca.fmax(w_dot - V_omega + (omega_x ** 2 - omega_y ** 2) * h + g_earth * ca.cos(mu) * ca.cos(phi), 0.0)
+        ## IY : new bridge_effect — only sin(mu) component scaled by g_weight
+        ##   matches fbga (--slope-corr) and velopt semantics. cos(mu) stays
+        ##   physical so grip loss is not double-counted.
+        ax_tilde = ax + omega_y_dot * h - omega_z * omega_x * h \
+                   + g_earth * (- ca.sin(mu) * self.g_weight * ca.cos(chi)
+                                + ca.cos(mu) * ca.sin(phi) * ca.sin(chi))
+        ay_tilde = ay + omega_x_dot * h + omega_z * omega_y * h \
+                   + g_earth * ( ca.sin(mu) * self.g_weight * ca.sin(chi)
+                                + ca.cos(mu) * ca.sin(phi) * ca.cos(chi))
+        g_tilde = ca.fmax(w_dot - V_omega + (omega_x ** 2 - omega_y ** 2) * h
+                          + g_earth * ca.cos(mu) * ca.cos(phi), 0.0)
+        ## IY : end
 
         return ax_tilde, ay_tilde, g_tilde
 
-    ## IY : slope-aware variant — removes slope terms so 3D GGV handles them
-    def calc_apparent_accelerations_no_slope(
-            self, V, n, chi, ax, ay, s, h,
-            neglect_w_omega_y=True, neglect_w_omega_x=True, neglect_euler=True,
-            neglect_centrifugal=True, neglect_w_dot=False, neglect_V_omega=False,
-    ):
-        """Same as calc_apparent_accelerations but with slope (mu) terms removed.
-        Returns (ax_tilde, ay_tilde, g_tilde, mu) where mu is the raw pitch angle."""
-        if not self.track_locked:
-            raise RuntimeError('Track is not locked.')
-
-        mu = self.mu_interpolator(s)
-        phi = self.phi_interpolator(s)
-        Omega_x = self.Omega_x_interpolator(s)
-        dOmega_x = self.dOmega_x_interpolator(s)
-        Omega_y = self.Omega_y_interpolator(s)
-        dOmega_y = self.dOmega_y_interpolator(s)
-        Omega_z = self.Omega_z_interpolator(s)
-        dOmega_z = self.dOmega_z_interpolator(s)
-
-        s_dot = (V * ca.cos(chi)) / (1.0 - n * Omega_z)
-        w = n * Omega_x * s_dot
-        V_dot = ax
-        if not neglect_w_omega_y:
-            V_dot += w * (Omega_x * ca.sin(chi) - Omega_y * ca.cos(chi)) * s_dot
-        n_dot = V * ca.sin(chi)
-        chi_dot = ay / V - Omega_z * s_dot
-        if not neglect_w_omega_x:
-            chi_dot += w * (Omega_x * ca.cos(chi) + Omega_y * ca.sin(chi)) * s_dot / V
-        s_ddot = ((V_dot * ca.cos(chi) - V * ca.sin(chi) * chi_dot) * (1.0 - n * Omega_z) - (V * ca.cos(chi)) * (- n_dot * Omega_z - n * dOmega_z * s_dot)) / (1.0 + 2.0 * n * Omega_z + n ** 2 * Omega_z ** 2)
-
-        omega_x_dot = 0.0
-        omega_y_dot = 0.0
-        if not neglect_euler:
-            omega_x_dot = (dOmega_x * s_dot * ca.cos(chi) - Omega_x * ca.sin(chi) * chi_dot + dOmega_y * s_dot * ca.sin(chi) + Omega_y * ca.cos(chi) * chi_dot) * s_dot + (Omega_x * ca.cos(chi) + Omega_y * ca.sin(chi)) * s_ddot
-            omega_y_dot = (-dOmega_x * s_dot * ca.sin(chi) - Omega_x * ca.cos(chi) * chi_dot + dOmega_y * s_dot * ca.cos(chi) - Omega_y * ca.sin(chi) * chi_dot) * s_dot + (- Omega_x * ca.sin(chi) + Omega_y * ca.cos(chi)) * s_ddot
-        omega_x, omega_y, omega_z = 0.0, 0.0, 0.0
-        if not neglect_centrifugal:
-            omega_x = (Omega_x * ca.cos(chi) + Omega_y * ca.sin(chi)) * s_dot
-            omega_y = (- Omega_x * ca.sin(chi) + Omega_y * ca.cos(chi)) * s_dot
-            omega_z = Omega_z * s_dot + chi_dot
-        w_dot = 0.0
-        if not neglect_w_dot:
-            w_dot = n_dot * Omega_x * s_dot + n * dOmega_x * s_dot ** 2 + n * Omega_x * s_ddot
-        V_omega = 0.0
-        if not neglect_V_omega:
-            V_omega = (- Omega_x * ca.sin(chi) + Omega_y * ca.cos(chi)) * s_dot * V
-
-        # No sin(mu)/cos(mu) — GGV envelope handles slope
-        ax_tilde = ax + omega_y_dot * h - omega_z * omega_x * h + g_earth * (ca.sin(phi) * ca.sin(chi))
-        ay_tilde = ay + omega_x_dot * h + omega_z * omega_y * h + g_earth * (ca.sin(phi) * ca.cos(chi))
-        g_tilde = ca.fmax(w_dot - V_omega + (omega_x ** 2 - omega_y ** 2) * h + g_earth * ca.cos(phi), 0.0)
-
-        return ax_tilde, ay_tilde, g_tilde, mu
-    ## IY : end
- 
     def get_track_bounds(self, margin=0.0):
         normal_vector = self.get_normal_vector_numpy(self.theta, self.mu, self.phi)
         left = np.array([self.x + normal_vector[0] * (self.w_tr_left + margin),

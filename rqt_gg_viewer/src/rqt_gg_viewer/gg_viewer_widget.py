@@ -1,11 +1,14 @@
-"""GG Viewer Widget — matplotlib + table + diff for GGV diamond results."""
+"""GG Viewer Widget — matplotlib + table + multi-snapshot overlay."""
 
 import json
+import os
 import copy
+from datetime import datetime
 
 import numpy as np
 import rospy
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
 from python_qt_binding.QtCore import Qt, Signal
 from python_qt_binding.QtGui import QColor, QFont
@@ -13,6 +16,7 @@ from python_qt_binding.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTabWidget,
     QComboBox, QCheckBox, QPushButton, QLabel, QTableWidget,
     QTableWidgetItem, QHeaderView, QStatusBar, QGroupBox,
+    QListWidget, QListWidgetItem,
 )
 
 import matplotlib
@@ -21,8 +25,13 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 
+## IY : color cycle for plotted versions (current=blue, baseline=gray, vers cycle)
+_VERSION_COLORS = ['#FF9800', '#4CAF50', '#9C27B0', '#795548',
+                   '#00BCD4', '#E91E63', '#8BC34A', '#FF5722']
+
+
 class GGViewerWidget(QWidget):
-    """Main widget: diamond plot + summary table + diff + slope tab."""
+    """Main widget: diamond plot + summary table + multi-snapshot overlay."""
 
     # Thread-safe signals (ROS callback thread → Qt main thread)
     results_signal = Signal(str)
@@ -32,12 +41,26 @@ class GGViewerWidget(QWidget):
         super().__init__()
         self.setWindowTitle('GG Viewer')
 
-        self.current_data = None
-        self.baseline_data = None
+        self.current_data = None         # updated only by /gg_results topic
+        self.baseline_data = None        # set by Load Baseline button
+        ## IY : multi-snapshot overlay
+        self.snapshots = {}              # disk-load cache: {snap_name: payload}
+        self.plotted_versions = set()    # currently checked snapshot names
+        ## IY : end
+
+        ## IY : disk scan dir for snapshot list
+        _this_file = os.path.abspath(__file__)
+        _race_stack_root = os.path.normpath(
+            os.path.join(os.path.dirname(_this_file), '..', '..', '..'))
+        self.gg_diagrams_dir = os.path.join(
+            _race_stack_root, 'planner', '3d_gb_optimizer',
+            'global_line', 'data', 'gg_diagrams')
+        ## IY : end
 
         self._build_ui()
         self._connect_signals()
         self._subscribe_ros()
+        self._refresh_snapshot_lists()   # initial disk scan
 
     # ------------------------------------------------------------------ #
     #  UI construction
@@ -45,34 +68,48 @@ class GGViewerWidget(QWidget):
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        # --- top toolbar ---
-        toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel('V:'))
+        ## IY : row 1 — baseline selector + save/refresh
+        toolbar1 = QHBoxLayout()
+        toolbar1.addWidget(QLabel('Baseline:'))
+        self.baseline_combo = QComboBox()
+        self.baseline_combo.setMinimumWidth(180)
+        toolbar1.addWidget(self.baseline_combo)
+        self.load_baseline_btn = QPushButton('Load')
+        toolbar1.addWidget(self.load_baseline_btn)
+        self.refresh_btn = QPushButton('Refresh')
+        self.refresh_btn.setToolTip('Re-scan gg_diagrams/ directory')
+        toolbar1.addWidget(self.refresh_btn)
+        toolbar1.addSpacing(20)
+        self.save_version_btn = QPushButton('Save Current as Version')
+        self.save_version_btn.setToolTip(
+            'Calls /gg_tuner/save_version → snapshots latest to v_N on disk')
+        toolbar1.addWidget(self.save_version_btn)
+        toolbar1.addStretch()
+        root.addLayout(toolbar1)
+        ## IY : end
+
+        ## IY : row 2 — versions multi-select + V/g + show baseline toggle
+        toolbar2 = QHBoxLayout()
+        toolbar2.addWidget(QLabel('Plotted Versions:'))
+        self.versions_list = QListWidget()
+        self.versions_list.setMaximumHeight(80)
+        self.versions_list.setMinimumWidth(300)
+        toolbar2.addWidget(self.versions_list)
+        toolbar2.addSpacing(20)
+        toolbar2.addWidget(QLabel('V:'))
         self.v_combo = QComboBox()
         self.v_combo.setMinimumWidth(80)
-        toolbar.addWidget(self.v_combo)
-        toolbar.addWidget(QLabel('g:'))
+        toolbar2.addWidget(self.v_combo)
+        toolbar2.addWidget(QLabel('g:'))
         self.g_combo = QComboBox()
         self.g_combo.setMinimumWidth(80)
-        toolbar.addWidget(self.g_combo)
-        ## IY : slope cross-section selector for 3D slope-aware ggv
-        toolbar.addWidget(QLabel('Slope:'))
-        self.slope_combo = QComboBox()
-        self.slope_combo.setMinimumWidth(90)
-        toolbar.addWidget(self.slope_combo)
+        toolbar2.addWidget(self.g_combo)
+        self.show_baseline_check = QCheckBox('Show baseline')
+        self.show_baseline_check.setChecked(True)
+        toolbar2.addWidget(self.show_baseline_check)
+        toolbar2.addStretch()
+        root.addLayout(toolbar2)
         ## IY : end
-        self.diff_check = QCheckBox('Show diff')
-        self.diff_check.setChecked(True)
-        toolbar.addWidget(self.diff_check)
-        self.baseline_btn = QPushButton('Set as Baseline')
-        toolbar.addWidget(self.baseline_btn)
-        self.auto_baseline_check = QCheckBox('Auto-baseline first')
-        self.auto_baseline_check.setChecked(True)
-        self.auto_baseline_check.setToolTip(
-            'Automatically set the first received result as baseline')
-        toolbar.addWidget(self.auto_baseline_check)
-        toolbar.addStretch()
-        root.addLayout(toolbar)
 
         # --- tabs ---
         self.tabs = QTabWidget()
@@ -105,18 +142,7 @@ class GGViewerWidget(QWidget):
         main_layout.addWidget(splitter)
         self.tabs.addTab(main_tab, 'Diamond + Table')
 
-        # Tab 2: Slope analysis
-        slope_tab = QWidget()
-        slope_layout = QVBoxLayout(slope_tab)
-        self.slope_fig = Figure(figsize=(6, 4), dpi=100)
-        self.slope_canvas = FigureCanvas(self.slope_fig)
-        self.slope_ax = self.slope_fig.add_subplot(111)
-        slope_layout.addWidget(self.slope_canvas)
-        self.slope_label = QLabel('No slope data yet. Enable slope in GGTuner rqt.')
-        slope_layout.addWidget(self.slope_label)
-        self.tabs.addTab(slope_tab, 'Slope Analysis')
-
-        # Tab 3: Tuning params
+        # Tab 2: Tuning params
         params_tab = QWidget()
         params_layout = QVBoxLayout(params_tab)
         self.params_table = QTableWidget()
@@ -138,11 +164,13 @@ class GGViewerWidget(QWidget):
         self.status_signal.connect(self._handle_status)
         self.v_combo.currentIndexChanged.connect(self._on_combo_changed)
         self.g_combo.currentIndexChanged.connect(self._on_combo_changed)
-        ## IY : slope_combo selection drives diamond redraw
-        self.slope_combo.currentIndexChanged.connect(self._on_combo_changed)
+        self.show_baseline_check.stateChanged.connect(self._on_combo_changed)
+        ## IY : new buttons + multi-version list
+        self.load_baseline_btn.clicked.connect(self._on_baseline_load)
+        self.refresh_btn.clicked.connect(self._on_refresh)
+        self.save_version_btn.clicked.connect(self._on_save_version)
+        self.versions_list.itemChanged.connect(self._on_version_check_changed)
         ## IY : end
-        self.diff_check.stateChanged.connect(self._on_combo_changed)
-        self.baseline_btn.clicked.connect(self._set_baseline)
 
     # ------------------------------------------------------------------ #
     #  ROS subscriptions
@@ -170,20 +198,16 @@ class GGViewerWidget(QWidget):
             return
         self.current_data = data
 
-        ### IY : auto-discard incompatible baseline when v_list/g_list change
-        # (e.g. v_max edited, FAST↔FULL toggled). Otherwise overlay would
-        # silently compare a different (V, g) layer than the title shows.
+        ## IY : auto-discard incompatible baseline when v_list/g_list change
         baseline_reset_msg = None
         if self.baseline_data is not None:
             ok, reason = self._baseline_compatible(data, self.baseline_data)
             if not ok:
                 self.baseline_data = None
                 baseline_reset_msg = f'Baseline reset (incompatible: {reason})'
-        ### IY : end
+        ## IY : end
 
-        if self.baseline_data is None and self.auto_baseline_check.isChecked():
-            self.baseline_data = copy.deepcopy(data)
-        self._populate_combos(data)
+        self._populate_combos()
         self._update_display()
         if baseline_reset_msg is not None:
             self.status_bar.showMessage(baseline_reset_msg)
@@ -195,21 +219,166 @@ class GGViewerWidget(QWidget):
     def _handle_status(self, text):
         self.status_bar.showMessage(text)
 
-    def _set_baseline(self):
-        if self.current_data is not None:
-            self.baseline_data = copy.deepcopy(self.current_data)
-            self.status_bar.showMessage('Baseline set from current data')
-            self._update_display()
-
     def _on_combo_changed(self, _=None):
         self._update_display()
 
     # ------------------------------------------------------------------ #
+    #  Snapshot disk scan + load (multi-version overlay)
+    # ------------------------------------------------------------------ #
+    ## IY : scan gg_diagrams/ for snapshot dirs (excl. *_latest — current slot)
+    def _scan_snapshots(self):
+        if not os.path.isdir(self.gg_diagrams_dir):
+            return []
+        snaps = []
+        for name in sorted(os.listdir(self.gg_diagrams_dir)):
+            full = os.path.join(self.gg_diagrams_dir, name)
+            if not os.path.isdir(full):
+                continue
+            if name.endswith('_latest'):
+                continue
+            # require velocity_frame npy presence
+            if not os.path.isfile(os.path.join(full, 'velocity_frame', 'v_list.npy')):
+                continue
+            snaps.append(name)
+        return snaps
+    ## IY : end
+
+    ## IY : load one snapshot from disk → /gg_results-style payload dict
+    def _load_snapshot_from_disk(self, snap_name):
+        if snap_name in self.snapshots:
+            return self.snapshots[snap_name]
+        vf = os.path.join(self.gg_diagrams_dir, snap_name, 'velocity_frame')
+        try:
+            v_list = np.load(os.path.join(vf, 'v_list.npy')).tolist()
+            g_list = np.load(os.path.join(vf, 'g_list.npy')).tolist()
+            ax_max = np.load(os.path.join(vf, 'ax_max.npy')).tolist()
+            ax_min = np.load(os.path.join(vf, 'ax_min.npy')).tolist()
+            ay_max = np.load(os.path.join(vf, 'ay_max.npy')).tolist()
+            gg_exp = np.load(os.path.join(vf, 'gg_exponent.npy')).tolist()
+        except (FileNotFoundError, OSError) as e:
+            rospy.logwarn(f'[GGViewer] load {snap_name} failed: {e}')
+            return None
+        # tuning_params from params_used.json if present
+        tuning_params = {}
+        meta_path = os.path.join(self.gg_diagrams_dir, snap_name, 'params_used.json')
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                tuning_params = meta.get('tuning', {})
+            except (OSError, json.JSONDecodeError):
+                pass
+        payload = {
+            'vehicle_name': snap_name,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'v_list': v_list,
+            'g_list': g_list,
+            'diamond': {
+                'ax_max': ax_max, 'ax_min': ax_min,
+                'ay_max': ay_max, 'gg_exponent': gg_exp,
+            },
+            'tuning_params': tuning_params,
+        }
+        self.snapshots[snap_name] = payload
+        return payload
+    ## IY : end
+
+    ## IY : refresh baseline_combo + versions_list while preserving state
+    def _refresh_snapshot_lists(self):
+        snaps = self._scan_snapshots()
+        # Baseline combo: keep current selection if still present
+        prev_baseline = self.baseline_combo.currentText() if self.baseline_combo.count() else ''
+        self.baseline_combo.blockSignals(True)
+        self.baseline_combo.clear()
+        self.baseline_combo.addItem('(none)')
+        for s in snaps:
+            self.baseline_combo.addItem(s)
+        idx = self.baseline_combo.findText(prev_baseline)
+        if idx >= 0:
+            self.baseline_combo.setCurrentIndex(idx)
+        self.baseline_combo.blockSignals(False)
+        # Versions list: keep checked state for surviving names
+        prev_checked = set(self.plotted_versions)
+        self.versions_list.blockSignals(True)
+        self.versions_list.clear()
+        for s in snaps:
+            item = QListWidgetItem(s)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if s in prev_checked else Qt.Unchecked)
+            self.versions_list.addItem(item)
+        self.versions_list.blockSignals(False)
+        # Drop checked names that disappeared from disk
+        self.plotted_versions = self.plotted_versions & set(snaps)
+    ## IY : end
+
+    ## IY : button handlers
+    def _on_baseline_load(self):
+        snap = self.baseline_combo.currentText()
+        if not snap or snap == '(none)':
+            self.baseline_data = None
+            self.status_bar.showMessage('Baseline cleared')
+        else:
+            data = self._load_snapshot_from_disk(snap)
+            if data is None:
+                self.status_bar.showMessage(f'Load failed: {snap}')
+                return
+            self.baseline_data = data
+            self.status_bar.showMessage(f'Baseline = {snap}')
+        self._populate_combos()
+        self._update_display()
+
+    def _on_version_check_changed(self, item):
+        snap = item.text()
+        if item.checkState() == Qt.Checked:
+            data = self._load_snapshot_from_disk(snap)
+            if data is None:
+                item.setCheckState(Qt.Unchecked)
+                return
+            self.plotted_versions.add(snap)
+        else:
+            self.plotted_versions.discard(snap)
+        self._populate_combos()
+        self._update_display()
+
+    def _on_save_version(self):
+        try:
+            rospy.wait_for_service('/gg_tuner/save_version', timeout=2.0)
+            srv = rospy.ServiceProxy('/gg_tuner/save_version', Trigger)
+            resp = srv()
+        except (rospy.ROSException, rospy.ServiceException) as e:
+            self.status_bar.showMessage(f'Save failed: {e}')
+            return
+        if resp.success:
+            self.status_bar.showMessage(f'Saved as {resp.message}')
+            self._refresh_snapshot_lists()
+        else:
+            self.status_bar.showMessage(f'Save failed: {resp.message}')
+
+    def _on_refresh(self):
+        self._refresh_snapshot_lists()
+        self.status_bar.showMessage(
+            f'Snapshots refreshed ({self.versions_list.count()} found)')
+    ## IY : end
+
+    # ------------------------------------------------------------------ #
     #  Populate combo boxes
     # ------------------------------------------------------------------ #
-    def _populate_combos(self, data):
-        v_list = data.get('v_list', [])
-        g_list = data.get('g_list', [])
+    def _populate_combos(self):
+        ## IY : union all V/g across current + baseline + cached snapshots
+        all_v = set()
+        all_g = set()
+        if self.current_data is not None:
+            all_v |= set(self.current_data.get('v_list', []))
+            all_g |= set(self.current_data.get('g_list', []))
+        if self.baseline_data is not None:
+            all_v |= set(self.baseline_data.get('v_list', []))
+            all_g |= set(self.baseline_data.get('g_list', []))
+        for snap in self.snapshots.values():
+            all_v |= set(snap.get('v_list', []))
+            all_g |= set(snap.get('g_list', []))
+        v_list = sorted(all_v)
+        g_list = sorted(all_g)
+        ## IY : end
 
         prev_v = self.v_combo.currentText()
         prev_g = self.g_combo.currentText()
@@ -234,42 +403,17 @@ class GGViewerWidget(QWidget):
         self.v_combo.blockSignals(False)
         self.g_combo.blockSignals(False)
 
-        ## IY : populate slope_combo from slope_results.slope_list_deg
-        slope_data = data.get('slope_results')
-        prev_slope = self.slope_combo.currentText()
-        self.slope_combo.blockSignals(True)
-        self.slope_combo.clear()
-        if (slope_data is not None
-                and isinstance(slope_data, dict)
-                and 'slope_list_deg' in slope_data
-                and len(slope_data.get('slope_list_deg', [])) > 0):
-            s_list = slope_data['slope_list_deg']
-            labels = [f'{float(s):+.1f}°' for s in s_list]
-            for lbl in labels:
-                self.slope_combo.addItem(lbl)
-            if prev_slope and prev_slope in labels:
-                self.slope_combo.setCurrentIndex(labels.index(prev_slope))
-            else:
-                # default to slope=0 (closest)
-                s_arr = np.asarray(s_list, dtype=float)
-                self.slope_combo.setCurrentIndex(int(np.argmin(np.abs(s_arr))))
-            self.slope_combo.setEnabled(True)
-        else:
-            self.slope_combo.addItem('flat (no sweep)')
-            self.slope_combo.setEnabled(False)
-        self.slope_combo.blockSignals(False)
-        ## IY : end
-
     # ------------------------------------------------------------------ #
     #  Update all displays
     # ------------------------------------------------------------------ #
     def _update_display(self):
-        if self.current_data is None:
-            return
-        self._update_table()
+        ## IY : plot works with baseline/versions only (no current required).
+        ##      table/params still need current as the reference frame.
         self._update_plot()
-        self._update_slope_tab()
-        self._update_params_tab()
+        if self.current_data is not None:
+            self._update_table()
+            self._update_params_tab()
+        ## IY : end
 
     # ------------------------------------------------------------------ #
     #  Summary table
@@ -278,15 +422,13 @@ class GGViewerWidget(QWidget):
         d = self.current_data['diamond']
         v_list = self.current_data['v_list']
         g_list = self.current_data['g_list']
-        ### IY : same compatibility gate as _update_plot — only show diff cells
-        # when v_list/g_list match (otherwise [vi][gi] indexes a different
-        # (V, g) layer in baseline than in current and the diff is misleading)
+        ## IY : table shows diff against baseline only (versions are plot-only)
         compat_ok, _ = self._baseline_compatible(
             self.current_data, self.baseline_data)
-        show_diff = (self.diff_check.isChecked()
+        show_diff = (self.show_baseline_check.isChecked()
                      and self.baseline_data is not None
                      and compat_ok)
-        ### IY : end
+        ## IY : end
 
         n_v = len(v_list)
         n_g = len(g_list)
@@ -338,12 +480,7 @@ class GGViewerWidget(QWidget):
         except (IndexError, KeyError):
             return None
 
-    ### IY : baseline compatibility check
-    # Two snapshots are comparable index-wise only if their v_list/g_list
-    # match exactly (length AND values). When they differ (v_max edited,
-    # FAST↔FULL toggled), [vi][gi] points at a different (V, g) layer in
-    # baseline than in current — the overlay would silently lie. Disable
-    # comparison instead of papering over with nearest-neighbor mapping.
+    ## IY : prefix compatibility — same step + start, one can be longer
     @staticmethod
     def _baseline_compatible(current, baseline, atol=1e-6):
         if baseline is None:
@@ -352,115 +489,92 @@ class GGViewerWidget(QWidget):
         bv = np.asarray(baseline.get('v_list', []), dtype=float)
         cg = np.asarray(current.get('g_list', []), dtype=float)
         bg = np.asarray(baseline.get('g_list', []), dtype=float)
-        if cv.shape != bv.shape:
-            return False, f'v_list length differs ({len(cv)} vs {len(bv)})'
-        if cg.shape != bg.shape:
-            return False, f'g_list length differs ({len(cg)} vs {len(bg)})'
-        if cv.size and not np.allclose(cv, bv, atol=atol):
-            return False, (f'v_list values differ '
-                           f'(cur=[{cv[0]:.2f}…{cv[-1]:.2f}], '
-                           f'base=[{bv[0]:.2f}…{bv[-1]:.2f}])')
-        if cg.size and not np.allclose(cg, bg, atol=atol):
-            return False, (f'g_list values differ '
-                           f'(cur=[{cg[0]:.1f}…{cg[-1]:.1f}], '
-                           f'base=[{bg[0]:.1f}…{bg[-1]:.1f}])')
+        n_v = min(len(cv), len(bv))
+        n_g = min(len(cg), len(bg))
+        if n_v < 1 or n_g < 1:
+            return False, 'empty grid'
+        if not np.allclose(cv[:n_v], bv[:n_v], atol=atol):
+            return False, 'V grid step/start mismatch'
+        if not np.allclose(cg[:n_g], bg[:n_g], atol=atol):
+            return False, 'g grid step/start mismatch'
         return True, ''
-    ### IY : end
+    ## IY : end
+
+    ## IY : grid-point lookup (returns None if (V, g) absent in data's grid)
+    @staticmethod
+    def _lookup_at(data, V, g, atol=1e-6):
+        if data is None:
+            return None
+        v_arr = data.get('v_list', [])
+        g_arr = data.get('g_list', [])
+        vi = next((i for i, v in enumerate(v_arr) if abs(v - V) < atol), -1)
+        gi = next((i for i, gx in enumerate(g_arr) if abs(gx - g) < atol), -1)
+        if vi < 0 or gi < 0:
+            return None
+        d = data['diamond']
+        try:
+            return {
+                'ax_max': d['ax_max'][vi][gi],
+                'ax_min': d['ax_min'][vi][gi],
+                'ay_max': d['ay_max'][vi][gi],
+                'gg_exponent': d['gg_exponent'][vi][gi],
+            }
+        except (IndexError, KeyError, TypeError):
+            return None
+    ## IY : end
 
     # ------------------------------------------------------------------ #
     #  Diamond GG plot
     # ------------------------------------------------------------------ #
     def _update_plot(self):
         self.ax_plot.clear()
-        d = self.current_data['diamond']
-        v_list = self.current_data['v_list']
-        g_list = self.current_data['g_list']
-
-        vi = self.v_combo.currentIndex()
-        gi = self.g_combo.currentIndex()
-        if vi < 0 or gi < 0:
+        ## IY : look up by V/g value (combo text), not by index — supports
+        ##      grids of different lengths (prefix-compatible)
+        try:
+            v_val = float(self.v_combo.currentText())
+            g_val = float(self.g_combo.currentText())
+        except (ValueError, TypeError):
             self.canvas.draw()
             return
 
-        v_val = v_list[vi]
-        g_val = g_list[gi]
+        # 1. baseline (gray dashed)
+        if (self.baseline_data is not None
+                and self.show_baseline_check.isChecked()):
+            b = self._lookup_at(self.baseline_data, v_val, g_val)
+            if b is not None:
+                self._draw_diamond(
+                    self.ax_plot,
+                    b['ax_max'], b['ax_min'], b['ay_max'], b['gg_exponent'],
+                    color='gray', linestyle='--',
+                    label=f'Baseline ({self.baseline_data.get("vehicle_name", "?")})',
+                    alpha=0.7)
 
-        ## IY : 3D slope-aware diamond if slope_results carries gg_exponent
-        slope_data = self.current_data.get('slope_results')
-        si = self.slope_combo.currentIndex()
-        use_3d = (slope_data is not None
-                  and isinstance(slope_data, dict)
-                  and 'slope_list_deg' in slope_data
-                  and 'gg_exponent' in slope_data
-                  and self.slope_combo.isEnabled()
-                  and si >= 0)
-        title_suffix = ''
-        if use_3d:
-            try:
-                ax_max_val = slope_data['ax_max'][vi][gi][si]
-                ax_min_val = slope_data['ax_min'][vi][gi][si]
-                ay_max_val = slope_data['ay_max'][vi][gi][si]
-                gg_exp     = slope_data['gg_exponent'][vi][gi][si]
-                slope_deg  = float(slope_data['slope_list_deg'][si])
-                title_suffix = f'  slope={slope_deg:+.1f}°'
-            except (IndexError, KeyError, TypeError):
-                ax_max_val = d['ax_max'][vi][gi]
-                ax_min_val = d['ax_min'][vi][gi]
-                ay_max_val = d['ay_max'][vi][gi]
-                gg_exp     = d['gg_exponent'][vi][gi]
-                title_suffix = '  (3d→flat fallback)'
-                use_3d = False
-        else:
-            ax_max_val = d['ax_max'][vi][gi]
-            ax_min_val = d['ax_min'][vi][gi]
-            ay_max_val = d['ay_max'][vi][gi]
-            gg_exp     = d['gg_exponent'][vi][gi]
+        # 2. plotted versions (cycling colors)
+        for i, snap_name in enumerate(sorted(self.plotted_versions)):
+            sd = self.snapshots.get(snap_name)
+            v = self._lookup_at(sd, v_val, g_val)
+            if v is None:
+                continue
+            self._draw_diamond(
+                self.ax_plot,
+                v['ax_max'], v['ax_min'], v['ay_max'], v['gg_exponent'],
+                color=_VERSION_COLORS[i % len(_VERSION_COLORS)],
+                linestyle='-', label=snap_name, alpha=0.75, linewidth=1.5)
+
+        # 3. current (blue, thick, on top)
+        c = self._lookup_at(self.current_data, v_val, g_val)
+        if c is not None:
+            self._draw_diamond(
+                self.ax_plot,
+                c['ax_max'], c['ax_min'], c['ay_max'], c['gg_exponent'],
+                color='#2196F3', linestyle='-',
+                label='Current', alpha=1.0, linewidth=2.5)
         ## IY : end
-
-        # Draw current diamond
-        self._draw_diamond(self.ax_plot, ax_max_val, ax_min_val, ay_max_val,
-                           gg_exp, color='#2196F3', linestyle='-',
-                           label='Current', alpha=1.0)
-
-        # Draw baseline diamond
-        ### IY : require v_list/g_list compatibility (defensive — _handle_results
-        # already discards incompatible baseline, but a stale caller could ask)
-        compat_ok, _ = self._baseline_compatible(
-            self.current_data, self.baseline_data)
-        show_diff = (self.diff_check.isChecked()
-                     and self.baseline_data is not None
-                     and compat_ok)
-        ### IY : end
-        if show_diff:
-            bd = self.baseline_data['diamond']
-            ## IY : baseline matches slope index when both have 3D data
-            b_slope_data = self.baseline_data.get('slope_results')
-            b_use_3d = (use_3d
-                        and b_slope_data is not None
-                        and isinstance(b_slope_data, dict)
-                        and 'gg_exponent' in b_slope_data)
-            try:
-                if b_use_3d:
-                    b_ax_max = b_slope_data['ax_max'][vi][gi][si]
-                    b_ax_min = b_slope_data['ax_min'][vi][gi][si]
-                    b_ay_max = b_slope_data['ay_max'][vi][gi][si]
-                    b_gg_exp = b_slope_data['gg_exponent'][vi][gi][si]
-                else:
-                    b_ax_max = bd['ax_max'][vi][gi]
-                    b_ax_min = bd['ax_min'][vi][gi]
-                    b_ay_max = bd['ay_max'][vi][gi]
-                    b_gg_exp = bd['gg_exponent'][vi][gi]
-                ## IY : end
-                self._draw_diamond(self.ax_plot, b_ax_max, b_ax_min, b_ay_max,
-                                   b_gg_exp, color='gray', linestyle='--',
-                                   label='Baseline', alpha=0.7)
-            except (IndexError, KeyError, TypeError):
-                pass
 
         self.ax_plot.set_xlabel('Lateral ay [m/s²]')
         self.ax_plot.set_ylabel('Longitudinal ax [m/s²]')
         self.ax_plot.set_title(
-            f'GG Diamond  V={v_val:.1f} m/s  g={g_val:.1f} m/s²{title_suffix}')
+            f'GG Diamond  V={v_val:.1f} m/s  g={g_val:.1f} m/s²')
         self.ax_plot.legend(loc='upper right', fontsize=8)
         self.ax_plot.grid(True, alpha=0.3)
         self.ax_plot.set_aspect('equal', adjustable='datalim')
@@ -470,7 +584,8 @@ class GGViewerWidget(QWidget):
         self.canvas.draw()
 
     def _draw_diamond(self, ax, ax_max, ax_min, ay_max, gg_exp,
-                      color='blue', linestyle='-', label=None, alpha=1.0):
+                      color='blue', linestyle='-', label=None, alpha=1.0,
+                      linewidth=2):
         """Draw a GG diamond envelope using the diamond parameterization."""
         exp = max(gg_exp, 0.5)
         theta = np.linspace(0, 2 * np.pi, 200)
@@ -483,58 +598,7 @@ class GGViewerWidget(QWidget):
             ax_lim = ax_max if np.sin(t) >= 0 else abs(ax_min)
             ax_pts[i] = ax_lim * remaining ** (1.0 / exp) * np.sign(np.sin(t))
         ax.plot(ay_pts, ax_pts, color=color, linestyle=linestyle,
-                linewidth=2, label=label, alpha=alpha)
-
-    # ------------------------------------------------------------------ #
-    #  Slope tab
-    # ------------------------------------------------------------------ #
-    def _update_slope_tab(self):
-        slope_data = self.current_data.get('slope_results')
-        if slope_data is None:
-            self.slope_label.setText(
-                'No slope data. Enable "enable_slope" in GGTuner rqt.')
-            self.slope_label.show()
-            self.slope_ax.clear()
-            self.slope_canvas.draw()
-            return
-        self.slope_label.hide()
-        self.slope_ax.clear()
-
-        vi = self.v_combo.currentIndex()
-        gi = self.g_combo.currentIndex()
-        if vi < 0 or gi < 0:
-            self.slope_canvas.draw()
-            return
-
-        slopes_deg = slope_data.get('slope_list_deg', [])
-        ax_max_s = slope_data.get('ax_max', [])
-        ax_min_s = slope_data.get('ax_min', [])
-        ay_max_s = slope_data.get('ay_max', [])
-
-        try:
-            ax_max_vs = [ax_max_s[vi][gi][si] for si in range(len(slopes_deg))]
-            ax_min_vs = [ax_min_s[vi][gi][si] for si in range(len(slopes_deg))]
-            ay_max_vs = [ay_max_s[vi][gi][si] for si in range(len(slopes_deg))]
-        except (IndexError, KeyError):
-            self.slope_label.setText('Slope data dimension mismatch.')
-            self.slope_label.show()
-            self.slope_canvas.draw()
-            return
-
-        v_val = self.current_data['v_list'][vi]
-        g_val = self.current_data['g_list'][gi]
-
-        self.slope_ax.plot(slopes_deg, ax_max_vs, 'r-o', markersize=4, label='ax_max')
-        self.slope_ax.plot(slopes_deg, ax_min_vs, 'b-o', markersize=4, label='ax_min')
-        self.slope_ax.plot(slopes_deg, ay_max_vs, 'g-o', markersize=4, label='ay_max')
-        self.slope_ax.set_xlabel('Slope angle [deg]')
-        self.slope_ax.set_ylabel('Acceleration [m/s²]')
-        self.slope_ax.set_title(f'Slope effect  V={v_val:.1f} m/s  g={g_val:.1f} m/s²')
-        self.slope_ax.legend(fontsize=8)
-        self.slope_ax.grid(True, alpha=0.3)
-        self.slope_ax.axvline(x=0, color='k', linewidth=0.5, linestyle='--')
-        self.slope_fig.tight_layout()
-        self.slope_canvas.draw()
+                linewidth=linewidth, label=label, alpha=alpha)
 
     # ------------------------------------------------------------------ #
     #  Tuning params tab

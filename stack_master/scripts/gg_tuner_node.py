@@ -17,8 +17,8 @@ import yaml
 from std_msgs.msg import String
 from dynamic_reconfigure.server import Server
 from stack_master.cfg import GGTunerConfig
-## IY : Trigger service for FBGA hot-reload
-from std_srvs.srv import Trigger
+## IY : Trigger service for FBGA hot-reload + viewer-driven save_version
+from std_srvs.srv import Trigger, TriggerResponse
 ## IY : end
 
 
@@ -96,11 +96,38 @@ class GGTunerNode:
         self.pipeline_thread = None
         self.pipeline_lock = threading.Lock()
         self.fbga_proc = None
+        ## IY : velopt subprocess handle (Stage 4 alternative engine)
+        self.velopt_proc = None
+        ## IY : sector_slicing roslaunch handle
+        self.sector_slicing_proc = None
+        self._last_sector_slicing_state = False
 
         rospy.on_shutdown(self._shutdown_cleanup)
 
+        ## IY : viewer-driven save_version service
+        ##      mirrors rqt's save_now checkbox so rqt_gg_viewer can trigger
+        ##      snapshot + auto-refresh its combo without going through cfg.
+        self.save_version_srv = rospy.Service(
+            '/gg_tuner/save_version', Trigger, self._save_version_cb)
+        ## IY : end
+
         self.srv = Server(GGTunerConfig, self.reconfigure_cb)
         rospy.loginfo("[GGTuner] Ready. Use rqt_reconfigure → /gg_tuner")
+
+    ## IY : viewer-driven save_version
+    def _save_version_cb(self, req):
+        if self.pipeline_thread is not None and self.pipeline_thread.is_alive():
+            return TriggerResponse(success=False, message='pipeline running')
+        try:
+            ok = self._snapshot_latest_to_version()
+            if ok:
+                v_name = f'{self.base_vehicle}_v{self._next_version() - 1}'
+                return TriggerResponse(success=True, message=v_name)
+            return TriggerResponse(success=False, message='snapshot failed')
+        except Exception as e:
+            rospy.logerr(f'[GGTuner] save_version exception: {e}')
+            return TriggerResponse(success=False, message=str(e)[:100])
+    ## IY : end
 
     def _round_tuning(self, tuning_dict):
         return {k: round(v, 4) for k, v in sorted(tuning_dict.items())}
@@ -236,28 +263,6 @@ class GGTunerNode:
         return True
     ## IY : end
 
-    ## IY : copy snapshot GGV+yml into _latest slot (snapshot remains unchanged)
-    def _activate_snapshot_as_latest(self, snapshot_name):
-        latest_name = f'{self.base_vehicle}_latest'
-        src_gg = os.path.join(self.data_path, 'gg_diagrams', snapshot_name)
-        dst_gg = os.path.join(self.data_path, 'gg_diagrams', latest_name)
-        src_yml = os.path.join(self.data_path, 'vehicle_params',
-                               f'params_{snapshot_name}.yml')
-        dst_yml = os.path.join(self.data_path, 'vehicle_params',
-                               f'params_{latest_name}.yml')
-        if not os.path.isdir(src_gg):
-            rospy.logerr(f"[GGTuner] snapshot gg_diagrams missing: {src_gg}")
-            return False
-        if not os.path.exists(src_yml):
-            rospy.logerr(f"[GGTuner] snapshot yml missing: {src_yml}")
-            return False
-        self._replace_dir(dst_gg, src_gg)
-        shutil.copy2(src_yml, dst_yml)
-        rospy.loginfo(f"[GGTuner] activated snapshot '{snapshot_name}' as _latest")
-        self.status_pub.publish(f"RACELINE_GGV_ACTIVATED: {snapshot_name}")
-        return True
-    ## IY : end
-
     def _restore_to_latest(self, cached_name):
         latest_name = f'{self.base_vehicle}_latest'
         src_gg = os.path.join(self.data_path, 'gg_diagrams', cached_name)
@@ -351,87 +356,19 @@ class GGTunerNode:
             rospy.logerr(f"[GGTuner] gg.bin gen failed (npy missing): {e}")
             return False
 
-        ## IY : detect 3D slope data and write 3D gg.bin if available
-        slope_list_path = os.path.join(npy_dir, 'slope_list.npy')
-        ax_max_3d_path = os.path.join(npy_dir, 'ax_max_3d.npy')
-        has_3d = os.path.exists(slope_list_path) and os.path.exists(ax_max_3d_path)
-
-        if has_3d:
-            slope_list = np.load(slope_list_path).astype(np.float64)
-            ax_max_3d = np.load(ax_max_3d_path).astype(np.float64)
-            ax_min_3d = np.load(os.path.join(npy_dir, 'ax_min_3d.npy')).astype(np.float64)
-            ay_max_3d = np.load(os.path.join(npy_dir, 'ay_max_3d.npy')).astype(np.float64)
-            gg_exp_3d = np.load(os.path.join(npy_dir, 'gg_exponent_3d.npy')).astype(np.float64)
-            nv, ng, ns = len(v_list), len(g_list), len(slope_list)
-            try:
-                with open(bin_path, 'wb') as f:
-                    f.write(struct.pack('III', nv, ng, ns))
-                    for arr in [v_list, g_list, slope_list]:
-                        arr.tofile(f)
-                    # 3D arrays: row-major [nv, ng, ns]
-                    for arr in [ax_max_3d, ax_min_3d, ay_max_3d, gg_exp_3d]:
-                        arr.astype(np.float64).tofile(f)
-            except OSError as e:
-                rospy.logerr(f"[GGTuner] 3D gg.bin write failed: {e}")
-                return False
-            rospy.loginfo(
-                f"[GGTuner] 3D gg.bin written: {bin_path} "
-                f"(nv={nv}, ng={ng}, ns={ns}, "
-                f"size={os.path.getsize(bin_path)} B)")
-        else:
-            nv, ng = len(v_list), len(g_list)
-            try:
-                with open(bin_path, 'wb') as f:
-                    f.write(struct.pack('II', nv, ng))
-                    for arr in [v_list, g_list, ax_max, ax_min, ay_max, gg_exp]:
-                        arr.tofile(f)
-            except OSError as e:
-                rospy.logerr(f"[GGTuner] gg.bin write failed: {e}")
-                return False
-            rospy.loginfo(
-                f"[GGTuner] 2D gg.bin written: {bin_path} (nv={nv}, ng={ng}, "
-                f"size={os.path.getsize(bin_path)} B)")
-        ## IY : end
+        nv, ng = len(v_list), len(g_list)
+        try:
+            with open(bin_path, 'wb') as f:
+                f.write(struct.pack('II', nv, ng))
+                for arr in [v_list, g_list, ax_max, ax_min, ay_max, gg_exp]:
+                    arr.tofile(f)
+        except OSError as e:
+            rospy.logerr(f"[GGTuner] gg.bin write failed: {e}")
+            return False
+        rospy.loginfo(
+            f"[GGTuner] gg.bin written: {bin_path} (nv={nv}, ng={ng}, "
+            f"size={os.path.getsize(bin_path)} B)")
         return True
-
-    ## IY : save ggv meta (slope_ax_scale, enable_slope) for downstream auto-pairing
-    ##      consumers: fast_sqp_planner._load_ggv, global_velocity_planner_3d
-    ##      also cleans stale *_3d.npy when enable_slope=False
-    def _save_ggv_meta(self, vehicle_name, slope_ax_scale, enable_slope):
-        import numpy as np
-        dst = os.path.join(self.data_path, 'gg_diagrams', vehicle_name)
-        for frame in ('velocity_frame', 'vehicle_frame'):
-            frame_dir = os.path.join(dst, frame)
-            if not os.path.isdir(frame_dir):
-                continue
-            try:
-                np.save(os.path.join(frame_dir, 'slope_ax_scale.npy'),
-                        np.float64(slope_ax_scale))
-                np.save(os.path.join(frame_dir, 'enable_slope.npy'),
-                        np.bool_(enable_slope))
-            except Exception as e:
-                rospy.logwarn(f"[GGTuner] save ggv meta failed ({frame}): {e}")
-            ## IY : cleanup stale *_3d.npy when enable_slope=False
-            ##      slope_data/ rho cache is preserved for future enable_slope=True reuse
-            if not enable_slope:
-                stale = ('ax_max_3d.npy', 'ax_min_3d.npy', 'ay_max_3d.npy',
-                         'gg_exponent_3d.npy', 'slope_list.npy',
-                         'slope_list_deg.npy')
-                removed = []
-                for fn in stale:
-                    p = os.path.join(frame_dir, fn)
-                    if os.path.isfile(p):
-                        try:
-                            os.remove(p)
-                            removed.append(fn)
-                        except OSError as e:
-                            rospy.logwarn(f"[GGTuner] cleanup failed ({fn}): {e}")
-                if removed:
-                    rospy.loginfo(
-                        f"[GGTuner] cleaned stale 3D npy in {frame}: {removed}")
-            ## IY : end
-        rospy.loginfo(f"[GGTuner] ggv meta saved: slope_ax_scale={slope_ax_scale}, enable_slope={enable_slope}")
-    ## IY : end
 
     def _copy_to_gg_diagrams(self, vehicle_name):
         src = os.path.join(self.fast_ggv_output_dir, vehicle_name)
@@ -520,9 +457,7 @@ class GGTunerNode:
         return ok
 
     ## IY : fast_ggv — no --tuning, unified params yml already has everything
-    def _run_fast_ggv(self, vehicle_name, full_resolution=False,
-                      enable_slope=False, slope_max_deg=15.0, slope_N=5,
-                      slope_ax_scale=1.0, slope_normal_scale=1.0):
+    def _run_fast_ggv(self, vehicle_name, full_resolution=False):
         rospy.loginfo(f"[GGTuner] [fast_ggv] starting: {vehicle_name}")
         self.status_pub.publish(f"GGV_COMPUTING: {vehicle_name}")
         if not os.path.exists(self.fast_ggv_script):
@@ -530,81 +465,12 @@ class GGTunerNode:
             return False
         resolution = '--full' if full_resolution else '--fast'
         cmd = ['bash', self.fast_ggv_script, vehicle_name, resolution]
-        env = {}
-        if enable_slope:
-            env['ENABLE_SLOPE'] = '1'
-            env['SLOPE_MAX_DEG'] = str(slope_max_deg)
-            env['SLOPE_N'] = str(slope_N)
-            env['SLOPE_AX_SCALE'] = str(slope_ax_scale)
-            env['SLOPE_NORMAL_SCALE'] = str(slope_normal_scale)
-        return self._run_and_stream(cmd, tag='fast_ggv', timeout=600,
-                                    env=env if env else None)
+        return self._run_and_stream(cmd, tag='fast_ggv', timeout=600)
     ## IY : end
 
-    def _read_friction_sectors(self, map_name):
-        """Read friction sectors — rosparam first (live rqt values), yaml fallback."""
-        # 1) try rosparam (set by friction_sector_server rqt)
-        try:
-            n_sec = rospy.get_param('/friction_map_params/n_sectors', 0)
-            if n_sec > 0:
-                sectors = []
-                for i in range(n_sec):
-                    sectors.append({
-                        'start': int(rospy.get_param(f'/friction_map_params/Sector{i}/start', 0)),
-                        'end':   int(rospy.get_param(f'/friction_map_params/Sector{i}/end', 0)),
-                        'friction': float(rospy.get_param(f'/friction_map_params/Sector{i}/friction', -1.0)),
-                    })
-                valid = [s for s in sectors if s['friction'] > 0]
-                if valid:
-                    rospy.loginfo(f"[GGTuner] Friction sectors from rosparam: {len(valid)} sectors")
-                    return valid
-        except Exception:
-            pass
-        # 2) fallback: read yaml file
-        yaml_path = os.path.join(self.maps_dir, map_name, 'friction_scaling.yaml')
-        if not os.path.exists(yaml_path):
-            rospy.loginfo(f"[GGTuner] No friction sectors for {map_name}")
-            return []
-        try:
-            with open(yaml_path) as f:
-                data = yaml.safe_load(f)
-            sectors = []
-            for i in range(data.get('n_sectors', 0)):
-                sec = data.get(f'Sector{i}', {})
-                fric = sec.get('friction', -1.0)
-                if fric > 0:
-                    sectors.append({'start': sec.get('start', 0),
-                                    'end': sec.get('end', 0),
-                                    'friction': float(fric)})
-            rospy.loginfo(f"[GGTuner] Friction sectors from yaml: {len(sectors)} sectors")
-            return sectors
-        except Exception as e:
-            rospy.logwarn(f"[GGTuner] friction_scaling.yaml parse error: {e}")
-            return []
-
-
-    def _replace_dir(self, dst, src):
-        if os.path.islink(dst):
-            os.unlink(dst)
-        elif os.path.exists(dst):
-            shutil.rmtree(dst)
-        shutil.copytree(src, dst)
-
-    ## IY : publish snapshot-name selectors to rosparam (consumed by velopt/FBGA)
-    def _publish_sector_ggv_map(self, slot_overrides):
-        for i in range(5):
-            name = (slot_overrides.get(i, '') or '').strip()
-            rospy.set_param(f'/gg_tuner/sector_ggv_map/sector{i}', name)
-        set_slots = {i: slot_overrides[i] for i in range(5)
-                     if (slot_overrides.get(i, '') or '').strip()}
-        if set_slots:
-            rospy.loginfo(f"[GGTuner] sector_ggv_map published: {set_slots}")
-        else:
-            rospy.loginfo("[GGTuner] sector_ggv_map cleared (all latest)")
-    ## IY : end
-
-    ## IY : raceline — passes safety_distance from rqt
-    def _run_raceline(self, vehicle_name, map_name, safety_distance=0.20):
+    ## IY : raceline — passes safety_distance + g_weight from rqt
+    def _run_raceline(self, vehicle_name, map_name, safety_distance=0.20,
+                      g_weight=1.0):
         if map_name not in self.available_maps:
             rospy.logerr(f"[GGTuner] map '{map_name}' not found. "
                          f"Available: {self.available_maps}")
@@ -612,12 +478,13 @@ class GGTunerNode:
             return False
         self.status_pub.publish(f"RACELINE_STARTED: {vehicle_name}")
         rospy.loginfo(f"[GGTuner] [raceline] map={map_name}, vehicle={vehicle_name}, "
-                      f"safety_distance={safety_distance}")
+                      f"safety_distance={safety_distance}, g_weight={g_weight:.3f}")
         cmd = [
             'roslaunch', 'stack_master', '3d_global_line.launch',
             f'map:={map_name}',
             f'vehicle:={vehicle_name}',
             f'safety_distance:={safety_distance}',
+            f'g_weight:={float(g_weight)}',
             'start_from:=5',
         ]
         ok = self._run_and_stream(cmd, tag='raceline', timeout=900)
@@ -628,10 +495,18 @@ class GGTunerNode:
         return ok
     ## IY : end
 
-    def _run_fbga_planner(self, vehicle_name, enable_mu=True, force_restart=False):
+    def _run_fbga_planner(self, vehicle_name, enable_mu=True, force_restart=False,
+                          bridge_effect=1.0,
+                          g_tilde_soft_beta=20.0,
+                          smooth_mu=True, mu_smooth_window=21, mu_smooth_polyorder=3,
+                          smooth_kappa=True, kappa_smooth_window=21, kappa_smooth_polyorder=3,
+                          slope_brake_margin=0.0, slope_brake_vmax=5.0):
         rospy.loginfo(
             f"[GGTuner] [fbga] update: {vehicle_name}, enable_mu={enable_mu}, "
-            f"force_restart={force_restart}")
+            f"bridge_effect={bridge_effect:.3f}, soft_beta={g_tilde_soft_beta:.1f}, "
+            f"smooth_mu={smooth_mu}/win{mu_smooth_window}, "
+            f"smooth_kappa={smooth_kappa}/win{kappa_smooth_window}, "
+            f"brake_margin={slope_brake_margin:.2f}m, force_restart={force_restart}")
         self.status_pub.publish(f"FBGA_STARTED: {vehicle_name}")
 
         gg_bin = os.path.join(
@@ -648,6 +523,18 @@ class GGTunerNode:
         rospy.set_param('/fbga_planner/gg_bin', gg_bin)
         rospy.set_param('/fbga_planner/params_yml', params_yml)
         rospy.set_param('/fbga_planner/enable_mu', bool(enable_mu))
+        ## IY : forward all live FBGA knobs (picked up by reload_cb)
+        rospy.set_param('/fbga_planner/bridge_effect', float(bridge_effect))
+        rospy.set_param('/fbga_planner/g_tilde_soft_beta', float(g_tilde_soft_beta))
+        rospy.set_param('/fbga_planner/smooth_mu', bool(smooth_mu))
+        rospy.set_param('/fbga_planner/mu_smooth_window', int(mu_smooth_window))
+        rospy.set_param('/fbga_planner/mu_smooth_polyorder', int(mu_smooth_polyorder))
+        rospy.set_param('/fbga_planner/smooth_kappa', bool(smooth_kappa))
+        rospy.set_param('/fbga_planner/kappa_smooth_window', int(kappa_smooth_window))
+        rospy.set_param('/fbga_planner/kappa_smooth_polyorder', int(kappa_smooth_polyorder))
+        rospy.set_param('/fbga_planner/slope_brake_margin', float(slope_brake_margin))
+        rospy.set_param('/fbga_planner/slope_brake_vmax', float(slope_brake_vmax))
+        ## IY : end
 
         if not force_restart:
             try:
@@ -687,6 +574,18 @@ class GGTunerNode:
             f'_gg_bin:={gg_bin}',
             f'_params_yml:={params_yml}',
             f'_enable_mu:={str(enable_mu).lower()}',
+            ## IY : pass all FBGA knobs on cold start
+            f'_bridge_effect:={float(bridge_effect)}',
+            f'_g_tilde_soft_beta:={float(g_tilde_soft_beta)}',
+            f'_smooth_mu:={str(smooth_mu).lower()}',
+            f'_mu_smooth_window:={int(mu_smooth_window)}',
+            f'_mu_smooth_polyorder:={int(mu_smooth_polyorder)}',
+            f'_smooth_kappa:={str(smooth_kappa).lower()}',
+            f'_kappa_smooth_window:={int(kappa_smooth_window)}',
+            f'_kappa_smooth_polyorder:={int(kappa_smooth_polyorder)}',
+            f'_slope_brake_margin:={float(slope_brake_margin)}',
+            f'_slope_brake_vmax:={float(slope_brake_vmax)}',
+            ## IY : end
         ]
         rospy.loginfo(f"[GGTuner] [fbga] cold start: {' '.join(cmd)}")
         try:
@@ -714,8 +613,167 @@ class GGTunerNode:
         rospy.loginfo("[GGTuner] [fbga] killed")
     ## IY : end
 
+    ## IY : sector_slicing spawn/kill (3d_sector_slicing.launch)
+    ##   spawns 4 interactive sector tuners for the selected map. User defines
+    ##   sectors via RViz, then unchecks the rqt box to kill the launch.
+    def _run_sector_slicing(self, map_name):
+        if self.sector_slicing_proc is not None and self.sector_slicing_proc.poll() is None:
+            rospy.loginfo("[GGTuner] [sectors] already running")
+            return True
+        if map_name not in self.available_maps:
+            rospy.logerr(f"[GGTuner] [sectors] invalid map '{map_name}'")
+            self.status_pub.publish(f"FAILED_SECTORS: invalid map")
+            return False
+        cmd = [
+            'roslaunch', 'stack_master', '3d_sector_slicing.launch',
+            f'map:={map_name}',
+        ]
+        rospy.loginfo(f"[GGTuner] [sectors] launching: {' '.join(cmd)}")
+        try:
+            self.sector_slicing_proc = subprocess.Popen(cmd)
+            self.status_pub.publish(f"SECTORS_RUNNING: {map_name}")
+            return True
+        except OSError as e:
+            rospy.logerr(f"[GGTuner] [sectors] launch failed: {e}")
+            self.status_pub.publish(f"FAILED_SECTORS: {map_name}")
+            return False
+
+    def _kill_sector_slicing(self):
+        rospy.loginfo("[GGTuner] [sectors] kill requested (checkbox off)")
+        # kill the four nodes in the launch
+        for node in ('/sector_node_3d', '/ot_sector_node_3d',
+                     '/static_obs_sector_node_3d', '/friction_sector_node'):
+            try:
+                subprocess.run(['rosnode', 'kill', node],
+                               capture_output=True, timeout=3, check=False)
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+        if self.sector_slicing_proc is not None and self.sector_slicing_proc.poll() is None:
+            try:
+                self.sector_slicing_proc.terminate()
+                self.sector_slicing_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.sector_slicing_proc.kill()
+        self.sector_slicing_proc = None
+        rospy.loginfo("[GGTuner] [sectors] killed")
+    ## IY : end
+
+    ## IY : Stage 4 alternative — 3d_optimized_vel_planner (NLP velocity).
+    ##   Mirrors fbga pattern: hot-reload via /velopt/reload, fallback cold start.
+    ##   bridge_effect is shared with fbga (Track3D inside velopt takes
+    ##   g_weight=bridge_effect → mu / Omega scale handled in track3D.py).
+    def _run_velopt_planner(self, vehicle_name, map_name, velopt_opts,
+                            bridge_effect=1.0, force_restart=False):
+        rospy.loginfo(
+            f"[GGTuner] [velopt] update: vehicle={vehicle_name}, map={map_name}, "
+            f"opts={velopt_opts}, bridge_effect={bridge_effect:.3f}, "
+            f"force_restart={force_restart}")
+        self.status_pub.publish(f"VELOPT_STARTED: {vehicle_name}")
+
+        params_yml = os.path.join(
+            self.data_path, 'vehicle_params',
+            'params_' + vehicle_name + '.yml')
+        if not os.path.exists(params_yml):
+            rospy.logerr(f"[GGTuner] params yml missing: {params_yml}")
+            self.status_pub.publish(f"FAILED_VELOPT: {vehicle_name}")
+            return False
+        raceline_csv = os.path.join(
+            self.maps_dir, map_name,
+            f'{map_name}_3d_{vehicle_name}_timeoptimal.csv')
+        if not os.path.exists(raceline_csv):
+            rospy.logerr(f"[GGTuner] raceline csv missing: {raceline_csv}")
+            self.status_pub.publish(f"FAILED_VELOPT: {vehicle_name}")
+            return False
+
+        rospy.set_param('/vel_opt_3d/map',           map_name)
+        rospy.set_param('/vel_opt_3d/racecar',       vehicle_name)
+        rospy.set_param('/vel_opt_3d/V_min',         float(velopt_opts['V_min']))
+        rospy.set_param('/vel_opt_3d/gg_margin',     float(velopt_opts['gg_margin']))
+        rospy.set_param('/vel_opt_3d/step_size_opt', float(velopt_opts['step_size']))
+        rospy.set_param('/vel_opt_3d/w_T',           float(velopt_opts['w_T']))
+        rospy.set_param('/vel_opt_3d/w_jx',          float(velopt_opts['w_jx']))
+        ## IY : asymmetric jerk + curvature-weighted regularization
+        rospy.set_param('/vel_opt_3d/w_jx_acc_ratio',  float(velopt_opts['w_jx_acc_ratio']))
+        rospy.set_param('/vel_opt_3d/w_jx_brk_ratio',  float(velopt_opts['w_jx_brk_ratio']))
+        rospy.set_param('/vel_opt_3d/w_jx_curv_alpha', float(velopt_opts['w_jx_curv_alpha']))
+        rospy.set_param('/vel_opt_3d/bridge_effect', float(bridge_effect))
+
+        if not force_restart:
+            try:
+                rospy.wait_for_service('/velopt/reload', timeout=0.5)
+                reload_srv = rospy.ServiceProxy('/velopt/reload', Trigger)
+                resp = reload_srv()
+                if resp.success:
+                    rospy.loginfo(
+                        f"[GGTuner] [velopt] hot-reloaded: {resp.message}")
+                    self.status_pub.publish(f"VELOPT_DONE: {vehicle_name}")
+                    return True
+                else:
+                    rospy.logwarn(
+                        f"[GGTuner] [velopt] reload returned failure: "
+                        f"{resp.message} → cold start")
+            except (rospy.ROSException, rospy.ServiceException) as e:
+                rospy.loginfo(
+                    f"[GGTuner] [velopt] reload unavailable ({e}) → cold start")
+
+        try:
+            subprocess.run(['rosnode', 'kill', '/vel_opt_3d'],
+                           capture_output=True, timeout=5, check=False)
+            time.sleep(0.3)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        if self.velopt_proc is not None and self.velopt_proc.poll() is None:
+            try:
+                self.velopt_proc.terminate()
+                self.velopt_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.velopt_proc.kill()
+        self.velopt_proc = None
+
+        cmd = [
+            'rosrun', 'stack_master', '3d_optimized_vel_planner.py',
+            '__name:=vel_opt_3d',
+            f'_map:={map_name}',
+            f'_racecar:={vehicle_name}',
+            f'_V_min:={float(velopt_opts["V_min"])}',
+            f'_gg_margin:={float(velopt_opts["gg_margin"])}',
+            f'_step_size_opt:={float(velopt_opts["step_size"])}',
+            f'_w_T:={float(velopt_opts["w_T"])}',
+            f'_w_jx:={float(velopt_opts["w_jx"])}',
+            ## IY : asymmetric jerk + curvature-weighted regularization
+            f'_w_jx_acc_ratio:={float(velopt_opts["w_jx_acc_ratio"])}',
+            f'_w_jx_brk_ratio:={float(velopt_opts["w_jx_brk_ratio"])}',
+            f'_w_jx_curv_alpha:={float(velopt_opts["w_jx_curv_alpha"])}',
+            f'_bridge_effect:={float(bridge_effect)}',
+        ]
+        rospy.loginfo(f"[GGTuner] [velopt] cold start: {' '.join(cmd)}")
+        try:
+            self.velopt_proc = subprocess.Popen(cmd)
+            return True
+        except OSError as e:
+            rospy.logerr(f"[GGTuner] Failed to start velopt: {e}")
+            self.status_pub.publish(f"FAILED_VELOPT: {vehicle_name}")
+            return False
+
+    def _kill_velopt_planner(self):
+        rospy.loginfo("[GGTuner] [velopt] kill requested")
+        try:
+            subprocess.run(['rosnode', 'kill', '/vel_opt_3d'],
+                           capture_output=True, timeout=5, check=False)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        if self.velopt_proc is not None and self.velopt_proc.poll() is None:
+            try:
+                self.velopt_proc.terminate()
+                self.velopt_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.velopt_proc.kill()
+        self.velopt_proc = None
+        rospy.loginfo("[GGTuner] [velopt] killed")
+    ## IY : end
+
     ## IY : publish GGV diamond results as JSON for rqt_gg_viewer
-    def _publish_gg_results(self, vehicle_name, tuning=None, slope_results=None):
+    def _publish_gg_results(self, vehicle_name, tuning=None):
         vf_dir = os.path.join(self.data_path, 'gg_diagrams', vehicle_name,
                               'velocity_frame')
         if not os.path.isdir(vf_dir):
@@ -731,36 +789,6 @@ class GGTunerNode:
         except (FileNotFoundError, OSError) as e:
             rospy.logwarn(f"[GGTuner] publish_gg_results: npy load failed: {e}")
             return
-        # auto-load slope results from 3D diamond arrays if available
-        ## IY : honor enable_slope meta — stale *_3d.npy may exist when ggv was
-        ##      regenerated with enable_slope=False (gen_diamond reuses slope_data/)
-        enable_slope_meta = True  # default: trust file presence (legacy)
-        es_path = os.path.join(vf_dir, 'enable_slope.npy')
-        if os.path.isfile(es_path):
-            try:
-                enable_slope_meta = bool(np.load(es_path))
-            except (FileNotFoundError, OSError, ValueError):
-                pass
-        ## IY : end
-        if slope_results is None and enable_slope_meta:
-            slope_list_path = os.path.join(vf_dir, 'slope_list_deg.npy')
-            ax_max_3d_path = os.path.join(vf_dir, 'ax_max_3d.npy')
-            if os.path.exists(slope_list_path) and os.path.exists(ax_max_3d_path):
-                try:
-                    slope_results = {
-                        'slope_list_deg': np.load(slope_list_path).tolist(),
-                        'ax_max': np.load(ax_max_3d_path).tolist(),
-                        'ax_min': np.load(os.path.join(vf_dir, 'ax_min_3d.npy')).tolist(),
-                        'ay_max': np.load(os.path.join(vf_dir, 'ay_max_3d.npy')).tolist(),
-                        ## IY : add gg_exponent_3d for viewer slope-aware diamond
-                        'gg_exponent': np.load(os.path.join(vf_dir, 'gg_exponent_3d.npy')).tolist(),
-                    }
-                    rospy.loginfo(f"[GGTuner] 3D slope diamond loaded for viewer")
-                except (FileNotFoundError, OSError):
-                    pass
-        elif not enable_slope_meta:
-            rospy.loginfo(f"[GGTuner] enable_slope=False → skip 3D slope payload "
-                          f"(stale *_3d.npy ignored)")
         payload = {
             'vehicle_name': vehicle_name,
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -773,7 +801,6 @@ class GGTunerNode:
                 'gg_exponent': gg_exp,
             },
             'tuning_params': tuning or {},
-            'slope_results': slope_results,
         }
         self.results_pub.publish(json.dumps(payload))
         rospy.loginfo(f"[GGTuner] Published /gg_results "
@@ -791,14 +818,6 @@ class GGTunerNode:
                 vehicle_name = f"{self.base_vehicle}_latest"
 
                 if not run_opts['run_ggv']:
-                    ## IY : raceline_ggv override — activate snapshot into _latest
-                    if run_opts['raceline_ggv']:
-                        if not self._activate_snapshot_as_latest(
-                                run_opts['raceline_ggv']):
-                            self.status_pub.publish(
-                                f"FAILED: snapshot_missing:{run_opts['raceline_ggv']}")
-                            return
-                    ## IY : end
                     latest_gg = os.path.join(
                         self.data_path, 'gg_diagrams', vehicle_name)
                     if not os.path.exists(latest_gg):
@@ -821,12 +840,7 @@ class GGTunerNode:
                     self._write_latest_params_yml(merged)
                     ok = self._run_fast_ggv(
                         vehicle_name,
-                        full_resolution=run_opts['full_resolution'],
-                        enable_slope=run_opts.get('enable_slope', False),
-                        slope_max_deg=run_opts.get('slope_max_deg', 15.0),
-                        slope_N=run_opts.get('slope_N', 5),
-                        slope_ax_scale=run_opts.get('slope_ax_scale', 1.0),
-                        slope_normal_scale=run_opts.get('slope_normal_scale', 1.0))
+                        full_resolution=run_opts['full_resolution'])
                     if not ok:
                         self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
                         return
@@ -834,51 +848,75 @@ class GGTunerNode:
                         self.status_pub.publish(f"FAILED_GGV: {vehicle_name}")
                         return
                     self._save_meta(vehicle_name, tuning)
-                    ## IY : save ggv meta for downstream auto-pairing
-                    self._save_ggv_meta(
-                        vehicle_name,
-                        slope_ax_scale=run_opts.get('slope_ax_scale', 1.0),
-                        enable_slope=run_opts.get('enable_slope', False))
-                    ## IY : end
                     self.status_pub.publish(f"GGV_DONE: {vehicle_name}")
                     ## IY : publish fresh results for rqt_gg_viewer
                     self._publish_gg_results(vehicle_name, tuning)
                     ## IY : end
                 ## IY : end
-                    
-                # Publish sector snapshot-name selectors for velopt/FBGA
-                slot_overrides = {
-                    i: run_opts[f'ggv_sector{i}'] for i in range(5)
-                }
-                self._publish_sector_ggv_map(slot_overrides)
 
                 # ---- Stage 3: raceline (optional) ----
                 if run_opts['regen_raceline']:
                     ## IY : overlay rqt RACELINE_KEYS onto latest yml (idempotent)
                     self._update_raceline_keys_in_yml(vehicle_name, tuning)
                     ## IY : end
+                    ## IY : raceline keeps the old g_weight signature; map from bridge_effect
                     ok = self._run_raceline(
                         vehicle_name, run_opts['map'],
-                        safety_distance=run_opts['safety_distance'])
+                        safety_distance=run_opts['safety_distance'],
+                        g_weight=run_opts['bridge_effect'])
+                    ## IY : end
                     if not ok:
                         rospy.logerr(f"[GGTuner] raceline failed")
                         return
                 else:
                     rospy.loginfo(f"[GGTuner] raceline regen SKIP")
 
-                if run_opts['run_fbga']:
-                    force_restart = bool(run_opts['regen_raceline'])
+                ## IY : Stage 4 single-engine dispatch (vel_engine selector)
+                engine = run_opts.get('vel_engine', 'none')
+                force_restart = bool(run_opts['regen_raceline'])
+                if engine == 'fbga':
+                    self._kill_velopt_planner()       # ensure other engine off
                     ok = self._run_fbga_planner(
                         vehicle_name,
                         enable_mu=run_opts['enable_mu'],
+                        force_restart=force_restart,
+                        bridge_effect=run_opts['bridge_effect'],
+                        g_tilde_soft_beta=run_opts['g_tilde_soft_beta'],
+                        smooth_mu=run_opts['smooth_mu'],
+                        mu_smooth_window=run_opts['mu_smooth_window'],
+                        mu_smooth_polyorder=run_opts['mu_smooth_polyorder'],
+                        smooth_kappa=run_opts['smooth_kappa'],
+                        kappa_smooth_window=run_opts['kappa_smooth_window'],
+                        kappa_smooth_polyorder=run_opts['kappa_smooth_polyorder'],
+                        slope_brake_margin=run_opts['slope_brake_margin'],
+                        slope_brake_vmax=run_opts['slope_brake_vmax'])
+                    if not ok:
+                        return
+                    self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
+                elif engine == 'velopt':
+                    self._kill_fbga_planner()         # ensure other engine off
+                    velopt_opts = {
+                        'V_min':            run_opts['velopt_V_min'],
+                        'gg_margin':        run_opts['velopt_gg_margin'],
+                        'step_size':        run_opts['velopt_step_size'],
+                        'w_T':              run_opts['velopt_w_T'],
+                        'w_jx':             run_opts['velopt_w_jx'],
+                        'w_jx_acc_ratio':   run_opts['velopt_w_jx_acc_ratio'],
+                        'w_jx_brk_ratio':   run_opts['velopt_w_jx_brk_ratio'],
+                        'w_jx_curv_alpha':  run_opts['velopt_w_jx_curv_alpha'],
+                    }
+                    ok = self._run_velopt_planner(
+                        vehicle_name, run_opts['map'], velopt_opts,
+                        bridge_effect=run_opts['velopt_bridge_effect'],
                         force_restart=force_restart)
                     if not ok:
                         return
                     self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
-                else:
+                else:  # 'none'
                     self._kill_fbga_planner()
-                    rospy.loginfo(f"[GGTuner] fbga killed (run_fbga=False)")
-                    self.status_pub.publish(f"DONE_FBGA_OFF: {vehicle_name}")
+                    self._kill_velopt_planner()
+                    rospy.loginfo(f"[GGTuner] vel_engine=none → both engines off")
+                    self.status_pub.publish(f"DONE_VEL_OFF: {vehicle_name}")
                 ## IY : end
 
                 rospy.loginfo(f"[GGTuner] ===== Pipeline done: {vehicle_name} =====")
@@ -908,6 +946,18 @@ class GGTunerNode:
                 return config
         ## IY : end
 
+        ## IY : sector_slicing toggle (independent of apply trigger)
+        new_sector_state = bool(getattr(config, 'run_sector_slicing', False))
+        if new_sector_state != self._last_sector_slicing_state:
+            if new_sector_state:
+                self._run_sector_slicing(str(config.map))
+            else:
+                self._kill_sector_slicing()
+            self._last_sector_slicing_state = new_sector_state
+            if not config.apply:
+                return config
+        ## IY : end
+
         if not config.apply:
             return config
 
@@ -926,23 +976,33 @@ class GGTunerNode:
             'full_resolution':  bool(config.full_resolution),
             'regen_raceline':   bool(config.regen_raceline),
             'map':              str(config.map),
-            'run_fbga':         bool(config.run_fbga),
+            ## IY : Stage 4 single selector (replaces run_fbga bool)
+            'vel_engine':       str(config.vel_engine),
+            ## IY : end
             'enable_mu':        bool(config.enable_mu),
             'safety_distance':  float(config.safety_distance),
-            ## IY : per-sector snapshot selectors (empty=latest) for velopt/FBGA
-            'ggv_sector0':      str(getattr(config, 'ggv_sector0', '')).strip(),
-            'ggv_sector1':      str(getattr(config, 'ggv_sector1', '')).strip(),
-            'ggv_sector2':      str(getattr(config, 'ggv_sector2', '')).strip(),
-            'ggv_sector3':      str(getattr(config, 'ggv_sector3', '')).strip(),
-            'ggv_sector4':      str(getattr(config, 'ggv_sector4', '')).strip(),
-            ## IY : raceline-dedicated snapshot (empty=latest)
-            'raceline_ggv':     str(getattr(config, 'raceline_ggv', '')).strip(),
-            ## IY : slope sweep for rqt_gg_viewer
-            'enable_slope':     bool(getattr(config, 'enable_slope', False)),
-            'slope_max_deg':    float(getattr(config, 'slope_max_deg', 15.0)),
-            'slope_N':          int(getattr(config, 'slope_N', 5)),
-            'slope_ax_scale':   float(getattr(config, 'slope_ax_scale', 1.0)),
-            'slope_normal_scale': float(getattr(config, 'slope_normal_scale', 1.0)),
+            ## IY : FBGA knobs (used when vel_engine='fbga'; bridge_effect also shared by velopt)
+            'bridge_effect':            float(config.bridge_effect),
+            'g_tilde_soft_beta':        float(config.g_tilde_soft_beta),
+            'smooth_mu':                bool(config.smooth_mu),
+            'mu_smooth_window':         int(config.mu_smooth_window),
+            'mu_smooth_polyorder':      int(config.mu_smooth_polyorder),
+            'smooth_kappa':             bool(config.smooth_kappa),
+            'kappa_smooth_window':      int(config.kappa_smooth_window),
+            'kappa_smooth_polyorder':   int(config.kappa_smooth_polyorder),
+            'slope_brake_margin':       float(config.slope_brake_margin),
+            'slope_brake_vmax':         float(config.slope_brake_vmax),
+            ## IY : end
+            ## IY : VelOpt knobs (used when vel_engine='velopt')
+            'velopt_bridge_effect': float(config.velopt_bridge_effect),
+            'velopt_V_min':       float(config.velopt_V_min),
+            'velopt_gg_margin':   float(config.velopt_gg_margin),
+            'velopt_step_size':   float(config.velopt_step_size),
+            'velopt_w_T':         float(config.velopt_w_T),
+            'velopt_w_jx':        float(config.velopt_w_jx),
+            'velopt_w_jx_acc_ratio':   float(config.velopt_w_jx_acc_ratio),
+            'velopt_w_jx_brk_ratio':   float(config.velopt_w_jx_brk_ratio),
+            'velopt_w_jx_curv_alpha':  float(config.velopt_w_jx_curv_alpha),
             ## IY : end
         }
         ## IY : end
@@ -976,6 +1036,20 @@ class GGTunerNode:
                 self.fbga_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.fbga_proc.kill()
+        if self.velopt_proc is not None and self.velopt_proc.poll() is None:
+            rospy.loginfo("[GGTuner] Terminating velopt subprocess...")
+            try:
+                self.velopt_proc.terminate()
+                self.velopt_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.velopt_proc.kill()
+        if self.sector_slicing_proc is not None and self.sector_slicing_proc.poll() is None:
+            rospy.loginfo("[GGTuner] Terminating sector_slicing roslaunch...")
+            try:
+                self.sector_slicing_proc.terminate()
+                self.sector_slicing_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.sector_slicing_proc.kill()
 
 
 if __name__ == '__main__':

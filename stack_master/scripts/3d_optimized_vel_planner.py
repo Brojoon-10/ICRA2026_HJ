@@ -195,18 +195,23 @@ def _build_friction_gg_map(sectors, n_waypoints, gg_base_dir, gg_margin,
 ## IY : end
 
 
-# --- (기존 build_and_solve 시그니처, 보존용 주석) ---
-# def build_and_solve(track, gg, vehicle_params,
-#                     n_fixed, chi_fixed, v_init, ax_init,
-#                     w_T=1.0, w_jx=1e-2, V_min=0.0, RK4_steps=1, sol_opt=None):
-# --- (원본 끝) ---
+
 ## IY(0416) : add gg_list, gg_idx params for multi-GGV friction support
+## IY : asymmetric jerk weights + curvature-weighted regularization.
+##   w_jx_acc / w_jx_brk default to w_jx (symmetric, backward-compat).
+##   w_jx_curv_alpha=0.0 disables curvature weighting.
 def build_and_solve(track, gg, vehicle_params,
                     n_fixed, chi_fixed, v_init, ax_init,
                     w_T=1.0, w_jx=1e-2, V_min=0.0, RK4_steps=1, sol_opt=None,
-                    gg_list=None, gg_idx=None):
+                    gg_list=None, gg_idx=None,
+                    w_jx_acc=None, w_jx_brk=None, w_jx_curv_alpha=0.0):
 ## IY(0416) : end
     """Reduced-state NLP. All arrays must be on track.s (resampled grid)."""
+    ## IY : asymmetric jerk defaults — fall back to symmetric w_jx
+    if w_jx_acc is None:
+        w_jx_acc = w_jx
+    if w_jx_brk is None:
+        w_jx_brk = w_jx
     h = vehicle_params['h']
     N = track.s.size
     ds = track.ds
@@ -257,7 +262,16 @@ def build_and_solve(track, gg, vehicle_params,
     dx = ca.vertcat(dV, dax)
 
     L_t = w_T * 1.0 / s_dot
-    L_reg = w_jx * (jx / s_dot) ** 2
+    ## IY : asymmetric jerk + curvature-weighted regularization.
+    ##   curv_factor = 1 + alpha * |Omega_z|  (corner-only smoothing when alpha>0).
+    ##   jx_pos / jx_neg split → independent accel-side / brake-side weights.
+    ##   Backward-compat: w_jx_acc=w_jx_brk=w_jx, alpha=0 → identical to legacy.
+    jx_pos = ca.fmax(jx, 0.0)
+    jx_neg = ca.fmax(-jx, 0.0)
+    curv_factor = 1.0 + w_jx_curv_alpha * ca.fabs(Omega_z_s)
+    L_reg = curv_factor * (
+        w_jx_acc * jx_pos ** 2 + w_jx_brk * jx_neg ** 2
+    ) / (s_dot ** 2)
 
     # RK4 (same as original)
     M = RK4_steps
@@ -519,6 +533,22 @@ class VelOptNode:
             self.w_jx = 1e-2
         self.w_T  = float(rospy.get_param('~w_T',  self.w_T))
         self.w_jx = float(rospy.get_param('~w_jx', self.w_jx))
+        ## IY : asymmetric jerk + curvature-weighted regularization knobs.
+        ##   ratio_acc / ratio_brk multiply base w_jx (1.0 = symmetric, legacy).
+        ##   curv_alpha=0 disables corner weighting.
+        if not hasattr(self, 'w_jx_acc_ratio'):
+            self.w_jx_acc_ratio = 1.0
+        if not hasattr(self, 'w_jx_brk_ratio'):
+            self.w_jx_brk_ratio = 1.0
+        if not hasattr(self, 'w_jx_curv_alpha'):
+            self.w_jx_curv_alpha = 0.0
+        self.w_jx_acc_ratio  = float(rospy.get_param('~w_jx_acc_ratio',  self.w_jx_acc_ratio))
+        self.w_jx_brk_ratio  = float(rospy.get_param('~w_jx_brk_ratio',  self.w_jx_brk_ratio))
+        self.w_jx_curv_alpha = float(rospy.get_param('~w_jx_curv_alpha', self.w_jx_curv_alpha))
+        self.w_jx_acc = self.w_jx * self.w_jx_acc_ratio
+        self.w_jx_brk = self.w_jx * self.w_jx_brk_ratio
+        ## IY : bridge_effect (shared with fbga; fed into Track3D as g_weight)
+        self.bridge_effect = float(rospy.get_param('~bridge_effect', 1.0))
         ## IY : end
         ## IY : end
 
@@ -547,7 +577,9 @@ class VelOptNode:
             self.vehicle_params = yaml.safe_load(f)['vehicle_params']
 
         # Track3D + grid step that exactly divides L_track for clean periodic closure
-        self.track = Track3D(path=self.track_csv)
+        ## IY : forward bridge_effect to Track3D — scales sin(mu) inside
+        ##   calc_apparent_accelerations (new semantics, fbga-consistent)
+        self.track = Track3D(path=self.track_csv, g_weight=self.bridge_effect)
         L_track = float(self.track.s[-1] + self.track.ds)
         N_target = max(10, int(round(L_track / self.step_size_opt)))
         actual_step = L_track / N_target
@@ -601,7 +633,11 @@ class VelOptNode:
         """Run the reduced-state NLP once using csv-based fixed path."""
         rospy.loginfo(
             f'[velopt] solving NLP ... (w_T={self.w_T}, w_jx={self.w_jx}, '
-            f'V_min={self.V_min}, gg_margin={self.gg_margin})')
+            f'w_jx_acc_ratio={self.w_jx_acc_ratio}, '
+            f'w_jx_brk_ratio={self.w_jx_brk_ratio}, '
+            f'w_jx_curv_alpha={self.w_jx_curv_alpha}, '
+            f'V_min={self.V_min}, gg_margin={self.gg_margin}, '
+            f'bridge_effect={self.bridge_effect})')
         # --- (기존 build_and_solve 호출, 보존용 주석) ---
         # self.V_opt, self.ax_opt, laptime, success = build_and_solve(
         #     track=self.track, gg=self.gg, vehicle_params=self.vehicle_params,
@@ -617,6 +653,8 @@ class VelOptNode:
             v_init=self.v_init, ax_init=self.ax_init, V_min=self.V_min,
             w_T=self.w_T, w_jx=self.w_jx,
             gg_list=self.gg_list, gg_idx=self.gg_idx,
+            w_jx_acc=self.w_jx_acc, w_jx_brk=self.w_jx_brk,
+            w_jx_curv_alpha=self.w_jx_curv_alpha,
         )
         ## IY(0416) : end
         rospy.loginfo(f'[velopt] laptime={laptime:.4f}s  '

@@ -128,7 +128,8 @@ void FWBW::compute_Vmax()
       // HJ : mu 보정 — 중력이 ax_tilde로 소모, diamond에서 ay 한계 감소
       //       (|ax_grav|/ax_max)^p + (|ay|/ay_max)^p <= 1
       //       → ay_max_eff = ay_max * (1 - (|ax_grav|/ax_max)^p)^(1/p)
-      const real ax_grav = std::abs(9.81 * std::sin(slope));
+      // IY : ax_grav scaled by slope_corr_ (2.5d_vel_planner slope_correction)
+      const real ax_grav = std::abs(9.81 * std::sin(slope)) * this->slope_corr_;
       if (ax_grav > 1e-6 && !std::isnan(vmax) && this->gg_Exp) {
         const real ay_max_raw = this->gg_range.max(vmax, g, slope);
         const real ax_max_raw = this->gg_Upper(0.0, vmax, g, slope);  // ay=0일 때 ax_max
@@ -147,7 +148,8 @@ void FWBW::compute_Vmax()
       auto F2solve = [this, k, g, slope](const real v) -> real { return k * v * v - this->gg_range.min(v, g, slope); };
       // IY : end
       bool ok = this->BD.solve(F2solve, v_a, v_b, vmax);
-      const real ax_grav = std::abs(9.81 * std::sin(slope));
+      // IY : ax_grav scaled by slope_corr_ (2.5d_vel_planner slope_correction)
+      const real ax_grav = std::abs(9.81 * std::sin(slope)) * this->slope_corr_;
       if (ax_grav > 1e-6 && !std::isnan(vmax) && this->gg_Exp) {
         const real ay_min_raw = std::abs(this->gg_range.min(vmax, g, slope));
         const real ax_min_raw = std::abs(this->gg_Lower(0.0, vmax, g, slope));
@@ -161,13 +163,10 @@ void FWBW::compute_Vmax()
       }
     }
     vmax              = std::isnan(vmax) ? v_top_speed : vmax;
-    // HJ : g_tilde > 0 constraint → v < sqrt(g*cos(mu) / dmu_ds) at crests
-    //       prevents vehicle from going airborne on slope transitions
-    const real dmu = this->DMU_vec[i];
-    if (dmu > 1e-4) {
-      const real v_gtilde_max = std::sqrt(9.81 * std::cos(slope) / dmu);
-      vmax = std::min(vmax, v_gtilde_max);
-    }
+    // IY : v_gtilde_max cap removed — Python softplus floor on g_tilde
+    //   already guarantees g_tilde >= g_min, so the same crest-airborne
+    //   constraint is enforced upstream (TUMRT-original FBGA had no
+    //   such cap inside FWBW).
     this->Vmax_vec[i] = vmax;
   }
 }
@@ -243,7 +242,8 @@ void FWBW::FW()
     const real k1 = this->K_vec[i + 1];
     const real g0 = this->G_vec[i];   // IY : per-segment apparent gravity (start node)
     const real mu0 = this->MU_vec[i]; // HJ : per-segment slope angle (also slope arg for 3D ggv lookup — IY option A)
-    const real ax_gravity = 9.81 * std::sin(mu0); // HJ : longitudinal gravity component
+    // IY : ax_gravity scaled by slope_corr_ (2.5d_vel_planner slope_correction)
+    const real ax_gravity = 9.81 * std::sin(mu0) * this->slope_corr_;
     const real S0 = this->S_vec[i];
     const real S1 = this->S_vec[i + 1];
     const real L0 = S1 - S0;
@@ -315,7 +315,8 @@ void FWBW::BW()
     const real kf  = this->Segments[i].k1();
     const real g1  = this->G_vec[i + 1];   // IY : per-segment apparent gravity (end node)
     const real mu1 = this->MU_vec[i + 1];  // HJ : per-segment slope angle (end node, also slope arg for 3D ggv lookup — IY option A)
-    const real ax_gravity = 9.81 * std::sin(mu1); // HJ : longitudinal gravity component
+    // IY : ax_gravity scaled by slope_corr_ (2.5d_vel_planner slope_correction)
+    const real ax_gravity = 9.81 * std::sin(mu1) * this->slope_corr_;
     // HJ : v1을 다음 노드의 Vmax로 clamp — BW 전파 시 비정상 고속 방지
     v1 = std::min(v1, this->Vmax_vec[i + 1]);
     const real ayf = kf * v1 * v1;
