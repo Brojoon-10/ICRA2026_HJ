@@ -22,8 +22,11 @@
 
         <!-- Button mapping: joy_index -> CRSF channel -->
         <!-- buttons[4]=LB(CH6), buttons[5]=RB(CH7) -->
-        <rosparam param="button_joy_indices">[4, 5]</rosparam>
-        <rosparam param="button_crsf_channels">[5, 6]</rosparam>
+        <!-- ### HJ : add buttons[0]=A <- CRSF ch7 (identified by diagnostic toggle test) -->
+        <rosparam param="button_joy_indices">[0, 4, 5]</rosparam>
+        <rosparam param="button_crsf_channels">[7, 5, 6]</rosparam>
+        <!-- ### HJ : invert polarity for A (CH7 idles low, latched switch presses high) -->
+        <rosparam param="button_invert">[1, 0, 0]</rosparam>
 
         <!-- Button threshold (CRSF value, below=pressed) -->
         <param name="button_threshold" value="992"/>
