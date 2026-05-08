@@ -44,6 +44,8 @@ class ELRSJoyNode:
         self.axes_crsf_channels = rospy.get_param('~axes_crsf_channels', [0, 2])
         self.button_joy_indices = rospy.get_param('~button_joy_indices', [4, 5])
         self.button_crsf_channels = rospy.get_param('~button_crsf_channels', [5, 6])
+        ### HJ : per-button polarity invert (1 = pressed when value > threshold)
+        self.button_invert = rospy.get_param('~button_invert', [0, 0])
         self.button_threshold = rospy.get_param('~button_threshold', 992)
         self.axes_invert = rospy.get_param('~axes_invert', [1.0, 1.0])
         self.deadzone = rospy.get_param('~deadzone', 0.05)
@@ -70,7 +72,10 @@ class ELRSJoyNode:
             normalized = 0.0
         return normalized
 
-    def channel_to_button(self, value):
+    def channel_to_button(self, value, invert=0):
+        ### HJ : invert=1 means "pressed when value > threshold" (for CH polarity flip)
+        if invert:
+            return 1 if value > self.button_threshold else 0
         return 1 if value < self.button_threshold else 0
 
     def validate_channels(self, channels):
@@ -176,8 +181,9 @@ class ELRSJoyNode:
         for i, (joy_idx, crsf_ch) in enumerate(zip(self.axes_joy_indices, self.axes_crsf_channels)):
             sign = self.axes_invert[i] if i < len(self.axes_invert) else 1.0
             msg.axes[joy_idx] = sign * self.normalize_axis(self.channels[crsf_ch])
-        for joy_idx, crsf_ch in zip(self.button_joy_indices, self.button_crsf_channels):
-            msg.buttons[joy_idx] = self.channel_to_button(self.channels[crsf_ch])
+        for i, (joy_idx, crsf_ch) in enumerate(zip(self.button_joy_indices, self.button_crsf_channels)):
+            inv = self.button_invert[i] if i < len(self.button_invert) else 0
+            msg.buttons[joy_idx] = self.channel_to_button(self.channels[crsf_ch], invert=inv)
         self.joy_pub.publish(msg)
 
     def check_failsafe(self):
