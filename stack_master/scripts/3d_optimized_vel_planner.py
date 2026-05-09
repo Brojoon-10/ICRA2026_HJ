@@ -194,15 +194,6 @@ def _build_friction_gg_map(sectors, n_waypoints, gg_base_dir, gg_margin,
     return gg_list, gg_idx
 ## IY : end
 
-
-
-## IY(0416) : add gg_list, gg_idx params for multi-GGV friction support
-## IY : asymmetric jerk weights + tanh-saturated curvature/transition weighting.
-##   w_jx_acc / w_jx_brk default to w_jx (symmetric, backward-compat).
-##   alpha_acc/_brk: |Omega_z|-driven tanh weight (corner overall).
-##   beta_acc/_brk:  |dOmega_z/ds|-driven tanh weight (transition zone).
-##   k_alpha [1/m], k_beta [1/m^2]: tanh saturation scales.
-##   Legacy w_jx_curv_alpha (linear) auto-maps to alpha_acc=alpha_brk if set.
 def build_and_solve(track, gg, vehicle_params,
                     n_fixed, chi_fixed, v_init, ax_init,
                     w_T=1.0, w_jx=1e-2, V_min=0.0, RK4_steps=1, sol_opt=None,
@@ -227,9 +218,7 @@ def build_and_solve(track, gg, vehicle_params,
         w_jx_acc = w_jx
     if w_jx_brk is None:
         w_jx_brk = w_jx
-    ## IY : legacy w_jx_curv_alpha auto-mapping. If user passes the old linear
-    ##   knob and both new α_acc / α_brk are 0, mirror the legacy value into
-    ##   both sides so existing launches keep working (with new tanh shape).
+
     if w_jx_curv_alpha > 0.0 and (w_jx_curv_alpha_acc + w_jx_curv_alpha_brk) == 0.0:
         rospy.logwarn(
             f'[velopt] legacy w_jx_curv_alpha={w_jx_curv_alpha} → '
@@ -254,10 +243,6 @@ def build_and_solve(track, gg, vehicle_params,
     dchi_ds = (np.roll(chi_unwrapped, -1) - np.roll(chi_unwrapped, 1)) / (2.0 * ds)
     dchi_ds_fn = ca.interpolant('dchi_ds_fix', 'linear', [s_aug], concat_arr(dchi_ds))
 
-    ## IY : dOmega_z/ds lookup for transition (β) weighting.
-    ##   Sampled on track.s grid then central-differenced (np.gradient handles
-    ##   periodic edges via second-order accurate one-sided at endpoints,
-    ##   acceptable since reg term is squared).
     Omega_z_arr = np.array([float(track.Omega_z_interpolator(float(si)))
                             for si in track.s])
     dOmega_z_ds_arr = np.gradient(Omega_z_arr, ds)
@@ -298,21 +283,19 @@ def build_and_solve(track, gg, vehicle_params,
     dx = ca.vertcat(dV, dax)
 
     L_t = w_T * 1.0 / s_dot
-    ## IY : tanh-saturated curvature weighting (α corner + β transition).
-    ##   omega_term  = tanh(|Ω_z|     / k_alpha)   ∈ [0, 1)
-    ##   domega_term = tanh(|dΩ_z/ds| / k_beta)    ∈ [0, 1)
-    ##   weight_acc / _brk independently mix α_acc/_brk and β_acc/_brk.
-    ##   All α/β default to 0 → curv_factor = 1 → identical to pure asymmetric.
+
     dOmega_z_ds_s = dOmega_z_ds_fn(s_sym)
     omega_term  = ca.tanh(ca.fabs(Omega_z_s)     / w_jx_curv_k_alpha)
     domega_term = ca.tanh(ca.fabs(dOmega_z_ds_s) / w_jx_curv_k_beta)
 
+    ## IY : jerk-side α/β reverted (w_T must not affect jerk smoothness).
     weight_acc = (1.0
                   + w_jx_curv_alpha_acc * omega_term
                   + w_jx_curv_beta_acc  * domega_term)
     weight_brk = (1.0
                   + w_jx_curv_alpha_brk * omega_term
                   + w_jx_curv_beta_brk  * domega_term)
+    ## IY : end
 
     jx_pos = ca.fmax(jx, 0.0)
     jx_neg = ca.fmax(-jx, 0.0)
@@ -320,14 +303,12 @@ def build_and_solve(track, gg, vehicle_params,
            + weight_brk * w_jx_brk * jx_neg ** 2) / (s_dot ** 2)
     ## IY : end
 
-    ## IY : direct ax_pos^2 penalty curvature-weighted. Penalises *being* in
-    ##   positive-ax state inside a high-curvature corner, which the jerk
-    ##   weighting above cannot do (jx_pos=0 once ax has settled). Independent
-    ##   k from k_alpha so this can be tuned without disturbing the jerk profile.
-    ##   w_ax_corner_acc=0 -> term vanishes (default behaviour).
     ax_corner_term = ca.tanh(ca.fabs(Omega_z_s) / w_ax_corner_k)
     ax_pos = ca.fmax(ax, 0.0)
-    L_reg = L_reg + w_ax_corner_acc * ax_corner_term * (ax_pos ** 2) / (s_dot ** 2)
+    ## IY : only ax² corner cap scales with w_T (not a jerk term).
+    # L_reg = L_reg + w_ax_corner_acc * ax_corner_term * (ax_pos ** 2) / (s_dot ** 2)
+    w_T_corner = max(float(w_T), 1e-6)
+    L_reg = L_reg + w_T_corner * w_ax_corner_acc * ax_corner_term * (ax_pos ** 2) / (s_dot ** 2)
     ## IY : end
 
     # RK4 (same as original)
@@ -386,13 +367,6 @@ def build_and_solve(track, gg, vehicle_params,
             neglect_w_dot=False, neglect_V_omega=False,
         )
 
-        # --- (기존 single-GGV lookup, 보존용 주석) ---
-        # gg_exp, ax_min, ax_max, ay_max = ca.vertsplit(
-        #     gg.acc_interpolator(ca.vertcat(Xk[0], gt_k))
-        # )
-        # --- (원본 끝) ---
-        ## IY(0416) : per-waypoint GGV lookup (multi-GGV friction support)
-        #   gg_list/gg_idx가 있으면 해당 sector의 GGV 사용, 없으면 기존 단일 GGV.
         if gg_list is not None and gg_idx is not None:
             gg_k = gg_list[int(gg_idx[k])]
         else:
@@ -449,18 +423,7 @@ def build_and_solve(track, gg, vehicle_params,
     ubg_vec = ca.vertcat(*ubg)
 
     if sol_opt is None:
-        # Tolerance strategy — mirrors the tolerance relaxation IY applied to
-        # gen_global_racing_line.py for the V_min=2.0 case:
-        #   At tight corners, V=V_min and ay=ay_max become simultaneously
-        #   binding. This creates dual-multiplier ambiguity: primal converges
-        #   (inf_pr ~ 1e-10) but inf_du oscillates around 0.08 ~ 2.5 and the
-        #   solver never hits the default 1e-8 exit criterion. We therefore:
-        #     - Keep constr_viol_tol TIGHT (1e-4): primal violation means a
-        #       physically invalid trajectory (outside track / GGV envelope).
-        #     - Loosen dual_inf_tol and the acceptable-level duals: the dual
-        #       noise is inherent to the degenerate active set, not a real
-        #       optimality issue. Objective error at these tolerances is
-        #       ~1e-4 × 20 s ≈ 2 ms on lap time — negligible.
+
         sol_opt = {
             'ipopt.max_iter': 100,
             'ipopt.hessian_approximation': 'limited-memory',
@@ -491,9 +454,16 @@ def build_and_solve(track, gg, vehicle_params,
     sol = solver(x0=w0_vec, lbx=lbw_vec, ubx=ubw_vec, lbg=lbg_vec, ubg=ubg_vec)
     t_solve = time.time() - t_solve
 
-    laptime = float(ca.Function('f_laptime', [w_vec], [J_t])(sol['x']))
+    ## IY : J_t = w_T * laptime_real; divide out w_T for real seconds.
+    # laptime = float(ca.Function('f_laptime', [w_vec], [J_t])(sol['x']))
+    # rospy.loginfo(f'[velopt] IPOPT: {t_solve:.2f}s, success={success}, laptime={laptime:.4f}s')
+    J_t_val = float(ca.Function('f_Jt', [w_vec], [J_t])(sol['x']))
+    laptime = J_t_val / max(float(w_T), 1e-6)
     success = solver.stats()['success']
-    rospy.loginfo(f'[velopt] IPOPT: {t_solve:.2f}s, success={success}, laptime={laptime:.4f}s')
+    rospy.loginfo(
+        f'[velopt] IPOPT: {t_solve:.2f}s, success={success}, '
+        f'laptime={laptime:.4f}s, J_t={J_t_val:.4f} (w_T={float(w_T):.3f})')
+    ## IY : end
 
     sol_x = np.array(sol['x']).flatten()
     stride = nx_ + nu_
@@ -508,33 +478,7 @@ def build_and_solve(track, gg, vehicle_params,
 
 
 class VelOptNode:
-    ## IY : __init__ refactored to enable hot-reload via /velopt/reload service.
-    #       Constructor args are stored as instance state so reload_cb can
-    #       refresh them from rosparams without rebuilding the node object.
-    #       Path resolution + file load + NLP solve are extracted to
-    #       _load_and_solve() for reuse.
-    # --- (original __init__ preserved below) ---
-    # def __init__(self, map_name, raceline_variant, vehicle_yml_file, gg_dir_name,
-    #              step_size_opt=0.2, V_min=0.0, gg_margin=0.0):
-    #     rospy.init_node('vel_opt_3d')
-    #     self.map_name = map_name
-    #     self.step_size_opt = step_size_opt
-    #     self.V_min = V_min
-    #     self.gg_margin = gg_margin
-    #
-    #     # Resolve paths — folder structure fixed, filenames derived from args
-    #     self.map_dir = os.path.abspath(os.path.join(_THIS_DIR, '..', 'maps', self.map_name))
-    #     # track is always <map>_3d_smoothed.csv
-    #     self.track_csv = os.path.join(self.map_dir, f'{self.map_name}_3d_smoothed.csv')
-    #     # raceline: <map>_3d_<variant>_timeoptimal.csv
-    #     self.raceline_csv = os.path.join(
-    #         self.map_dir, f'{self.map_name}_3d_{raceline_variant}_timeoptimal.csv')
-    #     self.vehicle_yml = os.path.join(_DATA_DIR, 'vehicle_params', vehicle_yml_file)
-    #     self.gg_path = os.path.join(_DATA_DIR, 'gg_diagrams', gg_dir_name, 'velocity_frame')
-    #
-    #     for p, label in [(self.track_csv, 'track csv'), ...]:
-    #         if not os.path.exists(p): raise FileNotFoundError(f'{label} not found: {p}')
-    # --- (original end) ---
+
     def __init__(self, map_name, raceline_variant, vehicle_yml_file, gg_dir_name,
                  step_size_opt=0.2, V_min=0.0, gg_margin=0.0):
         rospy.init_node('vel_opt_3d')
@@ -552,9 +496,6 @@ class VelOptNode:
         self._load_and_solve()
         ## IY : end
 
-        ## IY : publisher + reload infrastructure (init once, reused by reload_cb).
-        #       process_lock serializes _load_and_solve / _publish_solution
-        #       against reload_cb so a reload mid-publish cannot corrupt state.
         self.process_lock = threading.Lock()
         self.last_wpnts_msg = None
         self.pub = rospy.Publisher('/global_waypoints', WpntArray, queue_size=1, latch=True)
@@ -565,10 +506,7 @@ class VelOptNode:
         rospy.loginfo('[velopt] waiting for /global_waypoints template message ...')
         ## IY : end
 
-    ## IY : _load_and_solve — path resolve + file load + NLP solve.
-    #       Called by __init__ and by reload_cb. Reads ~map, ~racecar (or
-    #       individual overrides), ~V_min, ~gg_margin, ~step_size_opt
-    #       rosparams if present; otherwise uses stored instance state.
+
     def _load_and_solve(self):
         ## IY : rosparam override (used by gg_tuner_3d cold-start and reload)
         self.map_name         = rospy.get_param('~map',            self.map_name)
@@ -590,12 +528,7 @@ class VelOptNode:
             self.w_jx = 1e-2
         self.w_T  = float(rospy.get_param('~w_T',  self.w_T))
         self.w_jx = float(rospy.get_param('~w_jx', self.w_jx))
-        ## IY : asymmetric jerk + tanh-saturated curvature/transition knobs.
-        ##   ratio_acc/_brk: legacy global asymmetry on base w_jx.
-        ##   alpha_acc/_brk + k_alpha: corner-overall weight via tanh(|Ω_z|/k).
-        ##   beta_acc/_brk  + k_beta:  transition weight  via tanh(|dΩ_z/ds|/k).
-        ##   Legacy w_jx_curv_alpha kept for backward-compat (auto-mapped inside
-        ##   build_and_solve when both new α_acc/_brk are 0).
+
         if not hasattr(self, 'w_jx_acc_ratio'):
             self.w_jx_acc_ratio = 1.0
         if not hasattr(self, 'w_jx_brk_ratio'):
@@ -661,9 +594,6 @@ class VelOptNode:
         with open(self.vehicle_yml) as f:
             self.vehicle_params = yaml.safe_load(f)['vehicle_params']
 
-        # Track3D + grid step that exactly divides L_track for clean periodic closure
-        ## IY : forward bridge_effect to Track3D — scales sin(mu) inside
-        ##   calc_apparent_accelerations (new semantics, fbga-consistent)
         self.track = Track3D(path=self.track_csv, g_weight=self.bridge_effect)
         L_track = float(self.track.s[-1] + self.track.ds)
         N_target = max(10, int(round(L_track / self.step_size_opt)))
@@ -674,10 +604,6 @@ class VelOptNode:
         self.track.resample(actual_step)
         self.gg = GGManager(gg_path=self.gg_path, gg_margin=self.gg_margin)
 
-        ## IY(0416) : per-sector friction → multi-GGV
-        #   friction_sector_server가 rosparam에 설정한 sector별 friction 값을 읽어서
-        #   해당 friction = p_Dx_1 = p_Dy_1 인 GGV를 로드.
-        #   GGV 디렉토리: {base}_f{NNN}/velocity_frame/ (gg_tuner가 미리 생성)
         with open(self.vehicle_yml) as _f:
             _full_params = yaml.safe_load(_f)
         _base_p_Dx_1 = _full_params.get('tire_params', {}).get('p_Dx_1', 0.56)
@@ -726,16 +652,6 @@ class VelOptNode:
             f'legacy_alpha={self.w_jx_curv_alpha}, '
             f'V_min={self.V_min}, gg_margin={self.gg_margin}, '
             f'bridge_effect={self.bridge_effect})')
-        # --- (기존 build_and_solve 호출, 보존용 주석) ---
-        # self.V_opt, self.ax_opt, laptime, success = build_and_solve(
-        #     track=self.track, gg=self.gg, vehicle_params=self.vehicle_params,
-        #     n_fixed=self.n_fixed, chi_fixed=self.chi_fixed,
-        #     v_init=self.v_init, ax_init=self.ax_init, V_min=self.V_min,
-        #     w_T=self.w_T, w_jx=self.w_jx,
-        # )
-        # --- (원본 끝) ---
-        ## IY(0416) : pass gg_list/gg_idx for multi-GGV friction support
-        ## IY : forward tanh-saturated curvature/transition knobs (α + β).
         self.V_opt, self.ax_opt, laptime, success = build_and_solve(
             track=self.track, gg=self.gg, vehicle_params=self.vehicle_params,
             n_fixed=self.n_fixed, chi_fixed=self.chi_fixed,
@@ -760,17 +676,6 @@ class VelOptNode:
                       f'V range [{self.V_opt.min():.2f}, {self.V_opt.max():.2f}] m/s  '
                       f'success={success}')
 
-    ## IY : _cb — simplified. Caches latest template msg and delegates publish
-    #       to _publish_solution. After first receive we unregister to stop
-    #       re-ingesting our own output; reload_cb re-subscribes to pick up
-    #       newer templates (e.g. after raceline regen).
-    # --- (original _cb preserved below) ---
-    # def _cb(self, msg):
-    #     if self._processed: return
-    #     self._processed = True
-    #     self.sub.unregister()
-    #     <...publish inlined here...>
-    # --- (original end) ---
     def _cb(self, msg):
         with self.process_lock:
             if self._processed:
@@ -784,10 +689,6 @@ class VelOptNode:
             self._publish_solution(msg)
     ## IY : end
 
-    ## IY : _publish_solution — build + publish output WpntArray from a
-    #       template msg and current self.V_opt / self.ax_opt.
-    #       Extracted from original _cb so reload_cb can reuse the same
-    #       periodic-wrap interp + template copy path.
     def _publish_solution(self, msg):
         # Determine the message's own track length (for periodic wrap of our V_opt)
         s_msg = np.array([w.s_m for w in msg.wpnts], dtype=np.float64)
@@ -833,11 +734,6 @@ class VelOptNode:
                       f'V[0]={V_out[0]:.2f}, V[-1]={V_out[-1]:.2f})')
     ## IY : end
 
-    ## IY : /velopt/reload service callback.
-    #       Reloads rosparams, re-solves NLP, then re-subscribes to
-    #       /global_waypoints to grab a fresh template (handles the case
-    #       where Stage 3 raceline regen published a new geometry).
-    #       Falls back to cached last_wpnts_msg if no fresh message arrives.
     def reload_cb(self, req):
         rospy.loginfo('[velopt] /velopt/reload received')
         try:
@@ -890,29 +786,12 @@ def main():
         description='3D speed-only optimizer — re-optimizes vx/ax on a fixed racing line '
                     'and republishes /global_waypoints with the new velocity profile.')
 
-    # --- map is the only truly required arg ---
-    # Track CSV is auto-derived from --map as "<map>_3d_smoothed.csv" inside
-    # stack_master/maps/<map>/. Raceline CSV is auto-derived as
-    # "<map>_3d_<raceline>_timeoptimal.csv" using --raceline below.
-    ## IY : --map no longer argparse-required; cold-start from gg_tuner_3d
-    #       provides it via rosparam (_map:=...). VelOptNode._load_and_solve()
-    #       reads ~map as override, so default here can be empty.
     ap.add_argument('--map', default=None,
                     help='Map folder name under stack_master/maps/ (e.g. "eng_0410_v5"). '
                          'Track csv is auto-derived as <map>_3d_smoothed.csv. '
                          'If omitted, ~map rosparam is used.')
     ## IY : end
 
-    # --- Shortcut: --racecar <name> sets all three (raceline, gg_dir, vehicle_yml)
-    #     consistently to this name, unless they are individually overridden.
-    #     Expands as:
-    #       --raceline     <name>
-    #       --gg_dir       <name>
-    #       --vehicle_yml  params_<name>.yml
-    #     If --racecar is NOT given, each of the three falls back to the
-    #     "rc_car_10th" defaults below.
-    #     Individual --raceline / --gg_dir / --vehicle_yml flags ALWAYS win
-    #     over --racecar.
     ap.add_argument('--racecar', default=None,
                     help='Shortcut: set raceline/gg_dir/vehicle_yml to this '
                          'variant in one go (e.g. "rc_car_10th_v7"). '
@@ -934,15 +813,6 @@ def main():
                          '3d_gb_optimizer/.../gg_diagrams/ '
                          '(default: --racecar if set, else "rc_car_10th")')
 
-    # --- tuning knobs ---
-    # step_size_opt: NLP grid spacing in meters. The script auto-adjusts this
-    #   slightly so the grid divides the full track length exactly (needed for
-    #   a clean periodic loop closure).
-    # V_min: lower bound on velocity state. Defaults to 1.0 m/s — a middle
-    #   ground between feasibility at tight corners (lower V_min relaxes the
-    #   ay-bound-active set) and numerical safety. Always match the GGV that
-    #   generated the raceline.
-    # gg_margin: shrinks the GGV diamond by this factor (0.0 = full grip).
     ap.add_argument('--step_size_opt', type=float, default=0.2,
                     help='Desired NLP grid spacing in meters (default: 0.2)')
     ap.add_argument('--V_min', type=float, default=1.0,
@@ -953,12 +823,6 @@ def main():
     # parse_known_args so ROS remapping args (__name:=, __log:=) don't choke argparse
     args, _ = ap.parse_known_args()
 
-    ## IY : argparse values are *initial* values only; VelOptNode._load_and_solve()
-    #       re-reads the same keys from rosparams (~map, ~racecar, ~V_min, ...)
-    #       before every solve, so gg_tuner_3d cold-starts can pass
-    #       "_map:=... _racecar:=..." and override these on-the-fly.
-    #       --map may be None here (cold-start path uses _map rosparam).
-    # --- Resolve racecar shortcut (fallback when rosparams are absent) ---
     _racecar = args.racecar or 'rc_car_10th'
     args.raceline    = args.raceline    or _racecar
     args.gg_dir      = args.gg_dir      or _racecar
