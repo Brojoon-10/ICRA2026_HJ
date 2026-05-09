@@ -689,14 +689,20 @@ class GGTunerNode:
         rospy.set_param('/vel_opt_3d/racecar',       vehicle_name)
         rospy.set_param('/vel_opt_3d/V_min',         float(velopt_opts['V_min']))
         rospy.set_param('/vel_opt_3d/gg_margin',     float(velopt_opts['gg_margin']))
-        rospy.set_param('/vel_opt_3d/step_size_opt', float(velopt_opts['step_size']))
+        ## IY : step_size_opt no longer set from rqt (velopt uses its default)
         rospy.set_param('/vel_opt_3d/w_T',           float(velopt_opts['w_T']))
         rospy.set_param('/vel_opt_3d/w_jx',          float(velopt_opts['w_jx']))
-        ## IY : asymmetric jerk + curvature-weighted regularization
-        rospy.set_param('/vel_opt_3d/w_jx_acc_ratio',  float(velopt_opts['w_jx_acc_ratio']))
-        rospy.set_param('/vel_opt_3d/w_jx_brk_ratio',  float(velopt_opts['w_jx_brk_ratio']))
-        rospy.set_param('/vel_opt_3d/w_jx_curv_alpha', float(velopt_opts['w_jx_curv_alpha']))
-        rospy.set_param('/vel_opt_3d/bridge_effect', float(bridge_effect))
+        ## IY : asymmetric jerk + tanh-saturated curvature/transition weighting
+        rospy.set_param('/vel_opt_3d/w_jx_acc_ratio',      float(velopt_opts['w_jx_acc_ratio']))
+        rospy.set_param('/vel_opt_3d/w_jx_brk_ratio',      float(velopt_opts['w_jx_brk_ratio']))
+        rospy.set_param('/vel_opt_3d/w_jx_curv_alpha_acc', float(velopt_opts['w_jx_curv_alpha_acc']))
+        rospy.set_param('/vel_opt_3d/w_jx_curv_alpha_brk', float(velopt_opts['w_jx_curv_alpha_brk']))
+        rospy.set_param('/vel_opt_3d/w_jx_curv_k_alpha',   float(velopt_opts['w_jx_curv_k_alpha']))
+        rospy.set_param('/vel_opt_3d/w_jx_curv_beta_acc',  float(velopt_opts['w_jx_curv_beta_acc']))
+        rospy.set_param('/vel_opt_3d/w_jx_curv_beta_brk',  float(velopt_opts['w_jx_curv_beta_brk']))
+        rospy.set_param('/vel_opt_3d/w_jx_curv_k_beta',    float(velopt_opts['w_jx_curv_k_beta']))
+        ## IY : legacy w_jx_curv_alpha removed from rqt; vel_opt_3d default 0 → fallback inactive.
+        rospy.set_param('/vel_opt_3d/bridge_effect',       float(bridge_effect))
 
         if not force_restart:
             try:
@@ -737,13 +743,19 @@ class GGTunerNode:
             f'_racecar:={vehicle_name}',
             f'_V_min:={float(velopt_opts["V_min"])}',
             f'_gg_margin:={float(velopt_opts["gg_margin"])}',
-            f'_step_size_opt:={float(velopt_opts["step_size"])}',
+            ## IY : step_size_opt no longer overridden; velopt node default used
             f'_w_T:={float(velopt_opts["w_T"])}',
             f'_w_jx:={float(velopt_opts["w_jx"])}',
-            ## IY : asymmetric jerk + curvature-weighted regularization
+            ## IY : asymmetric jerk + tanh-saturated curvature/transition weighting
             f'_w_jx_acc_ratio:={float(velopt_opts["w_jx_acc_ratio"])}',
             f'_w_jx_brk_ratio:={float(velopt_opts["w_jx_brk_ratio"])}',
-            f'_w_jx_curv_alpha:={float(velopt_opts["w_jx_curv_alpha"])}',
+            f'_w_jx_curv_alpha_acc:={float(velopt_opts["w_jx_curv_alpha_acc"])}',
+            f'_w_jx_curv_alpha_brk:={float(velopt_opts["w_jx_curv_alpha_brk"])}',
+            f'_w_jx_curv_k_alpha:={float(velopt_opts["w_jx_curv_k_alpha"])}',
+            f'_w_jx_curv_beta_acc:={float(velopt_opts["w_jx_curv_beta_acc"])}',
+            f'_w_jx_curv_beta_brk:={float(velopt_opts["w_jx_curv_beta_brk"])}',
+            f'_w_jx_curv_k_beta:={float(velopt_opts["w_jx_curv_k_beta"])}',
+            ## IY : legacy w_jx_curv_alpha launch arg removed; node default 0 → fallback inactive.
             f'_bridge_effect:={float(bridge_effect)}',
         ]
         rospy.loginfo(f"[GGTuner] [velopt] cold start: {' '.join(cmd)}")
@@ -895,19 +907,28 @@ class GGTunerNode:
                     self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
                 elif engine == 'velopt':
                     self._kill_fbga_planner()         # ensure other engine off
+                    ## IY : rqt vo_* keys → velopt_opts dict (internal keys
+                    ##   match _run_velopt_planner's ROS-param-style names).
                     velopt_opts = {
-                        'V_min':            run_opts['velopt_V_min'],
-                        'gg_margin':        run_opts['velopt_gg_margin'],
-                        'step_size':        run_opts['velopt_step_size'],
-                        'w_T':              run_opts['velopt_w_T'],
-                        'w_jx':             run_opts['velopt_w_jx'],
-                        'w_jx_acc_ratio':   run_opts['velopt_w_jx_acc_ratio'],
-                        'w_jx_brk_ratio':   run_opts['velopt_w_jx_brk_ratio'],
-                        'w_jx_curv_alpha':  run_opts['velopt_w_jx_curv_alpha'],
+                        'V_min':                run_opts['vo_Vmin'],
+                        'gg_margin':            run_opts['vo_gg_marg'],
+                        ## IY : step_size removed; velopt node uses fixed default
+                        'w_T':                  run_opts['vo_w_T'],
+                        'w_jx':                 run_opts['vo_w_jx'],
+                        'w_jx_acc_ratio':       run_opts['vo_acc_r'],
+                        'w_jx_brk_ratio':       run_opts['vo_brk_r'],
+                        ## IY : tanh-saturated curvature/transition (alpha + beta)
+                        'w_jx_curv_alpha_acc':  run_opts['vo_alpha_acc'],
+                        'w_jx_curv_alpha_brk':  run_opts['vo_alpha_brk'],
+                        'w_jx_curv_k_alpha':    run_opts['vo_k_alpha'],
+                        'w_jx_curv_beta_acc':   run_opts['vo_beta_acc'],
+                        'w_jx_curv_beta_brk':   run_opts['vo_beta_brk'],
+                        'w_jx_curv_k_beta':     run_opts['vo_k_beta'],
+                        ## IY : legacy w_jx_curv_alpha key removed.
                     }
                     ok = self._run_velopt_planner(
                         vehicle_name, run_opts['map'], velopt_opts,
-                        bridge_effect=run_opts['velopt_bridge_effect'],
+                        bridge_effect=run_opts['vo_bridge'],
                         force_restart=force_restart)
                     if not ok:
                         return
@@ -930,6 +951,14 @@ class GGTunerNode:
                 
     def reconfigure_cb(self, config, level):
 
+        ## IY : OR-merge per-group Apply mirrors with the root `apply`. All
+        ##   trigger the same pipeline; we clear them together at the end so
+        ##   rqt's checkbox auto-resets regardless of which one was clicked.
+        APPLY_KEYS = ('apply', 'apply_ggv', 'apply_raceline',
+                      'apply_fbga', 'apply_velopt')
+        apply_any = any(bool(getattr(config, k, False)) for k in APPLY_KEYS)
+        ## IY : end
+
         if getattr(config, 'save_now', False):
             if self.pipeline_thread is not None and self.pipeline_thread.is_alive():
                 rospy.logwarn(
@@ -942,7 +971,7 @@ class GGTunerNode:
                     rospy.logerr(f"[GGTuner] SAVE exception: {e}")
                     self.status_pub.publish(f"SAVE_EXCEPTION: {str(e)[:80]}")
             config.save_now = False
-            if not config.apply:
+            if not apply_any:
                 return config
         ## IY : end
 
@@ -954,17 +983,18 @@ class GGTunerNode:
             else:
                 self._kill_sector_slicing()
             self._last_sector_slicing_state = new_sector_state
-            if not config.apply:
+            if not apply_any:
                 return config
         ## IY : end
 
-        if not config.apply:
+        if not apply_any:
             return config
 
         ## IY : refuse concurrent runs
         if self.pipeline_thread is not None and self.pipeline_thread.is_alive():
             rospy.logwarn("[GGTuner] Pipeline already running — ignoring apply")
-            config.apply = False
+            for k in APPLY_KEYS:
+                setattr(config, k, False)
             return config
         ## IY : end
 
@@ -993,16 +1023,23 @@ class GGTunerNode:
             'slope_brake_margin':       float(config.slope_brake_margin),
             'slope_brake_vmax':         float(config.slope_brake_vmax),
             ## IY : end
-            ## IY : VelOpt knobs (used when vel_engine='velopt')
-            'velopt_bridge_effect': float(config.velopt_bridge_effect),
-            'velopt_V_min':       float(config.velopt_V_min),
-            'velopt_gg_margin':   float(config.velopt_gg_margin),
-            'velopt_step_size':   float(config.velopt_step_size),
-            'velopt_w_T':         float(config.velopt_w_T),
-            'velopt_w_jx':        float(config.velopt_w_jx),
-            'velopt_w_jx_acc_ratio':   float(config.velopt_w_jx_acc_ratio),
-            'velopt_w_jx_brk_ratio':   float(config.velopt_w_jx_brk_ratio),
-            'velopt_w_jx_curv_alpha':  float(config.velopt_w_jx_curv_alpha),
+            ## IY : VelOpt knobs (rqt names shortened velopt_* → vo_*).
+            'vo_bridge':         float(config.vo_bridge),
+            'vo_Vmin':           float(config.vo_Vmin),
+            'vo_gg_marg':        float(config.vo_gg_marg),
+            ## IY : velopt_step_size removed (fixed at velopt node default 0.2 m)
+            'vo_w_T':            float(config.vo_w_T),
+            'vo_w_jx':           float(config.vo_w_jx),
+            'vo_acc_r':          float(config.vo_acc_r),
+            'vo_brk_r':          float(config.vo_brk_r),
+            ## IY : tanh-saturated curvature/transition weighting (alpha + beta)
+            'vo_alpha_acc':      float(config.vo_alpha_acc),
+            'vo_alpha_brk':      float(config.vo_alpha_brk),
+            'vo_k_alpha':        float(config.vo_k_alpha),
+            'vo_beta_acc':       float(config.vo_beta_acc),
+            'vo_beta_brk':       float(config.vo_beta_brk),
+            'vo_k_beta':         float(config.vo_k_beta),
+            ## IY : legacy w_jx_curv_alpha slider removed (rqt-side).
             ## IY : end
         }
         ## IY : end
@@ -1012,7 +1049,8 @@ class GGTunerNode:
             rospy.logerr(f"[GGTuner] Invalid map '{run_opts['map']}'. "
                          f"Available: {self.available_maps}")
             self.status_pub.publish(f"FAILED_RACELINE: invalid map")
-            config.apply = False
+            for k in APPLY_KEYS:
+                setattr(config, k, False)
             return config
         ## IY : end
 
@@ -1025,7 +1063,10 @@ class GGTunerNode:
         rospy.loginfo("[GGTuner] Pipeline spawned in background thread")
         ## IY : end
 
-        config.apply = False
+        ## IY : clear all Apply mirrors so rqt resets every checkbox
+        for k in APPLY_KEYS:
+            setattr(config, k, False)
+        ## IY : end
         return config
 
     def _shutdown_cleanup(self):
