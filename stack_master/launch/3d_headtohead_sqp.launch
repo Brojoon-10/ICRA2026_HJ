@@ -7,14 +7,14 @@
   <arg name="perception" default="False" />
   <arg name="enable_planners" default="True" />
   <arg name="enable_prediction" default="True" />
-  <arg name="dynamic_avoidance_mode" default="SQP" />
+  <arg name="dynamic_avoidance_mode" default="NONE" />
   <arg name="use_vd_prediction" default="False" />
   <!-- ### HJ : when true, replace spliner / sqp / recovery_spliner with
        sampling_based_planner_3d (state-aware OT + RECOVERY). Default false
        keeps 2D-style planners wired as today. -->
   <arg name="sampling_planner_enable" default="False" />
   ## IY : state_machine_type — "original" or "overtaking"
-  <arg name="state_machine_type" default="original" />
+  <arg name="state_machine_type" default="overtaking" />
   <!-- ### HJ : When empty, sampling_planner reads /map rosparam set by 3d_base_system.launch.
        Set MAP_NAME env var to override. -->
   <arg name="map_name" default="$(optenv MAP_NAME '')"
