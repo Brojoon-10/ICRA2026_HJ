@@ -16,7 +16,7 @@ from python_qt_binding.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTabWidget,
     QComboBox, QCheckBox, QPushButton, QLabel, QTableWidget,
     QTableWidgetItem, QHeaderView, QStatusBar, QGroupBox,
-    QListWidget, QListWidgetItem,
+    QListWidget, QListWidgetItem, QMessageBox,
 )
 
 import matplotlib
@@ -80,6 +80,13 @@ class GGViewerWidget(QWidget):
         self.refresh_btn = QPushButton('Refresh')
         self.refresh_btn.setToolTip('Re-scan gg_diagrams/ directory')
         toolbar1.addWidget(self.refresh_btn)
+        ## IY : restore baseline → _latest (overwrites current)
+        self.restore_latest_btn = QPushButton('Restore Baseline → Latest')
+        self.restore_latest_btn.setToolTip(
+            'Copies the selected baseline (v_N) into _latest on disk; '
+            'velopt picks it up on next Apply / cold-start.')
+        toolbar1.addWidget(self.restore_latest_btn)
+        ## IY : end
         toolbar1.addSpacing(20)
         self.save_version_btn = QPushButton('Save Current as Version')
         self.save_version_btn.setToolTip(
@@ -170,6 +177,7 @@ class GGViewerWidget(QWidget):
         self.load_baseline_btn.clicked.connect(self._on_baseline_load)
         self.refresh_btn.clicked.connect(self._on_refresh)
         self.save_version_btn.clicked.connect(self._on_save_version)
+        self.restore_latest_btn.clicked.connect(self._on_restore_to_latest)
         self.versions_list.itemChanged.connect(self._on_version_check_changed)
         ## IY : end
 
@@ -355,6 +363,35 @@ class GGViewerWidget(QWidget):
         else:
             self.status_bar.showMessage(f'Save failed: {resp.message}')
 
+    ## IY : copy selected baseline (v_N) into _latest
+    def _on_restore_to_latest(self):
+        snap = self.baseline_combo.currentText()
+        if not snap or snap == '(none)':
+            self.status_bar.showMessage('Restore: select a baseline first')
+            return
+        reply = QMessageBox.question(
+            self, 'Restore to Latest',
+            f'Overwrite _latest with "{snap}"?\n'
+            f'(GGV diagrams + params yml on disk; velopt reloads on next Apply)',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            rospy.set_param('/gg_tuner/restore_target', snap)
+            rospy.wait_for_service('/gg_tuner/restore_version', timeout=2.0)
+            srv = rospy.ServiceProxy('/gg_tuner/restore_version', Trigger)
+            resp = srv()
+        except (rospy.ROSException, rospy.ServiceException) as e:
+            self.status_bar.showMessage(f'Restore failed: {e}')
+            return
+        if resp.success:
+            self.status_bar.showMessage(
+                f'Restored {resp.message} (Apply to reload velopt)')
+            self._refresh_snapshot_lists()
+        else:
+            self.status_bar.showMessage(f'Restore failed: {resp.message}')
+    ## IY : end
+
     def _on_refresh(self):
         self._refresh_snapshot_lists()
         self.status_bar.showMessage(
@@ -409,24 +446,44 @@ class GGViewerWidget(QWidget):
     # ------------------------------------------------------------------ #
     def _update_display(self):
         ## IY : plot works with baseline/versions only (no current required).
-        ##      table/params still need current as the reference frame.
+        ##      table/params now also fall back to baseline when current is absent.
+        ## IY : old behavior (current-only) kept for reference:
+        # self._update_plot()
+        # if self.current_data is not None:
+        #     self._update_table()
+        #     self._update_params_tab()
         self._update_plot()
-        if self.current_data is not None:
-            self._update_table()
-            self._update_params_tab()
+        ref = (self.current_data
+               if self.current_data is not None
+               else self.baseline_data)
+        if ref is not None:
+            self._update_table(ref)
+            self._update_params_tab(ref)
+        else:
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+            self.params_table.setRowCount(0)
         ## IY : end
 
     # ------------------------------------------------------------------ #
     #  Summary table
     # ------------------------------------------------------------------ #
-    def _update_table(self):
-        d = self.current_data['diamond']
-        v_list = self.current_data['v_list']
-        g_list = self.current_data['g_list']
-        ## IY : table shows diff against baseline only (versions are plot-only)
+    def _update_table(self, ref):
+        ## IY : ref drives the table (current preferred, baseline fallback).
+        ## IY : old current-only signature kept for reference:
+        # d = self.current_data['diamond']
+        # v_list = self.current_data['v_list']
+        # g_list = self.current_data['g_list']
+        d = ref['diamond']
+        v_list = ref['v_list']
+        g_list = ref['g_list']
+        ## IY : end
+        ## IY : diff vs baseline only when ref is current (baseline-alone = no diff)
+        ref_is_current = ref is self.current_data
         compat_ok, _ = self._baseline_compatible(
-            self.current_data, self.baseline_data)
-        show_diff = (self.show_baseline_check.isChecked()
+            ref, self.baseline_data) if ref_is_current else (False, '')
+        show_diff = (ref_is_current
+                     and self.show_baseline_check.isChecked()
                      and self.baseline_data is not None
                      and compat_ok)
         ## IY : end
@@ -616,16 +673,30 @@ class GGViewerWidget(QWidget):
     # ------------------------------------------------------------------ #
     #  Tuning params tab
     # ------------------------------------------------------------------ #
-    def _update_params_tab(self):
-        cur_p = self.current_data.get('tuning_params', {})
-        base_p = self.baseline_data.get('tuning_params', {}) if self.baseline_data else {}
-        all_keys = sorted(set(list(cur_p.keys()) + list(base_p.keys())))
+    def _update_params_tab(self, ref):
+        ## IY : ref drives the left column (current preferred, baseline fallback).
+        ## IY : old current-only logic kept for reference:
+        # cur_p = self.current_data.get('tuning_params', {})
+        # base_p = self.baseline_data.get('tuning_params', {}) if self.baseline_data else {}
+        ref_is_current = ref is self.current_data
+        ref_p = ref.get('tuning_params', {})
+        base_p = (self.baseline_data.get('tuning_params', {})
+                  if (ref_is_current and self.baseline_data is not None) else {})
+        # Header reflects what ref column actually shows
+        if ref_is_current:
+            self.params_table.setHorizontalHeaderLabels(
+                ['Param', 'Current', 'Baseline'])
+        else:
+            self.params_table.setHorizontalHeaderLabels(
+                ['Param', 'Baseline', '(n/a)'])
+        ## IY : end
+        all_keys = sorted(set(list(ref_p.keys()) + list(base_p.keys())))
 
         self.params_table.setRowCount(len(all_keys))
         for i, key in enumerate(all_keys):
             self.params_table.setItem(i, 0, QTableWidgetItem(key))
 
-            cur_val = cur_p.get(key, '')
+            cur_val = ref_p.get(key, '')
             base_val = base_p.get(key, '')
             cur_item = QTableWidgetItem(f'{cur_val}')
             base_item = QTableWidgetItem(f'{base_val}')

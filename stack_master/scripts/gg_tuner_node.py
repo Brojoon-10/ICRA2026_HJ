@@ -105,10 +105,13 @@ class GGTunerNode:
         rospy.on_shutdown(self._shutdown_cleanup)
 
         ## IY : viewer-driven save_version service
-        ##      mirrors rqt's save_now checkbox so rqt_gg_viewer can trigger
-        ##      snapshot + auto-refresh its combo without going through cfg.
         self.save_version_srv = rospy.Service(
             '/gg_tuner/save_version', Trigger, self._save_version_cb)
+        ## IY : end
+
+        ## IY : restore selected version → _latest (target via rosparam)
+        self.restore_version_srv = rospy.Service(
+            '/gg_tuner/restore_version', Trigger, self._restore_version_cb)
         ## IY : end
 
         self.srv = Server(GGTunerConfig, self.reconfigure_cb)
@@ -126,6 +129,30 @@ class GGTunerNode:
             return TriggerResponse(success=False, message='snapshot failed')
         except Exception as e:
             rospy.logerr(f'[GGTuner] save_version exception: {e}')
+            return TriggerResponse(success=False, message=str(e)[:100])
+    ## IY : end
+
+    ## IY : restore selected version → _latest
+    def _restore_version_cb(self, req):
+        if self.pipeline_thread is not None and self.pipeline_thread.is_alive():
+            return TriggerResponse(success=False, message='pipeline running')
+        target = rospy.get_param('/gg_tuner/restore_target', '')
+        if not target:
+            return TriggerResponse(success=False, message='no target')
+        prefix = self.base_vehicle + '_v'
+        if not (target.startswith(prefix) and target[len(prefix):].isdigit()):
+            return TriggerResponse(
+                success=False, message=f'invalid target: {target}')
+        try:
+            ok = self._restore_to_latest(target)
+            if not ok:
+                return TriggerResponse(success=False, message='restore failed')
+            self.status_pub.publish(f'RESTORED: {target} -> latest')
+            self._publish_gg_results(f'{self.base_vehicle}_latest')
+            return TriggerResponse(
+                success=True, message=f'{target} -> latest')
+        except Exception as e:
+            rospy.logerr(f'[GGTuner] restore_version exception: {e}')
             return TriggerResponse(success=False, message=str(e)[:100])
     ## IY : end
 
@@ -658,6 +685,33 @@ class GGTunerNode:
         rospy.loginfo("[GGTuner] [sectors] killed")
     ## IY : end
 
+    ## IY : persist velopt tuning to a single overwritten yaml so the latest
+    ##   slider state survives session restarts. Path is fixed under
+    ##   rqt_gg_viewer/velopt_tun/ to keep tuning artifacts close to the UI.
+    def _save_velopt_yaml(self, velopt_opts, bridge_effect, map_name,
+                          vehicle_name):
+        out_dir = os.path.join(self.race_stack_root, 'rqt_gg_viewer',
+                               'velopt_tun')
+        os.makedirs(out_dir, exist_ok=True)
+        yml_path = os.path.join(out_dir, 'velopt_tuning.yml')
+        payload = {
+            'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'base_vehicle': self.base_vehicle,
+            'vehicle_name': vehicle_name,
+            'map': map_name,
+            'vo_bridge': float(bridge_effect),
+            **{f'vo_{k}': float(v) if not isinstance(v, bool) else v
+               for k, v in velopt_opts.items()},
+        }
+        try:
+            with open(yml_path, 'w') as f:
+                yaml.dump(payload, f, default_flow_style=False,
+                          allow_unicode=True, sort_keys=True)
+            rospy.loginfo(f"[GGTuner] velopt tuning saved: {yml_path}")
+        except OSError as e:
+            rospy.logerr(f"[GGTuner] velopt tuning save failed: {e}")
+    ## IY : end
+
     ## IY : Stage 4 alternative — 3d_optimized_vel_planner (NLP velocity).
     ##   Mirrors fbga pattern: hot-reload via /velopt/reload, fallback cold start.
     ##   bridge_effect is shared with fbga (Track3D inside velopt takes
@@ -877,11 +931,11 @@ class GGTunerNode:
                     ## IY : overlay rqt RACELINE_KEYS onto latest yml (idempotent)
                     self._update_raceline_keys_in_yml(vehicle_name, tuning)
                     ## IY : end
-                    ## IY : raceline keeps the old g_weight signature; map from bridge_effect
+                    ## IY : g_weight no longer routed from rqt; raceline launch
+                    ##   default (1.0) is used. Re-add a slider if needed.
                     ok = self._run_raceline(
                         vehicle_name, run_opts['map'],
-                        safety_distance=run_opts['safety_distance'],
-                        g_weight=run_opts['bridge_effect'])
+                        safety_distance=run_opts['safety_distance'])
                     ## IY : end
                     if not ok:
                         rospy.logerr(f"[GGTuner] raceline failed")
@@ -892,26 +946,30 @@ class GGTunerNode:
                 ## IY : Stage 4 single-engine dispatch (vel_engine selector)
                 engine = run_opts.get('vel_engine', 'none')
                 force_restart = bool(run_opts['regen_raceline'])
-                if engine == 'fbga':
-                    self._kill_velopt_planner()       # ensure other engine off
-                    ok = self._run_fbga_planner(
-                        vehicle_name,
-                        enable_mu=run_opts['enable_mu'],
-                        force_restart=force_restart,
-                        bridge_effect=run_opts['bridge_effect'],
-                        g_tilde_soft_beta=run_opts['g_tilde_soft_beta'],
-                        smooth_mu=run_opts['smooth_mu'],
-                        mu_smooth_window=run_opts['mu_smooth_window'],
-                        mu_smooth_polyorder=run_opts['mu_smooth_polyorder'],
-                        smooth_kappa=run_opts['smooth_kappa'],
-                        kappa_smooth_window=run_opts['kappa_smooth_window'],
-                        kappa_smooth_polyorder=run_opts['kappa_smooth_polyorder'],
-                        slope_brake_margin=run_opts['slope_brake_margin'],
-                        slope_brake_vmax=run_opts['slope_brake_vmax'])
-                    if not ok:
-                        return
-                    self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
-                elif engine == 'velopt':
+                ## IY : 'fbga' branch hidden — vel_engine enum no longer
+                ##   exposes 'fbga' in rqt. Helpers _run_fbga_planner /
+                ##   _kill_fbga_planner remain for re-enabling later.
+                # if engine == 'fbga':
+                #     self._kill_velopt_planner()       # ensure other engine off
+                #     ok = self._run_fbga_planner(
+                #         vehicle_name,
+                #         enable_mu=run_opts['enable_mu'],
+                #         force_restart=force_restart,
+                #         bridge_effect=run_opts['bridge_effect'],
+                #         g_tilde_soft_beta=run_opts['g_tilde_soft_beta'],
+                #         smooth_mu=run_opts['smooth_mu'],
+                #         mu_smooth_window=run_opts['mu_smooth_window'],
+                #         mu_smooth_polyorder=run_opts['mu_smooth_polyorder'],
+                #         smooth_kappa=run_opts['smooth_kappa'],
+                #         kappa_smooth_window=run_opts['kappa_smooth_window'],
+                #         kappa_smooth_polyorder=run_opts['kappa_smooth_polyorder'],
+                #         slope_brake_margin=run_opts['slope_brake_margin'],
+                #         slope_brake_vmax=run_opts['slope_brake_vmax'])
+                #     if not ok:
+                #         return
+                #     self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
+                # elif engine == 'velopt':
+                if engine == 'velopt':
                     self._kill_fbga_planner()         # ensure other engine off
                     ## IY : rqt vo_* keys → velopt_opts dict (internal keys
                     ##   match _run_velopt_planner's ROS-param-style names).
@@ -935,6 +993,11 @@ class GGTunerNode:
                         'w_ax_corner_acc':      run_opts['vo_w_axc'],
                         'w_ax_corner_k':        run_opts['vo_k_axc'],
                     }
+                    ## IY : persist velopt slider state (single overwriting yml)
+                    self._save_velopt_yaml(
+                        velopt_opts, run_opts['vo_bridge'],
+                        run_opts['map'], vehicle_name)
+                    ## IY : end
                     ok = self._run_velopt_planner(
                         vehicle_name, run_opts['map'], velopt_opts,
                         bridge_effect=run_opts['vo_bridge'],
@@ -963,9 +1026,12 @@ class GGTunerNode:
         ## IY : OR-merge per-group Apply mirrors with the root `apply`. All
         ##   trigger the same pipeline; we clear them together at the end so
         ##   rqt's checkbox auto-resets regardless of which one was clicked.
+        ## IY : 'apply_fbga' left in the tuple so re-enabling FBGA needs no
+        ##   change here. dict.get() (not getattr) is the correct fallback for
+        ##   dynamic_reconfigure.Config — getattr can't catch its KeyError.
         APPLY_KEYS = ('apply', 'apply_ggv', 'apply_raceline',
                       'apply_fbga', 'apply_velopt')
-        apply_any = any(bool(getattr(config, k, False)) for k in APPLY_KEYS)
+        apply_any = any(bool(config.get(k, False)) for k in APPLY_KEYS)
         ## IY : end
 
         if getattr(config, 'save_now', False):
@@ -1018,19 +1084,22 @@ class GGTunerNode:
             ## IY : Stage 4 single selector (replaces run_fbga bool)
             'vel_engine':       str(config.vel_engine),
             ## IY : end
-            'enable_mu':        bool(config.enable_mu),
             'safety_distance':  float(config.safety_distance),
-            ## IY : FBGA knobs (used when vel_engine='fbga'; bridge_effect also shared by velopt)
-            'bridge_effect':            float(config.bridge_effect),
-            'g_tilde_soft_beta':        float(config.g_tilde_soft_beta),
-            'smooth_mu':                bool(config.smooth_mu),
-            'mu_smooth_window':         int(config.mu_smooth_window),
-            'mu_smooth_polyorder':      int(config.mu_smooth_polyorder),
-            'smooth_kappa':             bool(config.smooth_kappa),
-            'kappa_smooth_window':      int(config.kappa_smooth_window),
-            'kappa_smooth_polyorder':   int(config.kappa_smooth_polyorder),
-            'slope_brake_margin':       float(config.slope_brake_margin),
-            'slope_brake_vmax':         float(config.slope_brake_vmax),
+            ## IY : FBGA knobs hidden in rqt — defaults kept here so the FBGA
+            ##   helpers still have something to read if re-enabled. The
+            ##   `if engine == 'fbga'` branch in _run_full_pipeline is
+            ##   commented out, so these are effectively unused.
+            # 'enable_mu':                bool(config.enable_mu),
+            # 'bridge_effect':            float(config.bridge_effect),
+            # 'g_tilde_soft_beta':        float(config.g_tilde_soft_beta),
+            # 'smooth_mu':                bool(config.smooth_mu),
+            # 'mu_smooth_window':         int(config.mu_smooth_window),
+            # 'mu_smooth_polyorder':      int(config.mu_smooth_polyorder),
+            # 'smooth_kappa':             bool(config.smooth_kappa),
+            # 'kappa_smooth_window':      int(config.kappa_smooth_window),
+            # 'kappa_smooth_polyorder':   int(config.kappa_smooth_polyorder),
+            # 'slope_brake_margin':       float(config.slope_brake_margin),
+            # 'slope_brake_vmax':         float(config.slope_brake_vmax),
             ## IY : end
             ## IY : VelOpt knobs (rqt names shortened velopt_* → vo_*).
             'vo_bridge':         float(config.vo_bridge),
