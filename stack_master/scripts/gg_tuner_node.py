@@ -702,6 +702,9 @@ class GGTunerNode:
         rospy.set_param('/vel_opt_3d/w_jx_curv_beta_brk',  float(velopt_opts['w_jx_curv_beta_brk']))
         rospy.set_param('/vel_opt_3d/w_jx_curv_k_beta',    float(velopt_opts['w_jx_curv_k_beta']))
         ## IY : legacy w_jx_curv_alpha removed from rqt; vel_opt_3d default 0 → fallback inactive.
+        ## IY : direct ax_pos^2 corner penalty
+        rospy.set_param('/vel_opt_3d/w_ax_corner_acc',     float(velopt_opts['w_ax_corner_acc']))
+        rospy.set_param('/vel_opt_3d/w_ax_corner_k',       float(velopt_opts['w_ax_corner_k']))
         rospy.set_param('/vel_opt_3d/bridge_effect',       float(bridge_effect))
 
         if not force_restart:
@@ -756,6 +759,9 @@ class GGTunerNode:
             f'_w_jx_curv_beta_brk:={float(velopt_opts["w_jx_curv_beta_brk"])}',
             f'_w_jx_curv_k_beta:={float(velopt_opts["w_jx_curv_k_beta"])}',
             ## IY : legacy w_jx_curv_alpha launch arg removed; node default 0 → fallback inactive.
+            ## IY : direct ax_pos^2 corner penalty
+            f'_w_ax_corner_acc:={float(velopt_opts["w_ax_corner_acc"])}',
+            f'_w_ax_corner_k:={float(velopt_opts["w_ax_corner_k"])}',
             f'_bridge_effect:={float(bridge_effect)}',
         ]
         rospy.loginfo(f"[GGTuner] [velopt] cold start: {' '.join(cmd)}")
@@ -925,6 +931,9 @@ class GGTunerNode:
                         'w_jx_curv_beta_brk':   run_opts['vo_beta_brk'],
                         'w_jx_curv_k_beta':     run_opts['vo_k_beta'],
                         ## IY : legacy w_jx_curv_alpha key removed.
+                        ## IY : direct ax_pos^2 corner penalty
+                        'w_ax_corner_acc':      run_opts['vo_w_axc'],
+                        'w_ax_corner_k':        run_opts['vo_k_axc'],
                     }
                     ok = self._run_velopt_planner(
                         vehicle_name, run_opts['map'], velopt_opts,
@@ -1040,6 +1049,9 @@ class GGTunerNode:
             'vo_beta_brk':       float(config.vo_beta_brk),
             'vo_k_beta':         float(config.vo_k_beta),
             ## IY : legacy w_jx_curv_alpha slider removed (rqt-side).
+            ## IY : direct ax_pos^2 corner penalty
+            'vo_w_axc':          float(config.vo_w_axc),
+            'vo_k_axc':          float(config.vo_k_axc),
             ## IY : end
         }
         ## IY : end
