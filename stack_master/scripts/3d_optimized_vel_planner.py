@@ -197,14 +197,24 @@ def _build_friction_gg_map(sectors, n_waypoints, gg_base_dir, gg_margin,
 
 
 ## IY(0416) : add gg_list, gg_idx params for multi-GGV friction support
-## IY : asymmetric jerk weights + curvature-weighted regularization.
+## IY : asymmetric jerk weights + tanh-saturated curvature/transition weighting.
 ##   w_jx_acc / w_jx_brk default to w_jx (symmetric, backward-compat).
-##   w_jx_curv_alpha=0.0 disables curvature weighting.
+##   alpha_acc/_brk: |Omega_z|-driven tanh weight (corner overall).
+##   beta_acc/_brk:  |dOmega_z/ds|-driven tanh weight (transition zone).
+##   k_alpha [1/m], k_beta [1/m^2]: tanh saturation scales.
+##   Legacy w_jx_curv_alpha (linear) auto-maps to alpha_acc=alpha_brk if set.
 def build_and_solve(track, gg, vehicle_params,
                     n_fixed, chi_fixed, v_init, ax_init,
                     w_T=1.0, w_jx=1e-2, V_min=0.0, RK4_steps=1, sol_opt=None,
                     gg_list=None, gg_idx=None,
-                    w_jx_acc=None, w_jx_brk=None, w_jx_curv_alpha=0.0):
+                    w_jx_acc=None, w_jx_brk=None,
+                    # === New (tanh-based) ===
+                    w_jx_curv_alpha_acc=0.0, w_jx_curv_alpha_brk=0.0,
+                    w_jx_curv_k_alpha=0.2,
+                    w_jx_curv_beta_acc=0.0, w_jx_curv_beta_brk=0.0,
+                    w_jx_curv_k_beta=0.5,
+                    # === Legacy (deprecated) ===
+                    w_jx_curv_alpha=0.0):
 ## IY(0416) : end
     """Reduced-state NLP. All arrays must be on track.s (resampled grid)."""
     ## IY : asymmetric jerk defaults — fall back to symmetric w_jx
@@ -212,6 +222,16 @@ def build_and_solve(track, gg, vehicle_params,
         w_jx_acc = w_jx
     if w_jx_brk is None:
         w_jx_brk = w_jx
+    ## IY : legacy w_jx_curv_alpha auto-mapping. If user passes the old linear
+    ##   knob and both new α_acc / α_brk are 0, mirror the legacy value into
+    ##   both sides so existing launches keep working (with new tanh shape).
+    if w_jx_curv_alpha > 0.0 and (w_jx_curv_alpha_acc + w_jx_curv_alpha_brk) == 0.0:
+        rospy.logwarn(
+            f'[velopt] legacy w_jx_curv_alpha={w_jx_curv_alpha} → '
+            f'mapped to alpha_acc=alpha_brk (deprecated, use _acc/_brk).')
+        w_jx_curv_alpha_acc = w_jx_curv_alpha
+        w_jx_curv_alpha_brk = w_jx_curv_alpha
+    ## IY : end
     h = vehicle_params['h']
     N = track.s.size
     ds = track.ds
@@ -228,6 +248,17 @@ def build_and_solve(track, gg, vehicle_params,
     chi_unwrapped = np.unwrap(chi_fixed)
     dchi_ds = (np.roll(chi_unwrapped, -1) - np.roll(chi_unwrapped, 1)) / (2.0 * ds)
     dchi_ds_fn = ca.interpolant('dchi_ds_fix', 'linear', [s_aug], concat_arr(dchi_ds))
+
+    ## IY : dOmega_z/ds lookup for transition (β) weighting.
+    ##   Sampled on track.s grid then central-differenced (np.gradient handles
+    ##   periodic edges via second-order accurate one-sided at endpoints,
+    ##   acceptable since reg term is squared).
+    Omega_z_arr = np.array([float(track.Omega_z_interpolator(float(si)))
+                            for si in track.s])
+    dOmega_z_ds_arr = np.gradient(Omega_z_arr, ds)
+    dOmega_z_ds_fn = ca.interpolant('dOmega_z_ds_fix', 'linear',
+                                     [s_aug], concat_arr(dOmega_z_ds_arr))
+    ## IY : end
 
     # Symbolic states: [V, ax]
     V = ca.MX.sym('V')
@@ -262,16 +293,27 @@ def build_and_solve(track, gg, vehicle_params,
     dx = ca.vertcat(dV, dax)
 
     L_t = w_T * 1.0 / s_dot
-    ## IY : asymmetric jerk + curvature-weighted regularization.
-    ##   curv_factor = 1 + alpha * |Omega_z|  (corner-only smoothing when alpha>0).
-    ##   jx_pos / jx_neg split → independent accel-side / brake-side weights.
-    ##   Backward-compat: w_jx_acc=w_jx_brk=w_jx, alpha=0 → identical to legacy.
+    ## IY : tanh-saturated curvature weighting (α corner + β transition).
+    ##   omega_term  = tanh(|Ω_z|     / k_alpha)   ∈ [0, 1)
+    ##   domega_term = tanh(|dΩ_z/ds| / k_beta)    ∈ [0, 1)
+    ##   weight_acc / _brk independently mix α_acc/_brk and β_acc/_brk.
+    ##   All α/β default to 0 → curv_factor = 1 → identical to pure asymmetric.
+    dOmega_z_ds_s = dOmega_z_ds_fn(s_sym)
+    omega_term  = ca.tanh(ca.fabs(Omega_z_s)     / w_jx_curv_k_alpha)
+    domega_term = ca.tanh(ca.fabs(dOmega_z_ds_s) / w_jx_curv_k_beta)
+
+    weight_acc = (1.0
+                  + w_jx_curv_alpha_acc * omega_term
+                  + w_jx_curv_beta_acc  * domega_term)
+    weight_brk = (1.0
+                  + w_jx_curv_alpha_brk * omega_term
+                  + w_jx_curv_beta_brk  * domega_term)
+
     jx_pos = ca.fmax(jx, 0.0)
     jx_neg = ca.fmax(-jx, 0.0)
-    curv_factor = 1.0 + w_jx_curv_alpha * ca.fabs(Omega_z_s)
-    L_reg = curv_factor * (
-        w_jx_acc * jx_pos ** 2 + w_jx_brk * jx_neg ** 2
-    ) / (s_dot ** 2)
+    L_reg = (weight_acc * w_jx_acc * jx_pos ** 2
+           + weight_brk * w_jx_brk * jx_neg ** 2) / (s_dot ** 2)
+    ## IY : end
 
     # RK4 (same as original)
     M = RK4_steps
@@ -533,18 +575,39 @@ class VelOptNode:
             self.w_jx = 1e-2
         self.w_T  = float(rospy.get_param('~w_T',  self.w_T))
         self.w_jx = float(rospy.get_param('~w_jx', self.w_jx))
-        ## IY : asymmetric jerk + curvature-weighted regularization knobs.
-        ##   ratio_acc / ratio_brk multiply base w_jx (1.0 = symmetric, legacy).
-        ##   curv_alpha=0 disables corner weighting.
+        ## IY : asymmetric jerk + tanh-saturated curvature/transition knobs.
+        ##   ratio_acc/_brk: legacy global asymmetry on base w_jx.
+        ##   alpha_acc/_brk + k_alpha: corner-overall weight via tanh(|Ω_z|/k).
+        ##   beta_acc/_brk  + k_beta:  transition weight  via tanh(|dΩ_z/ds|/k).
+        ##   Legacy w_jx_curv_alpha kept for backward-compat (auto-mapped inside
+        ##   build_and_solve when both new α_acc/_brk are 0).
         if not hasattr(self, 'w_jx_acc_ratio'):
             self.w_jx_acc_ratio = 1.0
         if not hasattr(self, 'w_jx_brk_ratio'):
             self.w_jx_brk_ratio = 1.0
+        if not hasattr(self, 'w_jx_curv_alpha_acc'):
+            self.w_jx_curv_alpha_acc = 0.0
+        if not hasattr(self, 'w_jx_curv_alpha_brk'):
+            self.w_jx_curv_alpha_brk = 0.0
+        if not hasattr(self, 'w_jx_curv_k_alpha'):
+            self.w_jx_curv_k_alpha = 0.2
+        if not hasattr(self, 'w_jx_curv_beta_acc'):
+            self.w_jx_curv_beta_acc = 0.0
+        if not hasattr(self, 'w_jx_curv_beta_brk'):
+            self.w_jx_curv_beta_brk = 0.0
+        if not hasattr(self, 'w_jx_curv_k_beta'):
+            self.w_jx_curv_k_beta = 0.5
         if not hasattr(self, 'w_jx_curv_alpha'):
-            self.w_jx_curv_alpha = 0.0
-        self.w_jx_acc_ratio  = float(rospy.get_param('~w_jx_acc_ratio',  self.w_jx_acc_ratio))
-        self.w_jx_brk_ratio  = float(rospy.get_param('~w_jx_brk_ratio',  self.w_jx_brk_ratio))
-        self.w_jx_curv_alpha = float(rospy.get_param('~w_jx_curv_alpha', self.w_jx_curv_alpha))
+            self.w_jx_curv_alpha = 0.0  # legacy, deprecated
+        self.w_jx_acc_ratio       = float(rospy.get_param('~w_jx_acc_ratio',       self.w_jx_acc_ratio))
+        self.w_jx_brk_ratio       = float(rospy.get_param('~w_jx_brk_ratio',       self.w_jx_brk_ratio))
+        self.w_jx_curv_alpha_acc  = float(rospy.get_param('~w_jx_curv_alpha_acc',  self.w_jx_curv_alpha_acc))
+        self.w_jx_curv_alpha_brk  = float(rospy.get_param('~w_jx_curv_alpha_brk',  self.w_jx_curv_alpha_brk))
+        self.w_jx_curv_k_alpha    = float(rospy.get_param('~w_jx_curv_k_alpha',    self.w_jx_curv_k_alpha))
+        self.w_jx_curv_beta_acc   = float(rospy.get_param('~w_jx_curv_beta_acc',   self.w_jx_curv_beta_acc))
+        self.w_jx_curv_beta_brk   = float(rospy.get_param('~w_jx_curv_beta_brk',   self.w_jx_curv_beta_brk))
+        self.w_jx_curv_k_beta     = float(rospy.get_param('~w_jx_curv_k_beta',     self.w_jx_curv_k_beta))
+        self.w_jx_curv_alpha      = float(rospy.get_param('~w_jx_curv_alpha',      self.w_jx_curv_alpha))
         self.w_jx_acc = self.w_jx * self.w_jx_acc_ratio
         self.w_jx_brk = self.w_jx * self.w_jx_brk_ratio
         ## IY : bridge_effect (shared with fbga; fed into Track3D as g_weight)
@@ -633,9 +696,12 @@ class VelOptNode:
         """Run the reduced-state NLP once using csv-based fixed path."""
         rospy.loginfo(
             f'[velopt] solving NLP ... (w_T={self.w_T}, w_jx={self.w_jx}, '
-            f'w_jx_acc_ratio={self.w_jx_acc_ratio}, '
-            f'w_jx_brk_ratio={self.w_jx_brk_ratio}, '
-            f'w_jx_curv_alpha={self.w_jx_curv_alpha}, '
+            f'ratio_acc/brk={self.w_jx_acc_ratio}/{self.w_jx_brk_ratio}, '
+            f'α_acc/brk={self.w_jx_curv_alpha_acc}/{self.w_jx_curv_alpha_brk} '
+            f'(k={self.w_jx_curv_k_alpha} [1/m]), '
+            f'β_acc/brk={self.w_jx_curv_beta_acc}/{self.w_jx_curv_beta_brk} '
+            f'(k={self.w_jx_curv_k_beta} [1/m^2]), '
+            f'legacy_alpha={self.w_jx_curv_alpha}, '
             f'V_min={self.V_min}, gg_margin={self.gg_margin}, '
             f'bridge_effect={self.bridge_effect})')
         # --- (기존 build_and_solve 호출, 보존용 주석) ---
@@ -647,6 +713,7 @@ class VelOptNode:
         # )
         # --- (원본 끝) ---
         ## IY(0416) : pass gg_list/gg_idx for multi-GGV friction support
+        ## IY : forward tanh-saturated curvature/transition knobs (α + β).
         self.V_opt, self.ax_opt, laptime, success = build_and_solve(
             track=self.track, gg=self.gg, vehicle_params=self.vehicle_params,
             n_fixed=self.n_fixed, chi_fixed=self.chi_fixed,
@@ -654,7 +721,14 @@ class VelOptNode:
             w_T=self.w_T, w_jx=self.w_jx,
             gg_list=self.gg_list, gg_idx=self.gg_idx,
             w_jx_acc=self.w_jx_acc, w_jx_brk=self.w_jx_brk,
-            w_jx_curv_alpha=self.w_jx_curv_alpha,
+            # tanh-saturated curvature weighting (α corner + β transition)
+            w_jx_curv_alpha_acc=self.w_jx_curv_alpha_acc,
+            w_jx_curv_alpha_brk=self.w_jx_curv_alpha_brk,
+            w_jx_curv_k_alpha=self.w_jx_curv_k_alpha,
+            w_jx_curv_beta_acc=self.w_jx_curv_beta_acc,
+            w_jx_curv_beta_brk=self.w_jx_curv_beta_brk,
+            w_jx_curv_k_beta=self.w_jx_curv_k_beta,
+            w_jx_curv_alpha=self.w_jx_curv_alpha,  # legacy
         )
         ## IY(0416) : end
         rospy.loginfo(f'[velopt] laptime={laptime:.4f}s  '
