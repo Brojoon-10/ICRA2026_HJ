@@ -23,6 +23,7 @@ import matplotlib
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.ticker import MultipleLocator   ## IY : 0.5-step grid
 
 
 ## IY : color cycle for plotted versions (current=blue, baseline=gray, vers cycle)
@@ -576,8 +577,20 @@ class GGViewerWidget(QWidget):
         self.ax_plot.set_title(
             f'GG Diamond  V={v_val:.1f} m/s  g={g_val:.1f} m/s²')
         self.ax_plot.legend(loc='upper right', fontsize=8)
-        self.ax_plot.grid(True, alpha=0.3)
-        self.ax_plot.set_aspect('equal', adjustable='datalim')
+        ## IY : labels every 1.0 m/s² (major), grid lines every 0.5 m/s² (minor)
+        self.ax_plot.xaxis.set_major_locator(MultipleLocator(1.0))
+        self.ax_plot.yaxis.set_major_locator(MultipleLocator(1.0))
+        self.ax_plot.xaxis.set_minor_locator(MultipleLocator(0.5))
+        self.ax_plot.yaxis.set_minor_locator(MultipleLocator(0.5))
+        self.ax_plot.grid(True, which='major', alpha=0.35)
+        self.ax_plot.grid(True, which='minor', alpha=0.2)
+        ## IY : end
+        ## IY : fixed ±10 m/s² range on both axes — same scale across all V/g
+        ##       combos for visual comparison. adjustable='box' keeps plot square.
+        self.ax_plot.set_xlim(-10.0, 10.0)
+        self.ax_plot.set_ylim(-10.0, 10.0)
+        self.ax_plot.set_aspect('equal', adjustable='box')
+        ## IY : end
         self.ax_plot.axhline(y=0, color='k', linewidth=0.5)
         self.ax_plot.axvline(x=0, color='k', linewidth=0.5)
         self.fig.tight_layout()
