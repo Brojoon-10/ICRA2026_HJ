@@ -213,6 +213,11 @@ def build_and_solve(track, gg, vehicle_params,
                     w_jx_curv_k_alpha=0.2,
                     w_jx_curv_beta_acc=0.0, w_jx_curv_beta_brk=0.0,
                     w_jx_curv_k_beta=0.5,
+                    ## IY : direct ax_pos^2 corner penalty (independent k from k_alpha).
+                    ##   Catches steady-state acceleration inside corners that the
+                    ##   jerk-based weights cannot see (jx=0 once ax is constant).
+                    w_ax_corner_acc=0.0,
+                    w_ax_corner_k=0.2,
                     # === Legacy (deprecated) ===
                     w_jx_curv_alpha=0.0):
 ## IY(0416) : end
@@ -313,6 +318,16 @@ def build_and_solve(track, gg, vehicle_params,
     jx_neg = ca.fmax(-jx, 0.0)
     L_reg = (weight_acc * w_jx_acc * jx_pos ** 2
            + weight_brk * w_jx_brk * jx_neg ** 2) / (s_dot ** 2)
+    ## IY : end
+
+    ## IY : direct ax_pos^2 penalty curvature-weighted. Penalises *being* in
+    ##   positive-ax state inside a high-curvature corner, which the jerk
+    ##   weighting above cannot do (jx_pos=0 once ax has settled). Independent
+    ##   k from k_alpha so this can be tuned without disturbing the jerk profile.
+    ##   w_ax_corner_acc=0 -> term vanishes (default behaviour).
+    ax_corner_term = ca.tanh(ca.fabs(Omega_z_s) / w_ax_corner_k)
+    ax_pos = ca.fmax(ax, 0.0)
+    L_reg = L_reg + w_ax_corner_acc * ax_corner_term * (ax_pos ** 2) / (s_dot ** 2)
     ## IY : end
 
     # RK4 (same as original)
@@ -599,6 +614,11 @@ class VelOptNode:
             self.w_jx_curv_k_beta = 0.5
         if not hasattr(self, 'w_jx_curv_alpha'):
             self.w_jx_curv_alpha = 0.0  # legacy, deprecated
+        ## IY : direct ax_pos^2 corner penalty (see build_and_solve)
+        if not hasattr(self, 'w_ax_corner_acc'):
+            self.w_ax_corner_acc = 0.0
+        if not hasattr(self, 'w_ax_corner_k'):
+            self.w_ax_corner_k = 0.2
         self.w_jx_acc_ratio       = float(rospy.get_param('~w_jx_acc_ratio',       self.w_jx_acc_ratio))
         self.w_jx_brk_ratio       = float(rospy.get_param('~w_jx_brk_ratio',       self.w_jx_brk_ratio))
         self.w_jx_curv_alpha_acc  = float(rospy.get_param('~w_jx_curv_alpha_acc',  self.w_jx_curv_alpha_acc))
@@ -608,6 +628,8 @@ class VelOptNode:
         self.w_jx_curv_beta_brk   = float(rospy.get_param('~w_jx_curv_beta_brk',   self.w_jx_curv_beta_brk))
         self.w_jx_curv_k_beta     = float(rospy.get_param('~w_jx_curv_k_beta',     self.w_jx_curv_k_beta))
         self.w_jx_curv_alpha      = float(rospy.get_param('~w_jx_curv_alpha',      self.w_jx_curv_alpha))
+        self.w_ax_corner_acc      = float(rospy.get_param('~w_ax_corner_acc',      self.w_ax_corner_acc))
+        self.w_ax_corner_k        = float(rospy.get_param('~w_ax_corner_k',        self.w_ax_corner_k))
         self.w_jx_acc = self.w_jx * self.w_jx_acc_ratio
         self.w_jx_brk = self.w_jx * self.w_jx_brk_ratio
         ## IY : bridge_effect (shared with fbga; fed into Track3D as g_weight)
@@ -728,6 +750,9 @@ class VelOptNode:
             w_jx_curv_beta_acc=self.w_jx_curv_beta_acc,
             w_jx_curv_beta_brk=self.w_jx_curv_beta_brk,
             w_jx_curv_k_beta=self.w_jx_curv_k_beta,
+            ## IY : direct ax_pos^2 corner penalty
+            w_ax_corner_acc=self.w_ax_corner_acc,
+            w_ax_corner_k=self.w_ax_corner_k,
             w_jx_curv_alpha=self.w_jx_curv_alpha,  # legacy
         )
         ## IY(0416) : end
