@@ -1,0 +1,84 @@
+
+========== bag1: /home/nuc3/catkin_ws/src/race_stack/bag/2026-04-27-13-09-22.bag ==========
+mpc_wpnts msgs: 567, avg_len: 35.7
+  in-msg kappa estim p50=1.53 p95=3.62 p99=49.74 max=597.81
+  in-msg min(ds) p10=0.0988 p50=0.1009
+  in-msg n_range p50=0.373 p95=0.739 max=1.299
+  inter-msg first-wpnt jumps >0.3m: 13
+    t=525.03 jump=1.683m
+    t=525.10 jump=1.474m
+    t=525.11 jump=1.161m
+    t=525.11 jump=0.929m
+    t=525.15 jump=0.724m
+    t=525.20 jump=0.580m
+    t=525.20 jump=0.423m
+    t=525.25 jump=0.340m
+    t=530.62 jump=0.566m
+    t=530.64 jump=0.613m
+  ot_line dist: {'avoid': 523, 'recover': 44}
+  ot_line transitions: {('avoid', 'recover'): 4, ('recover', 'avoid'): 4}
+
+  Predictor stability:
+  sampled predictor states: 142 (every 50th of 7188)
+    t=513.21: id=0 s=79.8 d=0.12 static=False | id=1 s=79.9 d=0.12 static=False | id=2 s=80.0 d=0.13 static=False | id=3 s=80.1 d=0.13 static=False | id=4 s=80.1 d=0.13 static=False | id=5 s=80.2 d=0.13 static=False | id=6 s=80.3 d=0.13 static=False | id=7 s=80.4 d=0.13 static=False | id=8 s=80.5 d=0.13 static=False | id=9 s=80.5 d=0.12 static=False | id=10 s=80.6 d=0.12 static=False | id=11 s=80.7 d=0.11 static=False | id=12 s=80.8 d=0.11 static=False | id=13 s=80.9 d=0.11 static=False | id=14 s=80.9 d=0.11 static=False | id=15 s=81.0 d=0.11 static=False | id=16 s=81.1 d=0.11 static=False | id=17 s=81.2 d=0.11 static=False | id=18 s=81.2 d=0.12 static=False | id=19 s=81.3 d=0.12 static=False
+    t=516.21: id=0 s=84.5 d=0.04 static=False | id=1 s=84.6 d=0.05 static=False | id=2 s=84.6 d=0.06 static=False | id=3 s=84.7 d=0.07 static=False | id=4 s=84.8 d=0.07 static=False | id=5 s=84.9 d=0.07 static=False | id=6 s=85.0 d=0.08 static=False | id=7 s=85.0 d=0.07 static=False | id=8 s=85.1 d=0.05 static=False | id=9 s=85.2 d=0.06 static=False | id=10 s=85.3 d=0.06 static=False | id=11 s=85.4 d=0.03 static=False | id=12 s=85.4 d=0.03 static=False | id=13 s=85.5 d=0.03 static=False | id=14 s=0.0 d=0.03 static=False | id=15 s=0.1 d=0.03 static=False | id=16 s=0.2 d=0.02 static=False | id=17 s=0.2 d=0.02 static=False | id=18 s=0.3 d=0.01 static=False | id=19 s=0.4 d=0.00 static=False
+    t=519.50: id=0 s=3.5 d=0.07 static=False | id=1 s=3.6 d=0.08 static=False | id=2 s=3.7 d=0.08 static=False | id=3 s=3.8 d=0.09 static=False | id=4 s=3.9 d=0.09 static=False | id=5 s=4.1 d=0.11 static=False | id=6 s=4.2 d=0.12 static=False | id=7 s=4.3 d=0.12 static=False | id=8 s=4.4 d=0.13 static=False | id=9 s=4.5 d=0.13 static=False | id=10 s=4.6 d=0.13 static=False | id=11 s=4.8 d=0.14 static=False | id=12 s=4.9 d=0.14 static=False | id=13 s=5.0 d=0.14 static=False | id=14 s=5.1 d=0.14 static=False | id=15 s=5.2 d=0.15 static=False | id=16 s=5.4 d=0.15 static=False | id=17 s=5.5 d=0.15 static=False | id=18 s=5.6 d=0.16 static=False | id=19 s=5.8 d=0.16 static=False
+    t=522.75: id=0 s=11.3 d=0.25 static=False | id=1 s=11.4 d=0.24 static=False | id=2 s=11.5 d=0.24 static=False | id=3 s=11.6 d=0.24 static=False | id=4 s=11.7 d=0.24 static=False | id=5 s=11.7 d=0.24 static=False | id=6 s=11.8 d=0.24 static=False | id=7 s=11.9 d=0.24 static=False | id=8 s=12.0 d=0.24 static=False | id=9 s=12.1 d=0.25 static=False | id=10 s=12.2 d=0.25 static=False | id=11 s=12.2 d=0.25 static=False | id=12 s=12.3 d=0.26 static=False | id=13 s=12.4 d=0.27 static=False | id=14 s=12.5 d=0.27 static=False | id=15 s=12.6 d=0.28 static=False | id=16 s=12.6 d=0.28 static=False | id=17 s=12.7 d=0.28 static=False | id=18 s=12.8 d=0.28 static=False | id=19 s=12.9 d=0.28 static=False
+    t=525.95: id=0 s=78.2 d=0.20 static=False | id=1 s=78.2 d=0.19 static=False | id=2 s=78.3 d=0.19 static=False | id=3 s=78.4 d=0.19 static=False | id=4 s=78.5 d=0.19 static=False | id=5 s=78.6 d=0.18 static=False | id=6 s=78.6 d=0.18 static=False | id=7 s=78.7 d=0.17 static=False | id=8 s=78.8 d=0.17 static=False | id=9 s=78.9 d=0.16 static=False | id=10 s=78.9 d=0.16 static=False | id=11 s=79.0 d=0.15 static=False | id=12 s=79.1 d=0.15 static=False | id=13 s=79.2 d=0.15 static=False | id=14 s=79.2 d=0.15 static=False | id=15 s=79.3 d=0.14 static=False | id=16 s=79.4 d=0.14 static=False | id=17 s=79.5 d=0.14 static=False | id=18 s=79.5 d=0.14 static=False | id=19 s=79.6 d=0.14 static=False
+    t=529.08: id=0 s=82.1 d=0.08 static=False | id=1 s=82.2 d=0.08 static=False | id=2 s=82.3 d=0.08 static=False | id=3 s=82.4 d=0.08 static=False | id=4 s=82.5 d=0.07 static=False | id=5 s=82.5 d=0.07 static=False | id=6 s=82.6 d=0.07 static=False | id=7 s=82.7 d=0.07 static=False | id=8 s=82.8 d=0.07 static=False | id=9 s=82.9 d=0.07 static=False | id=10 s=82.9 d=0.07 static=False | id=11 s=83.0 d=0.06 static=False | id=12 s=83.1 d=0.06 static=False | id=13 s=83.2 d=0.06 static=False | id=14 s=83.2 d=0.05 static=False | id=15 s=83.3 d=0.04 static=False | id=16 s=83.4 d=0.03 static=False | id=17 s=83.5 d=0.03 static=False | id=18 s=83.6 d=0.02 static=False | id=19 s=83.6 d=0.01 static=False
+    t=532.27: id=0 s=0.9 d=0.01 static=False | id=1 s=1.0 d=0.02 static=False | id=2 s=1.1 d=0.03 static=False | id=3 s=1.1 d=0.03 static=False | id=4 s=1.2 d=0.04 static=False | id=5 s=1.3 d=0.04 static=False | id=6 s=1.4 d=0.04 static=False | id=7 s=1.5 d=0.04 static=False | id=8 s=1.5 d=0.05 static=False | id=9 s=1.6 d=0.05 static=False | id=10 s=1.7 d=0.05 static=False | id=11 s=1.8 d=0.05 static=False | id=12 s=1.8 d=0.05 static=False | id=13 s=1.9 d=0.05 static=False | id=14 s=2.0 d=0.05 static=False | id=15 s=2.1 d=0.05 static=False | id=16 s=2.2 d=0.05 static=False | id=17 s=2.3 d=0.05 static=False | id=18 s=2.3 d=0.05 static=False | id=19 s=2.4 d=0.05 static=False
+    t=535.52: id=0 s=7.2 d=0.18 static=False | id=1 s=7.3 d=0.17 static=False | id=2 s=7.4 d=0.17 static=False | id=3 s=7.6 d=0.16 static=False | id=4 s=7.7 d=0.16 static=False | id=5 s=7.9 d=0.16 static=False | id=6 s=8.0 d=0.16 static=False | id=7 s=8.1 d=0.16 static=False | id=8 s=8.3 d=0.17 static=False | id=9 s=8.4 d=0.18 static=False | id=10 s=8.5 d=0.19 static=False | id=11 s=8.6 d=0.19 static=False | id=12 s=8.8 d=0.21 static=False | id=13 s=8.9 d=0.22 static=False | id=14 s=9.0 d=0.23 static=False | id=15 s=9.2 d=0.24 static=False | id=16 s=9.3 d=0.24 static=False | id=17 s=9.4 d=0.25 static=False | id=18 s=9.5 d=0.25 static=False | id=19 s=9.6 d=0.25 static=False
+
+  Tracking truth check:
+  sampled truth states: 67 (every 20th of 1322)
+    t=513.35: id=1 s=80.0 d=0.14 static=False | id=100 s=9.8 d=-0.16 static=True
+    t=517.74: id=1 s=0.7 d=0.03 static=False | id=100 s=9.8 d=-0.16 static=True
+    t=522.14: id=1 s=10.1 d=0.23 static=False | id=100 s=9.8 d=-0.16 static=True
+    t=526.54: id=1 s=78.7 d=0.17 static=False | id=100 s=9.8 d=-0.16 static=True
+    t=530.95: id=1 s=84.8 d=0.02 static=False | id=100 s=9.8 d=-0.16 static=True
+    t=535.33: id=1 s=6.7 d=0.17 static=False | id=100 s=9.8 d=-0.16 static=True
+
+  Behavior strategy from state machine:
+  state msgs: 2076
+  state dist: {'TRAILING': 2001, 'GB_TRACK': 75}
+  state transitions: {('TRAILING', 'GB_TRACK'): 1, ('GB_TRACK', 'TRAILING'): 1}
+
+  collision_marker msgs: 80, first at t=519.826
+
+========== bag2: /home/nuc3/catkin_ws/src/race_stack/bag/2026-04-27-13-12-51.bag ==========
+mpc_wpnts msgs: 382, avg_len: 33.3
+  in-msg kappa estim p50=1.31 p95=6.54 p99=51.33 max=96.11
+  in-msg min(ds) p10=0.0857 p50=0.1010
+  in-msg n_range p50=0.229 p95=0.703 max=0.860
+  inter-msg first-wpnt jumps >0.3m: 15
+    t=725.84 jump=1.262m
+    t=725.87 jump=1.171m
+    t=725.89 jump=0.936m
+    t=725.92 jump=0.748m
+    t=725.94 jump=0.600m
+    t=725.99 jump=0.478m
+    t=726.01 jump=0.382m
+    t=726.07 jump=0.305m
+    t=732.33 jump=1.267m
+    t=732.35 jump=1.086m
+  ot_line dist: {'avoid': 334, 'recover': 48}
+  ot_line transitions: {('avoid', 'recover'): 1, ('recover', 'avoid'): 1}
+
+  Predictor stability:
+  sampled predictor states: 0 (every 50th of 49847)
+
+  Tracking truth check:
+  sampled truth states: 41 (every 20th of 808)
+    t=721.74: id=100 s=78.7 d=-0.05 static=True
+    t=724.14: id=100 s=78.7 d=-0.05 static=True
+    t=726.57: id=100 s=78.7 d=-0.05 static=True
+    t=728.95: id=100 s=78.7 d=-0.05 static=True
+    t=731.33: id=100 s=78.7 d=-0.05 static=True
+    t=733.74: id=100 s=78.7 d=-0.05 static=True
+
+  Behavior strategy from state machine:
+  state msgs: 1261
+  state dist: {'TRAILING': 1103, 'GB_TRACK': 158}
+  state transitions: {('TRAILING', 'GB_TRACK'): 1, ('GB_TRACK', 'TRAILING'): 1}
+
+  collision_marker msgs: 167, first at t=730.086

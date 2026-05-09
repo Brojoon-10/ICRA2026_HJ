@@ -1,0 +1,23 @@
+Loading /home/nuc3/catkin_ws/src/race_stack/HJ_docs/debug/0428_debug/bags/s1_extra_E_172308.bag ...
+
+ticks: 1667, collision msgs: 1
+
+Distinct collision events: 1
+  #0: t=[1823.89-1823.89] dur=0.00s msgs=1
+
+========== Per-event analysis (each event start) ==========
+
+#0 t=1823.89 (n=1 msgs)
+  ego: s=12.83 n=-0.015 v=2.24 psi=-0.547
+  side=clear mpc_mode=WITH_OBS alpha_ramp=0.00
+  reason=no_obstacle d_free_L=+0.00 d_free_R=+0.00
+  trajectory: n_min=-0.018 n_max=+0.607 kappa=2.67
+  obstacles: s=10.31,n=+0.210,sN=12.79
+  ipopt=Solve_Succeede pass=1 tier=0
+
+========== obs_in_horizon=True analysis (n=199) ==========
+  side dist: {'left': 83, 'clear': 89, 'trail': 15, 'right': 12}
+  reason dist: {'no_obstacle': 93, 'only_left_fits': 74, 'best_effort_left': 6, 'best_effort_right': 16, 'swing_unsafe': 6, 'only_right_fits': 4}
+  trajectory ↔ obstacle overlap (obs_in_horizon=True): 157/199 = 78.9%
+  side ↔ ego_n contradiction (|ego_n|>0.2 against side): 12/199
+  cost.obs > 5x sum_others: 52/199 = 26.1%

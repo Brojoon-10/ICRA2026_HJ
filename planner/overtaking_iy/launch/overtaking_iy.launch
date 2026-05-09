@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<!-- Takeover launch: remap overrides SQP while running, auto-fallback on stop. -->
+<launch>
+  <node pkg="overtaking_iy" type="overtaking_iy_node.py"
+        name="planner_rolling" output="screen">
+    <remap from="/planner/rolling/otwpnts" to="/planner/avoidance/otwpnts"/>
+    <rosparam command="load"
+              file="$(find overtaking_iy)/config/overtaking_iy.yaml"/>
+  </node>
+</launch>

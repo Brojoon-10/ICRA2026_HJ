@@ -4,9 +4,9 @@ spline_len: 30
 ot_sector_begin: 0.5
 Overtaking_sector0:
   start: 0
-  end: 304
+  end: 365
   ot_flag: false
 Overtaking_sector1:
-  start: 305
-  end: 766
+  start: 366
+  end: 857
   ot_flag: false

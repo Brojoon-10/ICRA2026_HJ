@@ -1,0 +1,159 @@
+
+========== bag1  (n=583) ==========
+duration: 26.37s, rate: 22.1 Hz
+-- tier distribution: {0: 493, 1: 90}
+-- status: {'OK': 493, 'HOLD_LAST': 90}
+-- ipopt_status: {'Solve_Succeeded': 493, 'Infeasible_Problem_Detected': 89, 'Maximum_Iterations_Exceeded': 1}
+-- solver_pass: {1: 389, 2: 104, 0: 90}
+-- side: {'left': 73, 'trail': 320, 'right': 136, 'clear': 54}
+-- mpc_mode: {'WITH_OBS': 539, 'NO_OBS': 44}
+-- n_obs_used: {1: 195, 2: 388}
+-- n_obs_seen (decider): {1: 213, 2: 367, -1: 3}
+-- decider.reason: {'only_left_fits': 104, 'left_wider': 2, 'no_side_fits': 244, 'only_right_fits': 185, 'right_wider': 2, 'no_obstacle': 3, 'dv_small': 43}
+-- TIER 1 (HOLD_LAST): 90 ticks  (15.4%)
+-- SOLVER PASS=2 (TRAIL fallback): 104 ticks (17.8%)
+
+-- side flips: 19
+   t=514.34  left->trail mode=WITH_OBS n_obs=1 ego_n=0.031
+   t=515.61 trail->right mode=WITH_OBS n_obs=2 ego_n=0.4055
+   t=518.02 right->clear mode=NO_OBS n_obs=2 ego_n=-0.4739
+   t=518.50 clear->trail mode=WITH_OBS n_obs=2 ego_n=-0.4654
+   t=520.93 trail->right mode=WITH_OBS n_obs=2 ego_n=0.2355
+   t=521.39 right->trail mode=WITH_OBS n_obs=2 ego_n=0.1838
+   t=524.81 trail->clear mode=NO_OBS n_obs=1 ego_n=0.1998
+   t=525.61 clear->left  mode=NO_OBS n_obs=1 ego_n=-0.0932
+   t=526.07  left->trail mode=WITH_OBS n_obs=1 ego_n=0.0676
+   t=527.73 trail->left  mode=WITH_OBS n_obs=1 ego_n=0.0183
+   t=528.94  left->trail mode=WITH_OBS n_obs=1 ego_n=0.3152
+   t=530.64 trail->right mode=WITH_OBS n_obs=1 ego_n=0.2456
+   t=532.99 right->trail mode=WITH_OBS n_obs=2 ego_n=-0.5784
+   t=533.80 trail->left  mode=WITH_OBS n_obs=2 ego_n=-0.5763
+   t=533.85  left->clear mode=NO_OBS n_obs=2 ego_n=-0.5694
+   t=534.45 clear->left  mode=WITH_OBS n_obs=2 ego_n=-0.3816
+   t=535.30  left->trail mode=WITH_OBS n_obs=2 ego_n=0.1437
+   t=535.94 trail->right mode=WITH_OBS n_obs=2 ego_n=0.5356
+   t=537.34 right->trail mode=WITH_OBS n_obs=2 ego_n=0.1493
+
+-- mpc_mode flips: 8
+   t=518.02 WITH_OBS->NO_OBS side=clear min_obs_ds=60.989 dwell=0
+   t=518.30 NO_OBS->WITH_OBS side=clear min_obs_ds=4.514 dwell=0
+   t=524.81 WITH_OBS->NO_OBS side=clear min_obs_ds=47.598 dwell=0
+   t=524.94 NO_OBS->WITH_OBS side=clear min_obs_ds=3.192 dwell=0
+   t=525.10 WITH_OBS->NO_OBS side=clear min_obs_ds=17.292 dwell=0
+   t=525.81 NO_OBS->WITH_OBS side=left min_obs_ds=3.791 dwell=0
+   t=533.85 WITH_OBS->NO_OBS side=clear min_obs_ds=63.253 dwell=0
+   t=534.19 NO_OBS->WITH_OBS side=clear min_obs_ds=4.717 dwell=0
+-- pass 1<->2 alternations: 10
+-- jitter_rms_m: p50=0.089 p95=0.243 p99=0.401 max=8.095
+-- traj.kappa_max: p95=124.451 p99=2110.285 max=10679.968
+-- traj.kappa_rms: p95=28.765 max=2450.155
+-- continuity_guard.applied: 372 (63.8%)
+-- solve_ms: p50=15.5 p95=73.4 p99=100.7 max=152.1
+
+-- cost breakdown means (n_obs>=1, n=583):
+      contour: mean=    18.56 max=   324.82
+          reg: mean=     0.05 max=     0.66
+           dd: mean=     4.00 max=   198.27
+      dd_rate: mean=     0.06 max=     3.26
+     smooth_a: mean=     1.06 max=     9.17
+     progress: mean=    -0.11 max=    -0.00
+          obs: mean=  3098.56 max= 10549.84
+         bias: mean=     0.00 max=     0.00
+         wall: mean=     3.10 max=    66.08
+         cont: mean=     5.34 max=  1177.76
+         term: mean=     6.27 max=   276.46
+        slack: mean=     0.03 max=     5.49
+
+-- MULTI-OBSTACLE ticks (n_obs_used>=2): 388 (66.6%)
+   side dist: {'trail': 216, 'right': 114, 'clear': 32, 'left': 26}
+   pass dist: {1: 245, 2: 66, 0: 77}
+   tier dist: {0: 311, 1: 77}
+   reason   : {'only_right_fits': 138, 'right_wider': 2, 'no_side_fits': 197, 'only_left_fits': 50, 'dv_small': 1}
+   multi-obs time window: t=515.47 to 539.72 (24.24s span)
+   sample ticks:
+   t=515.47 side=trail pass=1 tier=0 ego_n=+0.39 d_free_L=-0.05 d_free_R=+0.24 reason=only_right_fits obs=[s=83.6,n=0.05,w=1|s=95.6,n=-0.16,w=1]
+   t=517.79 side=right pass=2 tier=0 ego_n=-0.41 d_free_L=-0.36 d_free_R=+0.28 reason=only_right_fits obs=[s=86.4,n=0.01,w=1|s=95.6,n=-0.16,w=1]
+   t=519.15 side=trail pass=1 tier=0 ego_n=-0.30 d_free_L=+0.21 d_free_R=-0.04 reason=no_side_fits obs=[s=2.9,n=0.05,w=1|s=10.0,n=-0.16,w=1]
+   t=520.39 side=trail pass=1 tier=0 ego_n=+0.23 d_free_L=+0.29 d_free_R=-0.17 reason=no_side_fits obs=[s=5.4,n=0.11,w=1|s=10.0,n=-0.16,w=1]
+   t=522.65 side=trail pass=0 tier=1 ego_n=+0.18 d_free_L=-0.59 d_free_R=+0.19 reason=no_side_fits obs=[s=10.0,n=-0.13,w=1|s=10.9,n=0.21,w=1]
+   t=529.60 side=trail pass=1 tier=0 ego_n=+0.45 d_free_L=+0.01 d_free_R=+0.09 reason=no_side_fits obs=[s=83.2,n=0.04,w=1|s=95.6,n=-0.16,w=1]
+   t=532.24 side=right pass=1 tier=0 ego_n=-0.42 d_free_L=-0.32 d_free_R=+0.21 reason=only_right_fits obs=[s=86.6,n=-0.02,w=1|s=95.6,n=-0.16,w=1]
+   t=533.50 side=trail pass=1 tier=0 ego_n=-0.59 d_free_L=+0.15 d_free_R=+0.00 reason=only_left_fits obs=[s=88.4,n=0.08,w=1|s=95.6,n=-0.16,w=1]
+   t=534.77 side= left pass=1 tier=0 ego_n=-0.23 d_free_L=+0.26 d_free_R=-0.15 reason=only_left_fits obs=[s=5.3,n=0.15,w=1|s=10.0,n=-0.16,w=1]
+   t=536.23 side=right pass=2 tier=0 ego_n=+0.54 d_free_L=-0.34 d_free_R=+0.16 reason=only_right_fits obs=[s=9.0,n=0.17,w=1|s=10.0,n=-0.16,w=1]
+   t=539.04 side=trail pass=0 tier=1 ego_n=+0.15 d_free_L=-0.19 d_free_R=+0.16 reason=no_side_fits obs=[s=10.0,n=-0.16,w=1|s=13.7,n=0.23,w=1]
+-- continuity_guard.applied at side flip: 15/19
+-- side vs ego_n contradiction (|ego_n|>0.2 against side): 48
+-- obs_in_horizon × mpc_mode:  WO+with=522  WO+NoO=0  NoO+WO=17  NoO+NoO=44
+
+-- IPOPT non-success: 90 (15.4%)
+   {'Infeasible_Problem_Detected': 89, 'Maximum_Iterations_Exceeded': 1}
+   t=521.39 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=0.931 vmax_min=2.20 side=trail n_obs=2 obs_in_h=True
+   t=521.42 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=0.931 vmax_min=2.19 side=trail n_obs=2 obs_in_h=True
+   t=521.53 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=0.931 vmax_min=2.18 side=trail n_obs=2 obs_in_h=True
+   t=521.59 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=0.931 vmax_min=2.17 side=trail n_obs=2 obs_in_h=True
+   t=521.66 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=0.931 vmax_min=2.17 side=trail n_obs=2 obs_in_h=True
+   t=521.71 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=0.931 vmax_min=2.17 side=trail n_obs=2 obs_in_h=True
+   t=521.80 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=0.931 vmax_min=2.17 side=trail n_obs=2 obs_in_h=True
+   t=521.85 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=0.931 vmax_min=2.16 side=trail n_obs=2 obs_in_h=True
+
+========== bag2  (n=382) ==========
+duration: 16.01s, rate: 23.9 Hz
+-- tier distribution: {0: 366, 1: 16}
+-- status: {'OK': 366, 'HOLD_LAST': 16}
+-- ipopt_status: {'Solve_Succeeded': 366, 'Infeasible_Problem_Detected': 16}
+-- solver_pass: {1: 264, 2: 102, 0: 16}
+-- side: {'left': 325, 'trail': 32, 'clear': 25}
+-- mpc_mode: {'WITH_OBS': 334, 'NO_OBS': 48}
+-- n_obs_used: {1: 371, 0: 11}
+-- n_obs_seen (decider): {1: 357, -1: 25}
+-- decider.reason: {'only_left_fits': 330, 'no_side_fits': 27, 'no_obstacle': 25}
+-- TIER 1 (HOLD_LAST): 16 ticks  (4.2%)
+-- SOLVER PASS=2 (TRAIL fallback): 102 ticks (26.7%)
+
+-- side flips: 3
+   t=730.26  left->trail mode=WITH_OBS n_obs=1 ego_n=0.2254
+   t=731.77 trail->clear mode=WITH_OBS n_obs=1 ego_n=-0.0578
+   t=732.62 clear->left  mode=NO_OBS n_obs=1 ego_n=-0.2434
+
+-- mpc_mode flips: 2
+   t=731.94 WITH_OBS->NO_OBS side=clear min_obs_ds=None dwell=0
+   t=733.55 NO_OBS->WITH_OBS side=left min_obs_ds=4.986 dwell=0
+-- pass 1<->2 alternations: 10
+-- jitter_rms_m: p50=0.068 p95=0.245 p99=0.348 max=6.436
+-- traj.kappa_max: p95=1632488.211 p99=1636297.563 max=1636843.066
+-- traj.kappa_rms: p95=374518.481 max=375517.553
+-- continuity_guard.applied: 186 (48.7%)
+-- solve_ms: p50=14.8 p95=73.7 p99=98.3 max=125.5
+
+-- cost breakdown means (n_obs>=1, n=371):
+      contour: mean=    22.55 max=   165.89
+          reg: mean=     0.17 max=     0.75
+           dd: mean=    10.51 max=   170.16
+      dd_rate: mean=     0.55 max=    38.05
+     smooth_a: mean=     1.77 max=    23.38
+     progress: mean=    -0.25 max=    -0.00
+          obs: mean=   398.85 max=  1856.68
+         bias: mean=     0.00 max=     0.00
+         wall: mean=     9.18 max=   147.33
+         cont: mean=     6.58 max=   426.17
+         term: mean=    10.67 max=   164.15
+        slack: mean=     0.19 max=    30.28
+
+-- MULTI-OBSTACLE ticks (n_obs_used>=2): 0 (0.0%)
+-- continuity_guard.applied at side flip: 1/3
+-- side vs ego_n contradiction (|ego_n|>0.2 against side): 16
+-- obs_in_horizon × mpc_mode:  WO+with=288  WO+NoO=0  NoO+WO=46  NoO+NoO=48
+
+-- IPOPT non-success: 16 (4.2%)
+   {'Infeasible_Problem_Detected': 16}
+   t=725.82 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=1.125 vmax_min=0.10 side=left n_obs=1 obs_in_h=True
+   t=730.73 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=1.125 vmax_min=0.10 side=trail n_obs=1 obs_in_h=True
+   t=730.82 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=1.125 vmax_min=0.10 side=trail n_obs=1 obs_in_h=True
+   t=730.85 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=1.117 vmax_min=0.10 side=trail n_obs=1 obs_in_h=True
+   t=730.90 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=1.117 vmax_min=0.10 side=trail n_obs=1 obs_in_h=True
+   t=730.95 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=1.103 vmax_min=0.10 side=trail n_obs=1 obs_in_h=True
+   t=731.00 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=1.103 vmax_min=0.10 side=trail n_obs=1 obs_in_h=True
+   t=731.14 ipopt=Infeasible_Problem_Detected pass=0 corridor_min=1.082 vmax_min=0.10 side=trail n_obs=1 obs_in_h=True
+
+Saved: ['/tmp/bag1_ticks.json', '/tmp/bag2_ticks.json']

@@ -1,0 +1,51 @@
+V_min: 2.0
+ax_max_scale: 1.0
+ax_min_scale: 1.0
+ay_scale: 1.0
+gg_exp_scale: 1.0
+safety_distance: 0.3
+tire_params:
+  N_0: 8.6
+  N_max: 50
+  kappa_max: 1.5
+  lambda_max: 1.6
+  lambda_mu_x: 1.0
+  lambda_mu_y: 0.8
+  p_Cx_1: 1.83
+  p_Cy_1: 1.83
+  p_Dx_1: 1.0
+  p_Dx_2: -0.2
+  p_Dy_1: 1.0
+  p_Dy_2: 0.0
+  p_Ex_1: 0.185
+  p_Ey_1: 0.185
+  p_Kx_1: 12.71
+  p_Kx_3: 0
+  p_Ky_1: -12.71
+  p_Ky_2: 1.0
+vehicle_params:
+  C_D_A: 0.0222
+  C_Lf_A: 0.00163
+  C_Lr_A: 0.00245
+  P_brake_max: 500.0
+  P_max: 500.0
+  T: 0.281
+  a: 0.159
+  ax_max_cap: null
+  ax_min_cap: null
+  ay_max_cap: null
+  b: 0.171
+  delta_max: 0.52
+  epsilon: 0.5
+  gamma: 1
+  h: 0.055
+  m: 4.38
+  rho: 1.225
+  total_length: 0.535
+  total_width: 0.3
+  v_max: 8.5
+  w: 0.33
+w_T: 1.0
+w_dOmega_z: 0.0
+w_jx: 0.01
+w_jy: 0.01

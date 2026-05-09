@@ -1,0 +1,29 @@
+{
+  "vehicle_name": "rc_car_10th_latest",
+  "base_vehicle": "rc_car_10th",
+  "tuning": {
+    "lambda_mu_x": 1.0,
+    "lambda_mu_y": 0.8,
+    "p_Dx_2": -0.2,
+    "p_Dy_2": 0.0,
+    "friction": 1.0,
+    "P_max": 500.0,
+    "v_max": 8.5,
+    "epsilon": 0.5,
+    "P_brake_max": 500.0,
+    "ax_max_cap": 0.0,
+    "ax_min_cap": 0.0,
+    "ay_max_cap": 0.0,
+    "gg_exp_scale": 1.0,
+    "ax_max_scale": 1.0,
+    "ax_min_scale": 1.0,
+    "ay_scale": 1.0,
+    "V_min": 2.0,
+    "safety_distance": 0.3,
+    "w_T": 1.0,
+    "w_jx": 0.01,
+    "w_jy": 0.01,
+    "w_dOmega_z": 0.0
+  },
+  "created": "2026-04-20 14:18:27"
+}

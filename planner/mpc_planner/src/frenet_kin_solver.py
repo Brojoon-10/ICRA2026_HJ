@@ -290,6 +290,21 @@ class FrenetKinMPC:
         P_obs_s = opti.parameter(n_obs, N + 1)
         P_obs_n = opti.parameter(n_obs, N + 1)
         P_obs_active = opti.parameter(n_obs)
+        ### HJ : 2026-04-27 (Option A) — true xy distance for obstacle cost.
+        ###      Frenet (s, n) cost overestimates distance in tight corners
+        ###      (raceline arc-length stretches the perceived gap → solver
+        ###      thinks safe but xy chord is shorter). Pre-compute raceline
+        ###      xy at each k AND obstacle xy at each (o, k) in node side,
+        ###      pass as parameters; cost uses (ego_xy - obs_xy)² directly.
+        ###      ref_nx, ref_ny = unit normal at raceline pose k.
+        ###        normal = (-sin psi_ref, cos psi_ref). Pushed from node.
+        P_ref_x = opti.parameter(N + 1)
+        P_ref_y = opti.parameter(N + 1)
+        P_ref_nx = opti.parameter(N + 1)
+        P_ref_ny = opti.parameter(N + 1)
+        P_obs_x = opti.parameter(n_obs, N + 1)
+        P_obs_y = opti.parameter(n_obs, N + 1)
+        ### HJ : end
         P_bias_L = opti.parameter()
         P_bias_R = opti.parameter()
         # v3: previous-solution n-profile for tick-to-tick continuity cost
@@ -307,6 +322,12 @@ class FrenetKinMPC:
         ###      Same ramp gates J_slack so slack at k=0 doesn't dominate.
         P_wall_ramp = opti.parameter(N + 1)
         ### HJ : end
+        ### HJ : 2026-04-28 Stage 2 Phase 2-2 — plan-aware target_n profile.
+        ###      Plan 별 target_n[k] (LEFT/RIGHT_PASS = 점진적 obs 옆 통과,
+        ###      TRAIL = ego_n 유지, RACELINE = 0). q_n_target=0 시 비활성.
+        P_n_target = opti.parameter(N + 1)
+        P_q_n_target = opti.parameter()
+        ### HJ : end (Phase 2-2)
 
         # Live-tunable cost parameters (promoted to opti.parameter so they
         # can be updated per-solve from rqt_reconfigure without NLP rebuild).
@@ -333,6 +354,12 @@ class FrenetKinMPC:
         P_w_slack = opti.parameter()
         P_sigma_s_obs = opti.parameter()
         P_sigma_n_obs = opti.parameter()
+        ### HJ : 2026-04-27 (C1'+) — per-obstacle sigma_n. Lets each
+        ###      obstacle slot carry its own lateral cost width based on
+        ###      its real size (vs blanket scalar). Pushed by node from
+        ###      _obs_half_arr + safety. Default = scalar fallback.
+        P_sigma_n_obs_per = opti.parameter(n_obs)
+        ### HJ : end
         P_wall_buf = opti.parameter()
         P_gap_lat = opti.parameter()
 
@@ -394,7 +421,15 @@ class FrenetKinMPC:
             if k == 0:
                 opti.subject_to(slk[k] <= 1.0)
             else:
-                opti.subject_to(slk[k] <= 0.0)
+                ### HJ : 2026-04-27 — tiny slack (1cm) for k>=1.
+                ###      Pure slk=0 caused IPOPT to flag Infeasible on
+                ###      sub-mm corridor violations (numerical noise from
+                ###      bubble-cost gradient at corridor edge), not real
+                ###      geometric infeasibility. With ε=0.01m the NLP can
+                ###      absorb this noise. wall_safe stays effectively
+                ###      0.14m. NOT bumped further — slack must remain a
+                ###      numerical guard, not a "relax until solves" knob.
+                opti.subject_to(slk[k] <= 0.01)
             ### HJ : end
 
         # ---- cost ----
@@ -441,17 +476,33 @@ class FrenetKinMPC:
         J_bias = 0
         for o in range(n_obs):
             for k in range(N + 1):
-                dx = (P_ref_s[k] - P_obs_s[o, k]) / P_sigma_s_obs
-                dy = (n_[k] - P_obs_n[o, k]) / P_sigma_n_obs
-                prox_sk = P_obs_active[o] * ca.exp(-(dx * dx))
-                J_obs = J_obs + (P_w_obs * prox_sk
-                                 * ca.exp(-(dy * dy)))
+                ### HJ : 2026-04-27 (Option A) — xy-Euclidean obstacle bubble.
+                ###      ego xy: ref_xy[k] + n[k] · normal[k]
+                ego_x_k = P_ref_x[k] + n_[k] * P_ref_nx[k]
+                ego_y_k = P_ref_y[k] + n_[k] * P_ref_ny[k]
+                dx_xy = ego_x_k - P_obs_x[o, k]
+                dy_xy = ego_y_k - P_obs_y[o, k]
+                xy_dist2 = dx_xy * dx_xy + dy_xy * dy_xy
+                sig_o = P_sigma_n_obs_per[o]
+                ### HJ : 2D radial bubble — true xy distance, immune to
+                ###      tight-corner Frenet distortion. s-axis gating dropped
+                ###      (xy distance naturally large for far-along-track
+                ###      obstacles).
+                bubble = ca.exp(-xy_dist2 / (sig_o * sig_o))
+                J_obs = J_obs + P_w_obs * P_obs_active[o] * bubble
+                ### HJ : Side bias kept in FRENET n (intentional — bias
+                ###      semantics is "stay on the chosen side of raceline").
                 viol_L = ca.fmax(0.0,
                                  (P_obs_n[o, k] + P_gap_lat) - n_[k])
                 viol_R = ca.fmax(0.0,
                                  n_[k] - (P_obs_n[o, k] - P_gap_lat))
-                J_bias = J_bias + P_bias_L * prox_sk * viol_L ** 2
-                J_bias = J_bias + P_bias_R * prox_sk * viol_R ** 2
+                # s-prox gate for side bias only (still useful — bias only
+                # near obstacle in s-direction).
+                ds_norm = (P_ref_s[k] - P_obs_s[o, k]) / P_sigma_s_obs
+                prox_sk_bias = P_obs_active[o] * ca.exp(-(ds_norm * ds_norm))
+                J_bias = J_bias + P_bias_L * prox_sk_bias * viol_L ** 2
+                J_bias = J_bias + P_bias_R * prox_sk_bias * viol_R ** 2
+                ### HJ : end
 
         # Wall cushion (strong quadratic hinge inside wall_buf).
         # ### HJ : v3b — cushion fires when the CAR BODY gets within
@@ -476,6 +527,16 @@ class FrenetKinMPC:
         J_term = (P_q_n_term * n_[N] ** 2
                   + P_q_v_term * (v_[N] - P_ref_v[N]) ** 2)
 
+        ### HJ : 2026-04-28 Phase 2-2 — plan-aware target_n cost.
+        ###      Plan 의 target_n profile 을 horizon 전 stage 에 강제. q_n_target=0
+        ###      이면 비활성 (Phase 2-1 weight overlay 만). 활성 시 trajectory
+        ###      가 명시적으로 target_n[k] 을 따라감 → obstacle 회피 / ego_n
+        ###      유지 / raceline 복귀 의 명시 표현.
+        J_target = 0
+        for k in range(N + 1):
+            J_target = J_target + P_q_n_target * (n_[k] - P_n_target[k]) ** 2
+        ### HJ : end (Phase 2-2)
+
         J_slack = 0
         for k in range(N + 1):
             ### HJ : 2026-04-27 — J_slack NOT ramped. Reverted from A4-b
@@ -490,7 +551,7 @@ class FrenetKinMPC:
 
         J = (J_contour + J_reg + J_dd + J_dd_rate + J_smooth_a
              + J_progress + J_obs + J_bias + J_wall
-             + J_cont + J_term + J_slack)
+             + J_cont + J_term + J_slack + J_target)
 
         opti.minimize(J)
         solver_opts = {
@@ -499,6 +560,21 @@ class FrenetKinMPC:
             'ipopt.linear_solver':  self.linear_solver,
             'print_time':           0,
             'ipopt.sb':             'yes',
+            ### HJ : 2026-04-28 (S1-1) — slack cap 1cm 와 align.
+            ###      Default `constr_viol_tol=1e-4` (0.1mm) 가 우리 slack cap (1cm)
+            ###      보다 100x 빡빡 → solver 가 정상 slack 활용 못 하고 sub-mm
+            ###      위반으로 infeas 보고. Tolerance 1cm align.
+            'ipopt.tol':                       1e-4,   # KKT residual
+            'ipopt.constr_viol_tol':           1e-2,   # 1cm
+            'ipopt.acceptable_tol':            1e-3,
+            'ipopt.acceptable_constr_viol_tol': 1e-2,  # 1cm
+            'ipopt.acceptable_iter':           10,
+            ### HJ : 2026-05-02 — IPOPT 가 큰 곡률 코너 + 좁은 corridor 에서
+            ###      발산하는 패턴 (bag 19-24-58 의 4 위치 fail). search 끈기
+            ###      강화 + adaptive barrier 로 완화.
+            'ipopt.expect_infeasible_problem': 'no',   # 빠른 infeas 판정 비활성
+            'ipopt.mu_strategy':               'adaptive',  # barrier 자동 조정
+            ### HJ : end
         }
         # ### HJ : v3c+ — attach JIT (compile symbolic fns to native C).
         if self.ipopt_jit:
@@ -521,6 +597,11 @@ class FrenetKinMPC:
                           ref_s=P_ref_s, ref_v=P_ref_v,
                           obs_s=P_obs_s, obs_n=P_obs_n,
                           obs_active=P_obs_active,
+                          ### HJ : Option A — xy-based obstacle cost params
+                          ref_x=P_ref_x, ref_y=P_ref_y,
+                          ref_nx=P_ref_nx, ref_ny=P_ref_ny,
+                          obs_x=P_obs_x, obs_y=P_obs_y,
+                          ### HJ : end
                           bias_L=P_bias_L, bias_R=P_bias_R,
                           n_prev=P_n_prev, cont_active=P_cont_active,
                           ### HJ : per-step wall ramp (A4-b)
@@ -535,15 +616,97 @@ class FrenetKinMPC:
                           w_wall_buf=P_w_wall_buf, w_slack=P_w_slack,
                           sigma_s_obs=P_sigma_s_obs,
                           sigma_n_obs=P_sigma_n_obs,
-                          wall_buf=P_wall_buf, gap_lat=P_gap_lat)
+                          sigma_n_obs_per=P_sigma_n_obs_per,
+                          wall_buf=P_wall_buf, gap_lat=P_gap_lat,
+                          ### HJ : Phase 2-2 — plan-aware target_n profile.
+                          n_target=P_n_target, q_n_target=P_q_n_target)
         self._cost_exprs = dict(
             contour=J_contour, reg=J_reg, dd=J_dd, dd_rate=J_dd_rate,
             smooth_a=J_smooth_a, progress=J_progress,
             obs=J_obs, bias=J_bias, wall=J_wall,
-            cont=J_cont, term=J_term, slack=J_slack)
+            cont=J_cont, term=J_term, slack=J_slack,
+            target=J_target)  # Phase 2-2
         self.ready = True
+        ### HJ : 2026-04-28 Phase 2-2 — defaults for plan-aware target_n.
+        ###      n_target = zeros (raceline). q_n_target = 0 (비활성).
+        ###      Plan_picker 가 매 tick 갱신.
+        self._n_target_arr = np.zeros(self.N + 1, dtype=np.float64)
+        self.q_n_target = 0.0
+        ### HJ : end
 
     # ----------------------------------------------------------------- helpers
+    ### HJ : 2026-04-27 (Option A) — push per-(o, k) obstacle xy.
+    ###      Shape (2, n_obs_max, N+1): [0]=x, [1]=y.
+    ###      None → reset to FAR placeholder (bubble vanishes).
+    def set_obs_xy(self, mat):
+        if mat is None:
+            self._obs_xy_mat = None
+            return
+        a = np.asarray(mat, dtype=np.float64)
+        if a.shape != (2, self.n_obs_max, self.N + 1):
+            raise ValueError(
+                f'set_obs_xy: expected shape (2, {self.n_obs_max}, '
+                f'{self.N + 1}), got {a.shape}')
+        self._obs_xy_mat = a
+    ### HJ : end
+
+    ### HJ : 2026-04-28 Phase 2-2 — plan-aware target_n profile setter.
+    def set_n_target_profile(self, arr, q_n_target=None):
+        """Plan 의 target_n profile 을 솔버에 push.
+
+        Args:
+          arr: list/array of length N+1. 각 stage 의 target n.
+          q_n_target: optional, target cost weight. None 이면 기존 값 유지.
+        """
+        if arr is None:
+            self._n_target_arr = np.zeros(self.N + 1, dtype=np.float64)
+        else:
+            a = np.asarray(arr, dtype=np.float64).reshape(-1)
+            if a.shape[0] != self.N + 1:
+                # Resize: pad/truncate to N+1
+                if a.shape[0] < self.N + 1:
+                    a = np.concatenate([a, np.full(self.N + 1 - a.shape[0], a[-1] if len(a)>0 else 0.0)])
+                else:
+                    a = a[:self.N + 1]
+            self._n_target_arr = a
+        if q_n_target is not None:
+            self.q_n_target = float(q_n_target)
+    ### HJ : end (Phase 2-2)
+
+    ### HJ : 2026-04-27 (C1'+) — push per-obstacle sigma_n.
+    ###      arr length must equal n_obs_max. Each entry =
+    ###      obs_half[o] + ego_half + safety_clearance.
+    ###      None → reset to scalar fallback (sigma_n_obs all slots).
+    def set_sigma_n_obs_per(self, arr):
+        if arr is None:
+            self._sigma_n_obs_per_arr = None
+            return
+        a = np.asarray(arr, dtype=np.float64).reshape(-1)
+        if a.shape[0] != self.n_obs_max:
+            raise ValueError(
+                f'set_sigma_n_obs_per: expected len={self.n_obs_max}, '
+                f'got {a.shape[0]}')
+        self._sigma_n_obs_per_arr = np.maximum(a, 1e-3)
+    ### HJ : end
+
+    ### HJ : 2026-04-27 — push per-obstacle static/dynamic flag.
+    ###      Used in TRAIL mode to inflate σ_n only for DYNAMIC obstacles
+    ###      (so lateral push from static obstacles still steers ego away
+    ###      from them while ego trails dynamic ones longitudinally).
+    ###      arr length must equal n_obs_max. True = static, False =
+    ###      dynamic. None → all True (conservative, current behaviour).
+    def set_obs_static(self, arr):
+        if arr is None:
+            self._obs_static_arr_solver = None
+            return
+        a = np.asarray(arr, dtype=bool).reshape(-1)
+        if a.shape[0] != self.n_obs_max:
+            raise ValueError(
+                f'set_obs_static: expected len={self.n_obs_max}, '
+                f'got {a.shape[0]}')
+        self._obs_static_arr_solver = a
+    ### HJ : end
+
     ### HJ : 2026-04-26 (A4-b) — push per-step wall_buf weight ramp.
     ###      arr length must equal N+1, values typically 0..1.
     ###      None → reset to all-ones (default behaviour).
@@ -577,6 +740,7 @@ class FrenetKinMPC:
         'w_obs', 'w_side_bias', 'w_cont', 'w_wall_buf', 'w_slack',
         'sigma_s_obs', 'sigma_n_obs',
         'wall_buf', 'gap_lat',
+        'q_n_target',  # Phase 2-2 — plan-aware target_n cost weight
     )
 
     def update_weights(self, **kwargs):
@@ -625,6 +789,80 @@ class FrenetKinMPC:
         nlb = -np.maximum(dR - margin, 1e-3)
         return nlb, nub
 
+    ### HJ : 2026-04-27 — hard-corridor side commit (range-gated).
+    ###      Bag 2026-04-27-08-59-57 showed side=right but solver picked LEFT
+    ###      because nub allowed positive n. side_bias is only a SOFT cost
+    ###      (w_side_bias=55) and was outweighed by contour/progress at the
+    ###      tick. With this patch: when side ∈ {LEFT, RIGHT}, clamp the
+    ###      corridor on the forbidden side so the solver physically cannot
+    ###      cross the obstacle's lateral keepout.
+    ###
+    ###      2026-04-27 (range-gate): obs_arr[o,k,2] is set to w_obstacle for
+    ###      all k regardless of how far the obstacle is in s. Without a
+    ###      range gate the clamp fires at every k even when obstacle is 13m
+    ###      ahead → pass 1 infeasible → pass 2 forces TRAIL → flicker between
+    ###      committed-side traj and TRAIL (no commit) traj. Bag
+    ###      2026-04-27-10-23-12 showed exactly this. Fix: only clamp at k
+    ###      where the obstacle's longitudinal proximity matters — within
+    ###      ds_window of ref_s[k]. ds_window = max(2.5·sigma_s, gap_long)
+    ###      so the clamp window matches the obstacle bubble's effective
+    ###      footprint. Outside that window: no clamp, solver free to follow
+    ###      raceline.
+    ###
+    ###      Skips the clamp at any k where it would invert the corridor
+    ###      (nlb >= nub) — preserves feasibility when wall is tight.
+    def _apply_side_commit(self, nlb, nub, obs_arr, side, ref_s=None):
+        ### HJ : 2026-04-28 (S1-3) — hard clamp 폐기. Multi-obs corridor
+        ###      inversion 회피 + side ↔ ego_n 모순 방지. Soft side bias
+        ###      hinge cost (line ~489-498, w_side_bias=55) 가 hint 역할.
+        ###      Stage 2 의 plan_library target_n profile 이 들어오면 더
+        ###      명확한 가이드.
+        return nlb, nub
+        ### HJ : end (S1-3) — below code unreached; kept for backup_20260428 diff.
+        if side not in (SIDE_LEFT, SIDE_RIGHT) or obs_arr is None:
+            return nlb, nub
+        sig_per = getattr(self, '_sigma_n_obs_per_arr', None)
+        # ### HJ : ds_window 3.0 m per user — enough longitudinal lead to
+        # commit corridor before ego is alongside obstacle. 2.5σ_s (≈1.75m)
+        # was too small: at v≈5 m/s, 1.75m = 0.35s lead, leaves ego barely
+        # time to drift onto the chosen side before obstacle is at horizon
+        # k. 3 m gives ~0.6s lead.
+        ds_window = float(getattr(self, 'side_commit_ds_window', 3.0))
+        nub_out = nub.copy()
+        nlb_out = nlb.copy()
+        N1 = obs_arr.shape[1]
+        for o in range(obs_arr.shape[0]):
+            w_ts = obs_arr[o, :, 2]
+            if float(np.max(w_ts)) <= 0.0:
+                continue
+            if sig_per is not None and o < len(sig_per):
+                sig = float(sig_per[o])
+            else:
+                sig = float(self.sigma_n_obs)
+            for k in range(N1):
+                if obs_arr[o, k, 2] <= 0.0:
+                    continue
+                obs_s_k = float(obs_arr[o, k, 0])
+                obs_n_k = float(obs_arr[o, k, 1])
+                # Range gate: only clamp when this k is near the obstacle.
+                if ref_s is not None:
+                    ref_s_k = float(ref_s[k])
+                    if abs(obs_s_k - ref_s_k) > ds_window:
+                        continue
+                if side == SIDE_RIGHT:
+                    cap = obs_n_k - sig
+                    nub_out[k] = min(nub_out[k], cap)
+                else:  # SIDE_LEFT
+                    floor = obs_n_k + sig
+                    nlb_out[k] = max(nlb_out[k], floor)
+        # Guard: never invert corridor; fall back to wall bounds at infeasible k
+        for k in range(N1):
+            if nlb_out[k] >= nub_out[k] - 1e-3:
+                nlb_out[k] = nlb[k]
+                nub_out[k] = nub[k]
+        return nlb_out, nub_out
+    ### HJ : end
+
     def _build_vmax(self, ref_v, obs_arr, side, v0=None):
         """Compute per-step vmax[k] for the horizon.
 
@@ -655,7 +893,15 @@ class FrenetKinMPC:
                 sN = float(obs_arr[o, -1, 0])
                 v_obs_s = max((sN - s0)
                               / max(self.N * self.dT, 1e-3), 0.0)
-                obs_cap = min(obs_cap, max(v_obs_s * 0.95, self.v_min))
+                ### HJ : 2026-04-28 (S1-2) — vmax cap floor 강화. 정적 obs
+                ###      (v_obs≈0) 시 cap=v_min(0.1) 까지 떨어지면 솔버가
+                ###      v[k]≈0 trajectory 풀어 lifter 의 ds≈0 → kappa 폭발
+                ###      (bag2 의 1.6M kappa). Floor 1.0 m/s 로 ego 가 살아
+                ###      있게. Stage 2 plan_library TRAIL plan 이 능동적 ds
+                ###      유지 + target_v 더 정교화.
+                trail_v_floor = float(getattr(self, 'trail_v_floor', 1.0))
+                obs_cap = min(obs_cap, max(v_obs_s * 0.95, trail_v_floor))
+                ### HJ : end (S1-2)
             cap = np.minimum(cap, obs_cap)
 
         # ---- universal v0-protect ramp ----
@@ -694,11 +940,17 @@ class FrenetKinMPC:
         return s_mat, n_mat, active
 
     def _seed_warm_start(self, n0, mu0, v0, de0, nlb, nub, vmax):
+        # ### HJ : 2026-05-02 — n[k] 가 ego_n 유지가 아니라 raceline (n=0)
+        # 으로 부드럽게 ramp 하는 seed. IPOPT 가 search 시작점부터 raceline
+        # 근처에 있어 발산 가능성 줄어듬. 큰 곡률 코너의 4 위치에서 NLP
+        # fail 하던 패턴 (bag 19-24-58) 의 부분적 fix.
         N = self.N
         X = np.zeros((N + 1, 4))
         U = np.zeros((N, 2))
         for k in range(N + 1):
-            X[k, 0] = float(np.clip(n0, nlb[k], nub[k]))
+            # Linear ramp from n0 (k=0) → 0 (k=N).
+            n_seed = n0 * (1.0 - k / max(N, 1))
+            X[k, 0] = float(np.clip(n_seed, nlb[k], nub[k]))
             X[k, 1] = mu0 * (1.0 - k / max(N, 1))
             X[k, 2] = float(np.clip(v0, self.v_min + 0.1, vmax[k]))
             X[k, 3] = de0
@@ -707,20 +959,25 @@ class FrenetKinMPC:
     # ------------------------------------------------------------------- solve
     def solve(self, initial_state, ref_slice,
               obstacles=None, side=SIDE_CLEAR, bias_scale=1.0):
-        """Two-pass retry ladder. See class docstring for motivation.
+        """Three-pass retry ladder.
 
         pass 1: decider's side, full obstacles active.
-        pass 2 (on fail): force SIDE_TRAIL → vmax caps (ramped from v0)
-                          to v_obs×0.95, giving the solver a feasible
-                          "hold behind" plan.
+        pass 2: force SIDE_TRAIL → vmax caps ramped to v_obs×0.95, but
+                obstacle cost weights still PASS-level (w_obs/w_side_bias).
+        pass 3 (NEW 2026-05-02): force SIDE_TRAIL + TRAIL weight swap
+                (w_obs=0, w_side_bias=0). Removes the lateral repulsion
+                that pushes ego into the corridor wall on tight corners
+                — root cause of mm-level corridor_upper/lower violations
+                seen in bag 2026-05-01-18-52-34 (14 infeas events, all on
+                PASS plan with kappa_max>1.7 + corridor_width≈1.86m).
+                Sacrifices PASS lateral commit but guarantees a feasible
+                trail trajectory consistent with user directive
+                "MPC 항상 feasible — 따라가는 경로라도 내야지".
 
-        ### HJ : v3c — former Pass 3 (obs-off + CLEAR) removed. It masked
-        genuine infeasibility with a trajectory that drove straight through
-        the obstacle at ref_v, starving the node-level fallback ladder of
-        the failure signal it needs. Now, if both passes fail, solver
-        returns success=False and the node engages HOLD_LAST → geometric
-        quintic → convergence quintic → raceline-slice (recovery chain
-        the user explicitly asked to use).
+        Former v3c Pass 3 (obs-off + CLEAR) was removed because it drove
+        straight through obstacles at ref_v. The new Pass 3 keeps the
+        SIDE_TRAIL vmax cap (won't catch up to obs) and only zeros
+        out the lateral repulsion cost.
         """
         if not self.ready:
             raise RuntimeError('FrenetKinMPC.setup() must be called first')
@@ -743,9 +1000,45 @@ class FrenetKinMPC:
             self.last_pass = 2
             return out
 
-        # Both passes failed. Report failure to node so the tier1/2/3
-        # recovery ladder engages instead of publishing a dangerous
-        # "obs-off straight-line" plan.
+        # ### HJ : 2026-05-02 — pass 3: 극단적 단순화.
+        # 이전 (q_n=5, q_n_term=8, gamma=4) 도 fail (bag 19-16-05 7건).
+        # IPOPT 가 search 도중 발산 → trajectory n_max=4.65m unconverged
+        # partial solution. 진짜 fix = Pass 3 의 NLP 를 IPOPT 에게 가장
+        # 단순한 problem 으로 만들기. progress = 0 (가만히 멈춰도 OK),
+        # q_n 압도적으로 큼 (raceline 강제), 다른 모든 cost 0.
+        # NLP 가 푸는 것 = "현재 ego 상태에서 raceline (n=0) 으로 부드럽게
+        # 회귀하는 trajectory + corridor 안 머무르기" 만. IPOPT 가 거의
+        # 항상 풀 수 있는 quadratic-like landscape.
+        saved = {
+            'w_obs':           float(self.w_obs),
+            'w_side_bias':     float(self.w_side_bias),
+            'q_n':             float(self.q_n),
+            'q_n_ramp':        float(self.q_n_ramp),
+            'q_n_term':        float(self.q_n_term),
+            'q_n_target':      float(self.q_n_target),
+            'gamma':           float(self.gamma),
+        }
+        try:
+            self.w_obs = 0.0
+            self.w_side_bias = 0.0
+            self.q_n = 100.0         # (50→100) 더 강력
+            self.q_n_ramp = 0.0
+            self.q_n_term = 200.0    # (50→200) terminal raceline 압도적
+            self.q_n_target = 0.0
+            self.gamma = 0.0         # progress 완전 제거
+            ok, out = self._solve_single_pass(
+                initial_state, ref_slice, obstacles=obstacles,
+                side=SIDE_TRAIL, bias_scale=bias_scale, pass_idx=3)
+        finally:
+            for k, v in saved.items():
+                setattr(self, k, v)
+        if ok:
+            self.last_pass = 3
+            return out
+
+        # All three passes failed. Report failure to node — rare now that
+        # pass 3 zeros the lateral repulsion. node engages tier2/3 quintic
+        # fallback only on genuine NLP collapse (numerical blowup).
         self.last_pass = 0
         return out
 
@@ -770,6 +1063,13 @@ class FrenetKinMPC:
         rs = np.asarray(ref_slice['ref_s'], dtype=float)
 
         nlb, nub = self._build_wall_bounds(dL, dR)
+        ### HJ : 2026-04-27 — hard side commit (see _apply_side_commit).
+        ###      Without this, side decision was a soft cost only and got
+        ###      out-balanced by other costs → solver crossed onto the
+        ###      forbidden side and crashed into the obstacle. ref_s passed
+        ###      so the clamp can range-gate by obstacle proximity at each k.
+        nlb, nub = self._apply_side_commit(nlb, nub, obstacles, side, ref_s=rs)
+        ### HJ : end
         # ### HJ : v3c — pass v0 so TRAIL vmax can be ramped from v0 down to
         # the obstacle cap via physical deceleration (a_dec_ramp ≈ 3 m/s²)
         # rather than snapping to the cap at k=0.
@@ -834,6 +1134,49 @@ class FrenetKinMPC:
         opti.set_value(P['obs_s'], obs_s_mat)
         opti.set_value(P['obs_n'], obs_n_mat)
         opti.set_value(P['obs_active'], obs_active)
+        ### HJ : Option A — push raceline xy + obstacle xy (xy-based bubble)
+        ###      ref_xy from ref_slice (already computed by node).
+        ###      obs_xy from node-side _build_obstacle_array_frenet
+        ###      (lifter.sn_to_xy applied to each obs (s, n) sample).
+        ref_x = ref_slice.get('ref_x_arr')
+        ref_y = ref_slice.get('ref_y_arr')
+        if ref_x is None or ref_y is None:
+            # Fallback: derive from center_points if available
+            cp = ref_slice.get('center_points')
+            if cp is not None and cp.shape[0] >= self.N + 1:
+                ref_x = cp[:self.N + 1, 0]
+                ref_y = cp[:self.N + 1, 1]
+            else:
+                ref_x = np.zeros(self.N + 1, dtype=np.float64)
+                ref_y = np.zeros(self.N + 1, dtype=np.float64)
+        opti.set_value(P['ref_x'], np.asarray(ref_x, dtype=np.float64))
+        opti.set_value(P['ref_y'], np.asarray(ref_y, dtype=np.float64))
+        ### HJ : raceline unit normal at each k
+        ###      normal = (-sin psi_ref, cos psi_ref) = (-ref_dy, ref_dx)
+        ref_dx_arr = ref_slice.get('ref_dx')
+        ref_dy_arr = ref_slice.get('ref_dy')
+        if ref_dx_arr is not None and ref_dy_arr is not None:
+            ref_dx_arr = np.asarray(ref_dx_arr, dtype=np.float64)
+            ref_dy_arr = np.asarray(ref_dy_arr, dtype=np.float64)
+            ref_nx = -ref_dy_arr[:self.N + 1]
+            ref_ny =  ref_dx_arr[:self.N + 1]
+        else:
+            ref_nx = np.zeros(self.N + 1, dtype=np.float64)
+            ref_ny = np.ones(self.N + 1, dtype=np.float64)
+        opti.set_value(P['ref_nx'], ref_nx)
+        opti.set_value(P['ref_ny'], ref_ny)
+        ### HJ : end
+        # obs_xy: get from solver instance attr (node sets via setter), or
+        # build a "FAR" placeholder for inactive slots.
+        obs_xy_mat = getattr(self, '_obs_xy_mat', None)
+        if (obs_xy_mat is None
+                or obs_xy_mat.shape != (2, self.n_obs_max, self.N + 1)):
+            # Default: place obstacles "far" (1e3 away) so bubble vanishes.
+            obs_xy_mat = np.full(
+                (2, self.n_obs_max, self.N + 1), 1.0e3, dtype=np.float64)
+        opti.set_value(P['obs_x'], obs_xy_mat[0])
+        opti.set_value(P['obs_y'], obs_xy_mat[1])
+        ### HJ : end
         opti.set_value(P['bias_L'], bL)
         opti.set_value(P['bias_R'], bR)
         opti.set_value(P['n_prev'], n_prev)
@@ -862,10 +1205,52 @@ class FrenetKinMPC:
         opti.set_value(P['w_cont'],      self.w_cont)
         opti.set_value(P['w_wall_buf'],  self.w_wall_buf)
         opti.set_value(P['w_slack'],     self.w_slack)
+        ### HJ : 2026-04-27 — TRAIL mode: inflate σ_n only for DYNAMIC.
+        ###      User insight: in TRAIL with mixed static + dynamic
+        ###      obstacles, ego should pre-position laterally to avoid the
+        ###      static (full bubble lateral push works) AND trail behind
+        ###      dynamic (no lateral push, just s-cost decelerates ego).
+        ###      Per-obstacle σ_n: dynamic in TRAIL → ×10 (lateral flat),
+        ###      static in TRAIL → ×1 (full lateral push).
+        ###      Outside TRAIL: ×1 for all (normal OT bubble).
         opti.set_value(P['sigma_s_obs'], max(self.sigma_s_obs, 1e-3))
-        opti.set_value(P['sigma_n_obs'], max(self.sigma_n_obs, 1e-3))
+        # Scalar default — used when per-obstacle array missing.
+        opti.set_value(P['sigma_n_obs'],
+                       max(self.sigma_n_obs, 1e-3))
+        ### HJ : per-obstacle sigma_n. Default fallback to scalar
+        ###      sigma_n_obs for all slots; node overrides via
+        ###      set_sigma_n_obs_per(). Per-obstacle TRAIL inflation
+        ###      applied via _obs_static_arr_solver.
+        sig_per = getattr(self, '_sigma_n_obs_per_arr', None)
+        if sig_per is None or sig_per.shape[0] != self.n_obs_max:
+            sig_per = np.full(self.n_obs_max,
+                              max(self.sigma_n_obs, 1e-3), dtype=np.float64)
+        if side == SIDE_TRAIL:
+            obs_static = getattr(self, '_obs_static_arr_solver', None)
+            sig_per_eff = sig_per.copy()
+            for o in range(self.n_obs_max):
+                if obs_static is None or not obs_static[o]:
+                    # Dynamic (or unknown — default treat as dynamic in TRAIL
+                    # so we don't accidentally push ego sideways for fast obs).
+                    sig_per_eff[o] *= 10.0
+                # Static: keep ×1 → full lateral bubble pushes ego away.
+        else:
+            sig_per_eff = sig_per
+        opti.set_value(P['sigma_n_obs_per'], sig_per_eff)
+        ### HJ : end
         opti.set_value(P['wall_buf'],    self.wall_buf)
         opti.set_value(P['gap_lat'],     self.gap_lat)
+        ### HJ : 2026-04-28 Phase 2-2 — plan-aware target_n profile push.
+        try:
+            target_arr = self._n_target_arr
+            if target_arr is None or target_arr.shape[0] != self.N + 1:
+                target_arr = np.zeros(self.N + 1, dtype=np.float64)
+            opti.set_value(P['n_target'], target_arr)
+            opti.set_value(P['q_n_target'], float(getattr(self, 'q_n_target', 0.0)))
+        except Exception:
+            opti.set_value(P['n_target'], np.zeros(self.N + 1))
+            opti.set_value(P['q_n_target'], 0.0)
+        ### HJ : end (Phase 2-2)
 
         # ---- warm start ----
         # Pass 2+ always re-seed (previous pass's debug values may be in
@@ -941,35 +1326,63 @@ class FrenetKinMPC:
         except RuntimeError:
             self.last_return_status = opti.stats().get('return_status', 'FAIL')
             self.last_iter_count = int(opti.stats().get('iter_count', -1))
-            try:
-                n_sol = np.asarray(opti.debug.value(V['n'])).ravel()
-                mu_sol = np.asarray(opti.debug.value(V['mu'])).ravel()
-                v_sol = np.asarray(opti.debug.value(V['v'])).ravel()
-                de_sol = np.asarray(opti.debug.value(V['de'])).ravel()
-                a_sol = np.asarray(opti.debug.value(V['a'])).ravel()
-                dd_sol = np.asarray(opti.debug.value(V['dd'])).ravel()
-                slk_sol = np.asarray(opti.debug.value(V['slk'])).ravel()
-                self.last_cost_breakdown = {}
-                # Probe which hard constraint family is violated most.
-                self.last_infeas_info = self._probe_infeasibility(
-                    n_sol, mu_sol, v_sol, de_sol, dd_sol, slk_sol,
-                    nlb, nub, vmax)
-            except Exception as exc:
-                self.last_infeas_info = {'probe_error': str(exc)}
+
+            # ### HJ : 2026-05-02 — accept Solved_To_Acceptable_Level.
+            # IPOPT 가 strict KKT tolerance (1e-4) 만족 못해도 acceptable
+            # tolerance (1e-2 = 1cm) 는 만족하면 결과 사용. 학계 standard
+            # 패턴. corridor 1mm 위반 같은 numerical noise 케이스 흡수.
+            if self.last_return_status == 'Solved_To_Acceptable_Level':
+                try:
+                    n_sol = np.asarray(opti.debug.value(V['n'])).ravel()
+                    mu_sol = np.asarray(opti.debug.value(V['mu'])).ravel()
+                    v_sol = np.asarray(opti.debug.value(V['v'])).ravel()
+                    de_sol = np.asarray(opti.debug.value(V['de'])).ravel()
+                    a_sol = np.asarray(opti.debug.value(V['a'])).ravel()
+                    dd_sol = np.asarray(opti.debug.value(V['dd'])).ravel()
+                    slk_sol = np.asarray(opti.debug.value(V['slk'])).ravel()
+                    self.last_cost_breakdown = {}
+                    self.last_infeas_info = {}
+                    self.last_pass_history.append({
+                        'pass': int(pass_idx),
+                        'status': self.last_return_status,
+                        'ok': True,
+                        'note': 'acceptable_level',
+                    })
+                    success = True
+                    # Fall through to the post-except success path
+                    # (warm-start shift + return) below.
+                except Exception:
+                    pass  # fall into the failure-probe block
+
+            if not success:
+                try:
+                    n_sol = np.asarray(opti.debug.value(V['n'])).ravel()
+                    mu_sol = np.asarray(opti.debug.value(V['mu'])).ravel()
+                    v_sol = np.asarray(opti.debug.value(V['v'])).ravel()
+                    de_sol = np.asarray(opti.debug.value(V['de'])).ravel()
+                    a_sol = np.asarray(opti.debug.value(V['a'])).ravel()
+                    dd_sol = np.asarray(opti.debug.value(V['dd'])).ravel()
+                    slk_sol = np.asarray(opti.debug.value(V['slk'])).ravel()
+                    self.last_cost_breakdown = {}
+                    self.last_infeas_info = self._probe_infeasibility(
+                        n_sol, mu_sol, v_sol, de_sol, dd_sol, slk_sol,
+                        nlb, nub, vmax)
+                except Exception as exc:
+                    self.last_infeas_info = {'probe_error': str(exc)}
+                    self.last_pass_history.append({
+                        'pass': int(pass_idx),
+                        'status': self.last_return_status,
+                        'ok': False,
+                        'err': 'debug_value_failed',
+                    })
+                    return False, (0.0, 0.0, None, False)
                 self.last_pass_history.append({
                     'pass': int(pass_idx),
                     'status': self.last_return_status,
                     'ok': False,
-                    'err': 'debug_value_failed',
+                    'worst': self.last_infeas_info.get('worst'),
                 })
                 return False, (0.0, 0.0, None, False)
-            self.last_pass_history.append({
-                'pass': int(pass_idx),
-                'status': self.last_return_status,
-                'ok': False,
-                'worst': self.last_infeas_info.get('worst'),
-            })
-            return False, (0.0, 0.0, None, False)
 
         # --- shift warm-start / continuity anchors one step ---
         N = self.N

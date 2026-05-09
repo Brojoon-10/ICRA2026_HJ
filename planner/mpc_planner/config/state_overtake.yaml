@@ -24,7 +24,7 @@ planner_freq: 30          # Hz. Tick rate of the plan loop; solve_ms p99 ~32 ms
                           # matches the predictor freshness and the controller.
 
 # ---- Horizon -----------------------------------------------------------------
-N: 20                     # prediction steps
+N: 40                     # prediction steps  ### HJ 2026-04-28 (d): N=40 + Phase 2-2 통합 + stage 비례 weight
 dT: 0.05                  # s per step  ->  1.0 s look-ahead
 
 # ---- Vehicle -----------------------------------------------------------------
@@ -136,12 +136,13 @@ w_obstacle: 1.0
 
 # Gaussian bubble on both (s, n). The s-envelope exp(-(ds/sigma_s)^2) gates
 # the per-k cost so far-away obstacles do not push the whole horizon.
-w_obs: 260.0              # ### HJ 2026-04-24: 180→260. bubble peak. User obs:
-                          #   "장애물 옆 나란히 떨어지는 무브먼트 없음" — strengthen.
-                          #   Must stay below w_wall_buf=2500 so wall wins.
+w_obs: 100.0              # ### HJ 2026-04-28 (S1-7): 260→100. bag1 cost.obs/sum_other
+                          #   ratio 60x → 정상화 (5x 미만 목표). raceline pull
+                          #   (q_n=3) 살아남도록. Stage 2 plan_library 도입 시
+                          #   w_obs 더 줄여서 plan-aware target_n 의존.
 sigma_s_obs: 0.7          # longitudinal scale ~ 2 x car length
-sigma_n_obs: 0.35         # ### HJ 2026-04-24: 0.18→0.35. lateral bubble doubled so
-                          #   obs push felt at 0.3 m lateral gap (was 0.06 weak).
+sigma_n_obs: 0.45         # ### HJ 2026-04-28 (S1-7): 0.35→0.45. bubble shape 부드럽게.
+                          #   가까이서 saturate 줄임 → solver 가 다른 비용도 고려.
 obstacle_sigma: 0.5       # legacy MPCC scalar (single-axis bubble)
 
 # Side bias -- one-sided quadratic hinge, direction set by SideDecider.
@@ -174,9 +175,13 @@ q_v_term: 0.5             # (v_N - v_ref_N)^2 terminal weight
 side_hold_ticks: 10       # LEFT<->RIGHT flip hysteresis (~0.33 s @ 30 Hz)
 trail_entry_ticks: 3      # ANY -> TRAIL fires in ~0.1 s
                           # ("못 갈 것 같으면 바로 감속" semantics)
-min_pass_margin: 0.10     # feasibility gate [m]. A side is viable only if
+min_pass_margin: 0.15     # feasibility gate [m]. A side is viable only if
                           # d_free >= ego_half + gap_lat + min_pass_margin;
                           # otherwise TRAIL is forced.
+                          # 2026-04-27: 0.10 → 0.15 — d_free already nets
+                          # 40cm safety (ego_half+gap_lat); +15cm extra is
+                          # plenty for NLP slack (1cm) to absorb numerical
+                          # edge.
 
 ### HJ : obstacle half_width source for SideDecider feasibility math.
 ###      "fixed" — always use obstacle_half_width_fixed (current behaviour, conservative)
@@ -212,12 +217,15 @@ trail_vel_ramp_ticks: 8
 #  IPOPT
 # =============================================================================
 
-ipopt_max_iter: 80        # ### HJ : 2026-04-26 (A2) — was 200. Bag analysis
-                          # showed worst-case failed solve hit 136ms (~0.7 ms/iter
-                          # on hard infeasibility), which exceeded SM freshness
-                          # threshold and triggered spurious GB fallback flap.
-                          # 80 caps worst-case fail to ~55 ms; tier-1 hold-last
-                          # publishes immediately afterward → SM stays in sync.
+ipopt_max_iter: 200       # 2026-05-02: 80 → 200. bag 19-24-58 4 위치 fail 분석:
+                          # IPOPT 가 search 도중 발산 (n_max=4.68m unconverged).
+                          # 80 iter 안에 KKT 못 만족. 큰 곡률 코너 + 좁은 corridor
+                          # 에서는 200 iter 까지 search 필요. solve_ms 영향:
+                          # successful solve 는 보통 10~25 iter 라 영향 적음 (8~25ms).
+                          # fail 케이스만 200 iter * 0.7ms ≈ 140ms — SM freshness
+                          # 임계 (300ms) 안.
+                          # acceptable_tol (1cm) + Solved_To_Acceptable_Level 처리
+                          # 와 함께 적용해서 fail 빈도 자체 줄임.
                           # Successful solves still finish in <20ms (~15 iters
                           # typical), so this only affects fail behaviour.
 ipopt_print_level: 0

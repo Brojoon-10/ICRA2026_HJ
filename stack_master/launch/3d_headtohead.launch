@@ -7,7 +7,9 @@
   <arg name="perception" default="False" />
   <arg name="enable_planners" default="True" />
   <arg name="enable_prediction" default="True" />
-  <arg name="dynamic_avoidance_mode" default="SQP" />
+  <!-- <arg name="dynamic_avoidance_mode" default="SQP" /> -->
+  <arg name="dynamic_avoidance_mode" default="None" />
+
   <arg name="use_vd_prediction" default="False" />
   <!-- ### HJ : when true, replace spliner / sqp / recovery_spliner with
        sampling_based_planner_3d (state-aware OT + RECOVERY). Default false

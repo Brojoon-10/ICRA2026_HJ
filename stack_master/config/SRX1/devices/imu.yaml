@@ -13,9 +13,9 @@ publish_mount_to_frame_id_transform  : False
 mount_to_frame_id_transform          : [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] # [ x, y, z, qi, qj, qk, qw ]
 
 imu_data_raw_rate         : 0    # Rate of imu/data_raw topic
-imu_data_rate             : 100  # Rate of imu/data topic
+imu_data_rate             : 500  # Rate of imu/data topic
 filter_human_readable_status_data_rate : 2  # Rate of ekf/status
-filter_imu_data_rate                   : 250  # Rate of ekf/imu/data topic
+filter_imu_data_rate                   : 500  # Rate of ekf/imu/data topic
                                             # Note: Both filter_odometry_earth_data_rate and filter_odometry_map_data_rate depend on the contents of this message.
                                             #       If either are set to a higher value, this message will be published at that rate.
 

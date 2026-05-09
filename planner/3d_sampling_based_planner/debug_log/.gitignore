@@ -1,2 +1,9 @@
-# Ignore runtime log files in this directory
+# ### HJ : runtime debug artefacts — DebugLogger 산출물 일체 무시.
+# (이 .gitignore 자체는 commit, 폴더 존재 보존용.)
 *.log
+*.csv
+*.jsonl
+*.yaml
+*.npz
+*_session/
+snapshots/

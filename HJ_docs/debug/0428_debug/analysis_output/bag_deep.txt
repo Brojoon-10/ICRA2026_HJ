@@ -1,0 +1,212 @@
+
+========== Kappa spikes (>5.0) — where? ==========
+
+--- bag1: 63 spike ticks (kappa_max>5)
+   (pass,tier,ipopt) -> {(1, 0, 'Solve_Succeeded'): 48, (2, 0, 'Solve_Succeeded'): 15}
+   t=526.12 kmax=10680.0 side=trail mode=WITH_OBS pass=1 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.086 cgL2=0.0692
+   t=525.57 kmax=8599.2 side=clear mode=NO_OBS pass=1 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.126 cgL2=0.2479
+   t=527.66 kmax=4066.8 side=trail mode=WITH_OBS pass=1 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.038 cgL2=0.1569
+   t=526.83 kmax=3474.3 side=trail mode=WITH_OBS pass=1 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.035 cgL2=0.0653
+   t=526.88 kmax=2144.8 side=trail mode=WITH_OBS pass=1 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.026 cgL2=0.0473
+   t=527.60 kmax=2110.3 side=trail mode=WITH_OBS pass=1 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.044 cgL2=0.0772
+   t=526.07 kmax=1214.8 side=trail mode=WITH_OBS pass=1 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.086 cgL2=0.1692
+   t=527.66 kmax=1107.0 side=trail mode=WITH_OBS pass=1 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.023 cgL2=0.204
+   t=525.30 kmax=917.1 side=clear mode=NO_OBS pass=1 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.149 cgL2=0.3643
+   t=526.61 kmax=904.3 side=trail mode=WITH_OBS pass=1 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.040 cgL2=0.0649
+
+--- bag2: 166 spike ticks (kappa_max>5)
+   (pass,tier,ipopt) -> {(1, 0, 'Solve_Succeeded'): 71, (2, 0, 'Solve_Succeeded'): 86, (0, 1, 'Infeasible_Problem_Detected'): 9}
+   t=729.80 kmax=1636843.1 side=left mode=WITH_OBS pass=2 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.031 cgL2=0.0721
+   t=729.87 kmax=1636843.0 side=left mode=WITH_OBS pass=2 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.002 cgL2=0.0719
+   t=729.90 kmax=1636842.9 side=left mode=WITH_OBS pass=2 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.001 cgL2=0.0718
+   t=735.70 kmax=1636297.6 side=left mode=WITH_OBS pass=2 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.094 cgL2=0.1027
+   t=730.03 kmax=1636289.7 side=left mode=WITH_OBS pass=2 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.025 cgL2=0.0602
+   t=729.95 kmax=1636289.3 side=left mode=WITH_OBS pass=2 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.032 cgL2=0.0612
+   t=723.80 kmax=1635114.5 side=left mode=WITH_OBS pass=2 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.109 cgL2=0.1371
+   t=729.56 kmax=1635107.0 side=left mode=WITH_OBS pass=2 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.050 cgL2=0.0934
+   t=729.71 kmax=1635105.3 side=left mode=WITH_OBS pass=2 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.031 cgL2=0.094
+   t=736.43 kmax=1634751.0 side=left mode=WITH_OBS pass=2 tier=0 ipopt=Solve_Succeeded n_obs=1 jitter=0.005 cgL2=0.0634
+
+========== NO_OBS but obstacle in horizon (rule violation candidates) ==========
+
+--- bag1: 0 ticks with NO_OBS+obs_in_horizon=True
+
+--- bag2: 0 ticks with NO_OBS+obs_in_horizon=True
+
+========== Bag1: multi-obstacle decision detail — the failure modes ==========
+multi-obs pair runs: 57
+
+  pair s=(84, 96), t=[515.47-516.15] 13 ticks
+    side dist: {'trail': 2, 'right': 11}
+    pass dist: {1: 2, 2: 11}
+    reason   : {'only_right_fits': 11, 'right_wider': 2}
+    ego_n range: [+0.32, +0.43]   side seq: ttrrrrrrrrrrr
+      t=515.47 side=trail pass=1 ego_n=+0.39 n_obs[0]_n=+0.047 d_free_L=-0.05 d_free_R=+0.24 reason=only_right_fits ipopt=Solve_Succ
+      t=515.49 side=trail pass=1 ego_n=+0.39 n_obs[0]_n=+0.040 d_free_L=+0.71 d_free_R=+1.23 reason=right_wider ipopt=Solve_Succ
+      t=515.61 side=right pass=2 ego_n=+0.41 n_obs[0]_n=+0.056 d_free_L=+0.67 d_free_R=+1.29 reason=right_wider ipopt=Solve_Succ
+      t=515.63 side=right pass=2 ego_n=+0.42 n_obs[0]_n=+0.054 d_free_L=-0.10 d_free_R=+0.32 reason=only_right_fits ipopt=Solve_Succ
+      t=515.71 side=right pass=2 ego_n=+0.42 n_obs[0]_n=+0.063 d_free_L=-0.12 d_free_R=+0.35 reason=only_right_fits ipopt=Solve_Succ
+      t=515.76 side=right pass=2 ego_n=+0.43 n_obs[0]_n=+0.050 d_free_L=-0.13 d_free_R=+0.37 reason=only_right_fits ipopt=Solve_Succ
+
+  pair s=(85, 96), t=[516.21-517.02] 14 ticks
+    side dist: {'right': 14}
+    pass dist: {2: 14}
+    reason   : {'only_right_fits': 14}
+    ego_n range: [-0.16, +0.32]   side seq: rrrrrrrrrrrrrr
+      t=516.21 side=right pass=2 ego_n=+0.32 n_obs[0]_n=+0.028 d_free_L=-0.31 d_free_R=+0.54 reason=only_right_fits ipopt=Solve_Succ
+      t=516.29 side=right pass=2 ego_n=+0.29 n_obs[0]_n=-0.002 d_free_L=-0.29 d_free_R=+0.51 reason=only_right_fits ipopt=Solve_Succ
+      t=516.34 side=right pass=2 ego_n=+0.28 n_obs[0]_n=+0.014 d_free_L=-0.33 d_free_R=+0.53 reason=only_right_fits ipopt=Solve_Succ
+      t=516.41 side=right pass=2 ego_n=+0.22 n_obs[0]_n=+0.012 d_free_L=-0.34 d_free_R=+0.53 reason=only_right_fits ipopt=Solve_Succ
+      t=516.48 side=right pass=2 ego_n=+0.17 n_obs[0]_n=+0.000 d_free_L=-0.34 d_free_R=+0.52 reason=only_right_fits ipopt=Solve_Succ
+      t=516.51 side=right pass=2 ego_n=+0.12 n_obs[0]_n=-0.000 d_free_L=-0.36 d_free_R=+0.52 reason=only_right_fits ipopt=Solve_Succ
+
+  pair s=(86, 96), t=[517.11-517.82] 13 ticks
+    side dist: {'right': 13}
+    pass dist: {2: 13}
+    reason   : {'only_right_fits': 13}
+    ego_n range: [-0.43, -0.19]   side seq: rrrrrrrrrrrrr
+      t=517.11 side=right pass=2 ego_n=-0.19 n_obs[0]_n=+0.000 d_free_L=-0.40 d_free_R=+0.49 reason=only_right_fits ipopt=Solve_Succ
+      t=517.12 side=right pass=2 ego_n=-0.22 n_obs[0]_n=-0.009 d_free_L=-0.39 d_free_R=+0.48 reason=only_right_fits ipopt=Solve_Succ
+      t=517.19 side=right pass=2 ego_n=-0.28 n_obs[0]_n=+0.000 d_free_L=-0.39 d_free_R=+0.46 reason=only_right_fits ipopt=Solve_Succ
+      t=517.29 side=right pass=2 ego_n=-0.29 n_obs[0]_n=+0.016 d_free_L=-0.41 d_free_R=+0.45 reason=only_right_fits ipopt=Solve_Succ
+      t=517.34 side=right pass=2 ego_n=-0.31 n_obs[0]_n=+0.030 d_free_L=-0.42 d_free_R=+0.44 reason=only_right_fits ipopt=Solve_Succ
+      t=517.39 side=right pass=2 ego_n=-0.32 n_obs[0]_n=+0.004 d_free_L=-0.39 d_free_R=+0.40 reason=only_right_fits ipopt=Solve_Succ
+
+  pair s=(87, 96), t=[517.87-517.99] 3 ticks
+    side dist: {'right': 3}
+    pass dist: {2: 3}
+    reason   : {'only_right_fits': 3}
+    ego_n range: [-0.45, -0.44]   side seq: rrr
+      t=517.87 side=right pass=2 ego_n=-0.44 n_obs[0]_n=+0.020 d_free_L=-0.36 d_free_R=+0.26 reason=only_right_fits ipopt=Solve_Succ
+      t=517.94 side=right pass=2 ego_n=-0.45 n_obs[0]_n=+0.015 d_free_L=-0.34 d_free_R=+0.24 reason=only_right_fits ipopt=Solve_Succ
+      t=517.99 side=right pass=2 ego_n=-0.45 n_obs[0]_n=+0.006 d_free_L=-0.32 d_free_R=+0.22 reason=only_right_fits ipopt=Solve_Succ
+
+  pair s=(61, 70), t=[518.02-518.02] 1 ticks
+    side dist: {'clear': 1}
+    pass dist: {1: 1}
+    reason   : {'only_right_fits': 1}
+    ego_n range: [-0.47, -0.47]   side seq: c
+      t=518.02 side=clear pass=1 ego_n=-0.47 n_obs[0]_n=+0.016 d_free_L=-0.21 d_free_R=+0.52 reason=only_right_fits ipopt=Solve_Succ
+
+  pair s=(43, 52), t=[518.08-518.08] 1 ticks
+    side dist: {'clear': 1}
+    pass dist: {1: 1}
+    reason   : {'only_right_fits': 1}
+    ego_n range: [-0.48, -0.48]   side seq: c
+      t=518.08 side=clear pass=1 ego_n=-0.48 n_obs[0]_n=+0.036 d_free_L=-0.24 d_free_R=+0.60 reason=only_right_fits ipopt=Solve_Succ
+
+  pair s=(31, 39), t=[518.09-518.09] 1 ticks
+    side dist: {'clear': 1}
+    pass dist: {1: 1}
+    reason   : {'only_right_fits': 1}
+    ego_n range: [-0.48, -0.48]   side seq: c
+      t=518.09 side=clear pass=1 ego_n=-0.48 n_obs[0]_n=+0.051 d_free_L=-0.42 d_free_R=+0.57 reason=only_right_fits ipopt=Solve_Succ
+
+  pair s=(22, 31), t=[518.11-518.11] 1 ticks
+    side dist: {'clear': 1}
+    pass dist: {1: 1}
+    reason   : {'no_side_fits': 1}
+    ego_n range: [-0.49, -0.49]   side seq: c
+      t=518.11 side=clear pass=1 ego_n=-0.49 n_obs[0]_n=+0.062 d_free_L=+0.05 d_free_R=+0.08 reason=no_side_fits ipopt=Solve_Succ
+
+========== Pass1<->Pass2 alternation events ==========
+
+--- bag1
+   10 alternation events
+   t=513.47 pass=2 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+   t=514.34 pass=1 side=trail reason=no_side_fits ipopt=Solve_Succeede n_obs=1
+   t=515.61 pass=2 side=right reason=right_wider ipopt=Solve_Succeede n_obs=2
+   t=518.02 pass=1 side=clear reason=only_right_fits ipopt=Solve_Succeede n_obs=2
+   t=520.93 pass=2 side=right reason=only_right_fits ipopt=Solve_Succeede n_obs=2
+   t=525.91 pass=2 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+   t=526.07 pass=1 side=trail reason=dv_small ipopt=Solve_Succeede n_obs=1
+   t=527.73 pass=2 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+   t=528.94 pass=1 side=trail reason=no_side_fits ipopt=Solve_Succeede n_obs=1
+   t=535.94 pass=2 side=right reason=only_right_fits ipopt=Solve_Succeede n_obs=2
+
+--- bag2
+   10 alternation events
+   t=722.06 pass=2 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+   t=722.13 pass=1 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+   t=722.20 pass=2 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+   t=722.36 pass=1 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+   t=723.66 pass=2 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+   t=729.32 pass=2 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+   t=730.26 pass=1 side=trail reason=no_side_fits ipopt=Solve_Succeede n_obs=1
+   t=734.00 pass=2 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+   t=734.25 pass=1 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+   t=735.37 pass=2 side=left reason=only_left_fits ipopt=Solve_Succeede n_obs=1
+
+========== Continuity guard L2 distribution ==========
+
+--- bag1  top 10 L2:
+   L2=8.523 t=525.03 side=clear pass=1 k_max=0.7 applied=True
+   L2=6.324 t=525.10 side=clear pass=1 k_max=0.8 applied=True
+   L2=4.753 t=525.11 side=clear pass=1 k_max=1.1 applied=True
+   L2=3.595 t=525.11 side=clear pass=1 k_max=1.3 applied=True
+   L2=3.275 t=530.62 side=trail pass=1 k_max=1.2 applied=True
+   L2=2.573 t=525.15 side=clear pass=1 k_max=1.5 applied=True
+   L2=2.132 t=530.64 side=right pass=1 k_max=1.1 applied=True
+   L2=1.857 t=525.20 side=clear pass=1 k_max=1.5 applied=True
+   L2=1.510 t=530.66 side=right pass=1 k_max=1.1 applied=True
+   L2=1.376 t=537.17 side=right pass=2 k_max=1.4 applied=True
+
+--- bag2  top 10 L2:
+   L2=6.876 t=725.84 side=left pass=1 k_max=0.8 applied=True
+   L2=5.962 t=732.33 side=clear pass=1 k_max=0.9 applied=True
+   L2=5.034 t=725.87 side=left pass=1 k_max=0.8 applied=True
+   L2=4.429 t=732.35 side=clear pass=1 k_max=0.9 applied=True
+   L2=3.872 t=725.89 side=left pass=1 k_max=0.8 applied=True
+   L2=3.347 t=732.38 side=clear pass=1 k_max=0.9 applied=True
+   L2=2.946 t=725.94 side=left pass=1 k_max=0.8 applied=True
+   L2=2.484 t=732.40 side=clear pass=1 k_max=0.9 applied=True
+   L2=2.205 t=725.94 side=left pass=1 k_max=0.8 applied=True
+   L2=1.798 t=732.41 side=clear pass=1 k_max=0.9 applied=True
+
+========== HOLD_LAST chain durations ==========
+
+--- bag1: 3 HOLD_LAST chains
+   t=[521.39-525.01] dur=3.62s ticks=51 first ipopt=Infeasible_Pro side=trail
+   t=[530.04-530.59] dur=0.54s ticks=8 first ipopt=Infeasible_Pro side=trail
+   t=[537.34-539.72] dur=2.38s ticks=31 first ipopt=Infeasible_Pro side=trail
+
+--- bag2: 6 HOLD_LAST chains
+   t=[725.82-725.82] dur=0.00s ticks=1 first ipopt=Infeasible_Pro side=left
+   t=[730.73-731.00] dur=0.27s ticks=6 first ipopt=Infeasible_Pro side=trail
+   t=[731.14-731.50] dur=0.36s ticks=5 first ipopt=Infeasible_Pro side=trail
+   t=[732.31-732.31] dur=0.00s ticks=1 first ipopt=Infeasible_Pro side=clear
+   t=[736.21-736.21] dur=0.00s ticks=1 first ipopt=Infeasible_Pro side=left
+   t=[736.55-736.63] dur=0.08s ticks=2 first ipopt=Infeasible_Pro side=left
+
+========== Cost balance — obs vs others (per tick max ratio) ==========
+   bag1: ticks where obs_cost > 10x sum_other_costs = 338/583 = 58.0%
+   bag2: ticks where obs_cost > 10x sum_other_costs = 102/382 = 26.7%
+
+========== Bag1: obstacle pair separation ==========
+   ds: p10=1.52 p50=6.22 p90=10.87
+   dn: p10=0.16 p50=0.26 p90=0.41
+
+========== Decider reason transitions (which reasons cluster?) ==========
+
+--- bag1:
+        only_right_fits -> no_side_fits          11
+           no_side_fits -> only_right_fits       8
+           no_side_fits -> only_left_fits        6
+         only_left_fits -> only_right_fits       6
+         only_left_fits -> no_side_fits          5
+        only_right_fits -> only_left_fits        3
+         only_left_fits -> left_wider            2
+             left_wider -> only_left_fits        2
+        only_right_fits -> right_wider           1
+            right_wider -> only_right_fits       1
+           no_side_fits -> no_obstacle           1
+            no_obstacle -> only_left_fits        1
+         only_left_fits -> dv_small              1
+               dv_small -> only_left_fits        1
+        only_right_fits -> dv_small              1
+
+--- bag2:
+         only_left_fits -> no_side_fits          2
+           no_side_fits -> no_obstacle           1
+            no_obstacle -> only_left_fits        1
+           no_side_fits -> only_left_fits        1

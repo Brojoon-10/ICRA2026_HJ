@@ -121,8 +121,8 @@
 
   <node pkg="stack_master" type="relay_node.py" name="relay_node" output="screen"/>
 
-  <!-- <node pkg="joy" type="joy_node" name="joy_node" output="screen"/> -->
+  <node pkg="joy" type="joy_node" name="joy_node" output="screen"/>
   <!-- ### HJ : use ELRS receiver instead of USB joystick -->
-  <include file="$(find elrs_joy)/launch/elrs_joy.launch"/>
+  <!-- <include file="$(find elrs_joy)/launch/elrs_joy.launch"/> -->
 
 </launch>

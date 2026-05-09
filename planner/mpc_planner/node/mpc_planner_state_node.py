@@ -88,6 +88,31 @@ else:
 
 _VALID_STATES = ('overtake', 'recovery', 'observe', 'auto')
 
+
+### HJ : 2026-05-02 (Phase 1) — Obstacle msg 가 __slots__ 라 임의 attribute
+###      attach 불가. wrapper 로 underlying msg attribute 를 그대로 위임하면서
+###      sidecar 시퀀스 (_horizon_s_seq / _horizon_d_seq / _horizon_conf_seq)
+###      를 추가 보유.
+class _ObsWithHorizon(object):
+    __slots__ = ('_underlying',
+                 '_horizon_s_seq', '_horizon_d_seq', '_horizon_conf_seq')
+
+    def __init__(self, obstacle_msg, s_seq, d_seq, conf_seq):
+        object.__setattr__(self, '_underlying', obstacle_msg)
+        object.__setattr__(self, '_horizon_s_seq', s_seq)
+        object.__setattr__(self, '_horizon_d_seq', d_seq)
+        object.__setattr__(self, '_horizon_conf_seq', conf_seq)
+
+    def __getattr__(self, name):
+        # Delegated to underlying Obstacle msg.
+        return getattr(self._underlying, name)
+
+    def __setattr__(self, name, value):
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._underlying, name, value)
+
 # ### HJ : Phase X (refactored) — 2-state MPC FSM for state:=auto.
 #   WITH_OBS : obstacle within horizon. Solver runs with full obstacle cost
 #              + SideDecider (LEFT/RIGHT/TRAIL/CLEAR). OVERTAKE AND TRAIL
@@ -867,23 +892,31 @@ class MPCPlannerStateNode:
         return None, 'none'
 
     def _merge_obs_sources(self):
-        """### HJ : 2026-04-27 (C1') — tracking-anchored merge.
+        """### HJ : 2026-05-02 (Phase 1) — horizon-sequence merge.
 
-        Previous bug: prediction publishes N=20 Obstacle msgs per opponent
-        (one per horizon timestep). Earlier merge dedupe-by-id failed
-        because prediction's `id` is the timestep index, not opponent id.
-        N msgs all kept → n_obs_max=2 slots filled by prediction
-        snapshots → static obstacles dropped → collision risk.
+        Tracking is canonical (1 msg per real obstacle). For each tracked
+        obstacle, attach the GP prediction's full N-timestep (s, d) sequence
+        as a sidecar so downstream consumers (NLP / corridor / bubble) see
+        the actual time-varying trajectory instead of constant vs/vd
+        propagation. See HJ_docs/phase_specs/phase1_obstacle_horizon_spec_*.
 
-        Fix: tracking is canonical source (1 msg per real obstacle).
-        For each tracked obstacle:
-          - find the prediction msg with (s, d) closest to (t.s, t.d)
-            AND smallest stamp (= timestep 0 of that opponent's sequence)
-          - if matched: copy vs / vd / vs_var / vd_var onto the tracked
-            obstacle (so solver gets propagation info), mark dynamic
-          - if no match: treat as static (vs=vd=0)
-        Result: 1 entry per real obstacle. Static + dynamic coexist
-        cleanly within n_obs_max slots.
+        Sidecar attributes attached to each returned Obstacle:
+          ._horizon_s_seq:    np.ndarray (N+1,) timestep-별 s_center
+          ._horizon_d_seq:    np.ndarray (N+1,) timestep-별 d_center
+          ._horizon_conf_seq: np.ndarray (N+1,) prediction 신뢰도
+                              (1.0 within GP horizon, decay for tail).
+
+        Existing attributes (vs, vd, vs_var, vd_var, is_static, size,
+        s_center, d_center, x_m, y_m) are preserved for backward
+        compatibility — the rest of the codebase keeps working unchanged.
+        Static obstacles get s_seq / d_seq filled with current (s, d)
+        repeated N+1 times.
+
+        Assumption: prediction publisher emits N Obstacle msgs per
+        opponent in a single ObstacleArray (id = timestep idx 0..N-1).
+        Multi-opponent grouping is left as a future extension; current
+        code groups all prediction msgs into one trajectory anchored to
+        the closest tracked obstacle.
         """
         pred_fresh = (self._is_fresh(self._obs_predict_t)
                       and self._obs_predict is not None
@@ -891,9 +924,17 @@ class MPCPlannerStateNode:
         track_fresh = (self._is_fresh(self._obs_track_t)
                        and self._obs_track is not None
                        and len(self._obs_track.obstacles) > 0)
+
+        N_plus_1 = self.N + 1
+        tl = float(self.track_length) if self.track_length else 1e6
+        tail_decay = float(getattr(
+            self, '_pred_tail_confidence_decay', 0.5))
+
         if not track_fresh:
-            # No tracking — fall back to legacy behaviour: emit prediction
-            # if available, dedup by (s,d) bucket. Won't see static-only.
+            # No tracking — fall back to legacy behaviour. We can't attach
+            # full sidecar here (no canonical obstacle id), so leave the
+            # output as-is; _build_obstacle_array_frenet will detect the
+            # missing sidecar and fall back to vs/vd propagation.
             if not pred_fresh:
                 return [], 'none'
             out = []
@@ -906,51 +947,84 @@ class MPCPlannerStateNode:
                 out.append(p)
             return out, 'pred-only:%d' % len(out)
 
+        # Build the prediction sequence (timestep-ordered list of Obstacle
+        # msgs). Sort by id (timestep idx) when available, fallback to the
+        # publish order. Currently treats all prediction msgs as a single
+        # opponent's trajectory — extend for multi-opponent later.
+        pred_seq = []
+        if pred_fresh:
+            pred_seq = sorted(self._obs_predict.obstacles,
+                              key=lambda p: (int(getattr(p, 'id', 0) or 0),
+                                              float(p.s_center)))
+
         ### Tracking-anchored loop
         out = []
-        tl = float(self.track_length) if self.track_length else 1e6
         n_matched = 0
         for t in self._obs_track.obstacles:
-            match = None
-            best_score = float('inf')
-            best_stamp = None
-            if pred_fresh:
-                t_s = float(t.s_center)
-                t_d = float(t.d_center)
-                for p in self._obs_predict.obstacles:
-                    ds = abs(float(p.s_center) - t_s)
-                    if ds > 0.5 * tl:
-                        ds = tl - ds
-                    dn = abs(float(p.d_center) - t_d)
-                    # Match if within reasonable thresholds
-                    if ds > 1.5 or dn > 0.5:
-                        continue
-                    # Prefer earliest stamp (= timestep 0 of opponent's seq)
-                    p_stamp = (p.header.stamp.to_sec()
-                               if hasattr(p, 'header') else 0.0)
-                    score = ds + 2.0 * dn  # weighted distance
-                    if (score < best_score
-                            or (abs(score - best_score) < 0.05
-                                and (best_stamp is None
-                                     or p_stamp < best_stamp))):
-                        best_score = score
-                        best_stamp = p_stamp
-                        match = p
-            if match is not None:
-                # Use TRACKED obstacle as canonical, attach prediction info.
-                # Copy by attribute (Obstacle msg is mutable).
+            t_s = float(t.s_center)
+            t_d = float(t.d_center)
+
+            # Match: prediction sequence's timestep 0 closest to tracked.
+            matched_seq = None
+            if pred_seq:
+                anchor = pred_seq[0]
+                ds = abs(float(anchor.s_center) - t_s)
+                if ds > 0.5 * tl:
+                    ds = tl - ds
+                dn = abs(float(anchor.d_center) - t_d)
+                if ds <= 1.5 and dn <= 0.5:
+                    matched_seq = pred_seq
+
+            if matched_seq is not None:
+                # Build (N+1,) (s, d) sequence. For k < M use GP raw; for
+                # k >= M extrapolate at vs/vd from the LAST predicted
+                # point so the obstacle keeps moving past prediction
+                # horizon (HJ 2026-05-02 fix: hold-last froze the obstacle
+                # at t_pred=0.5s while NLP horizon is ~1.0s, causing
+                # side_decider/NLP disagreement and toggling).
+                M = len(matched_seq)
+                s_seq = np.zeros(N_plus_1, dtype=np.float64)
+                d_seq = np.zeros(N_plus_1, dtype=np.float64)
+                conf_seq = np.zeros(N_plus_1, dtype=np.float64)
+                # Tail extrapolation velocity: prefer last-step finite-difference
+                # over the matched_seq's static vs/vd field (which is timestep-0
+                # value, not the trajectory's local rate).
+                if M >= 2:
+                    tail_vs = (float(matched_seq[M - 1].s_center)
+                               - float(matched_seq[M - 2].s_center)) / max(self.dT, 1e-3)
+                    tail_vd = (float(matched_seq[M - 1].d_center)
+                               - float(matched_seq[M - 2].d_center)) / max(self.dT, 1e-3)
+                else:
+                    tail_vs = float(matched_seq[0].vs)
+                    tail_vd = float(matched_seq[0].vd)
+                for k in range(N_plus_1):
+                    if k < M:
+                        s_seq[k] = float(matched_seq[k].s_center)
+                        d_seq[k] = float(matched_seq[k].d_center)
+                        conf_seq[k] = 1.0
+                    else:
+                        dt_tail = (k - (M - 1)) * self.dT
+                        s_seq[k] = (float(matched_seq[M - 1].s_center)
+                                    + tail_vs * dt_tail)
+                        d_seq[k] = (float(matched_seq[M - 1].d_center)
+                                    + tail_vd * dt_tail)
+                        conf_seq[k] = tail_decay
+                # Backward-compat scalars (existing code uses these).
                 try:
-                    t.vs = float(match.vs)
-                    t.vd = float(match.vd)
-                    t.vs_var = float(getattr(match, 'vs_var', 0.0) or 0.0)
-                    t.vd_var = float(getattr(match, 'vd_var', 0.0) or 0.0)
+                    t.vs = float(matched_seq[0].vs)
+                    t.vd = float(matched_seq[0].vd)
+                    t.vs_var = float(getattr(matched_seq[0], 'vs_var', 0.0) or 0.0)
+                    t.vd_var = float(getattr(matched_seq[0], 'vd_var', 0.0) or 0.0)
                     if abs(t.vs) > 0.05 or abs(t.vd) > 0.05:
                         t.is_static = False
                 except Exception:
                     pass
                 n_matched += 1
             else:
-                # Tracked obs without prediction → static (or stale).
+                # No prediction match → treat as static, hold (s, d).
+                s_seq = np.full(N_plus_1, t_s, dtype=np.float64)
+                d_seq = np.full(N_plus_1, t_d, dtype=np.float64)
+                conf_seq = np.full(N_plus_1, 1.0, dtype=np.float64)
                 try:
                     t.vs = 0.0
                     t.vd = 0.0
@@ -959,8 +1033,15 @@ class MPCPlannerStateNode:
                     t.is_static = True
                 except Exception:
                     pass
-            out.append(t)
-        tag = 'tanchor:T%d+P%d' % (len(out), n_matched)
+
+            # Wrap the Obstacle msg with sidecar sequences. Obstacle msg
+            # has __slots__ → cannot attach attrs directly. _ObsWithHorizon
+            # delegates all other attribute access (vs, vd, is_static,
+            # s_center, ...) to the underlying msg so existing code keeps
+            # working unchanged.
+            out.append(_ObsWithHorizon(t, s_seq, d_seq, conf_seq))
+
+        tag = 'tanchor_seq:T%d+P%d' % (len(out), n_matched)
         return out, tag
 
     def _extrapolate_obs_traj(self, obs, N, dT):
@@ -1137,10 +1218,34 @@ class MPCPlannerStateNode:
             is_static_flag = bool(o.is_static or abs(o.vs) < 1e-3)
             self._obs_static_arr[n_used] = is_static_flag
             ### HJ : end
-            if is_static_flag:
+
+            ### HJ : 2026-05-02 (Phase 1) — use horizon sequence sidecar.
+            ###      _merge_obs_sources attaches _horizon_s_seq / _horizon_d_seq
+            ###      with N+1 timestep-별 (s, d) from GP prediction (constant
+            ###      vs/vd extrapolation deprecated). Sidecar is None when
+            ###      tracking dropped — fall back to legacy propagation in
+            ###      that case to preserve safety baseline.
+            seq_s = getattr(o, '_horizon_s_seq', None)
+            seq_d = getattr(o, '_horizon_d_seq', None)
+            if seq_s is not None and seq_d is not None and len(seq_s) >= N_plus_1:
+                # ### HJ : 2026-05-02 — per-timestep s unwrap (lap boundary fix).
+                # prediction msg 의 s_center 는 modulo track_length 로 publish 됨.
+                # sequence 가 lap 경계 넘으면 wrap 발생 — 통째 s_offset 으로는
+                # 처리 불가 (각 timestep 이 다른 modulo 도메인). 매 timestep
+                # 별로 ego_s 의 ±tl/2 도메인으로 unwrap.
+                for k in range(N_plus_1):
+                    s_k = float(seq_s[k])
+                    while s_k - ego_s > 0.5 * tl:
+                        s_k -= tl
+                    while s_k - ego_s < -0.5 * tl:
+                        s_k += tl
+                    obs_arr[n_used, k, 0] = s_k
+                    obs_arr[n_used, k, 1] = float(seq_d[k])
+            elif is_static_flag:
                 obs_arr[n_used, :, 0] = s0
                 obs_arr[n_used, :, 1] = d0
             else:
+                # Legacy fallback: vs/vd constant propagation (sidecar absent).
                 vs = float(o.vs)
                 vd = float(o.vd)
                 for k in range(N_plus_1):
@@ -4441,18 +4546,34 @@ class MPCPlannerStateNode:
                 pass
 
         # ---- obstacles: extract slot[0] (closest tick) per active slot -----
+        # ### HJ : 2026-05-02 (Phase 1) — extended fields:
+        #   's_seq', 'n_seq': N+1 timestep-별 (s, n) — Phase 1 sequence verify.
+        #   'midN_s', 'midN_n': halfway timestep — quick 시계열 비교용.
+        # constant vs/vd 외삽이라면 's0'..'sN' 가 정확히 선형. GP sequence
+        # 라면 곡률 / 가속 변화가 보임. 분석 스크립트가 이 fields 사용.
         obs_list = []
         if obs_arr is not None:
             try:
+                N_p1 = obs_arr.shape[1]
+                mid_idx = max(N_p1 // 2, 1)
                 for o in range(obs_arr.shape[0]):
                     w_ts = obs_arr[o, :, 2]
                     if float(np.max(w_ts)) <= 0.0:
                         continue
+                    s_seq_raw = [float(x) for x in obs_arr[o, :, 0]]
+                    n_seq_raw = [float(x) for x in obs_arr[o, :, 1]]
                     obs_list.append({
-                        's0': float(obs_arr[o, 0, 0]),
-                        'n0': float(obs_arr[o, 0, 1]),
-                        'sN': float(obs_arr[o, -1, 0]),
-                        'nN': float(obs_arr[o, -1, 1]),
+                        's0': s_seq_raw[0],
+                        'n0': n_seq_raw[0],
+                        'sN': s_seq_raw[-1],
+                        'nN': n_seq_raw[-1],
+                        'midN_s': s_seq_raw[mid_idx],
+                        'midN_n': n_seq_raw[mid_idx],
+                        # Down-sample to ~6 points to keep tick_json size bounded.
+                        's_seq': [round(s_seq_raw[k], 4)
+                                  for k in range(0, N_p1, max(N_p1 // 6, 1))],
+                        'n_seq': [round(n_seq_raw[k], 4)
+                                  for k in range(0, N_p1, max(N_p1 // 6, 1))],
                         'w': float(np.max(w_ts)),
                     })
             except Exception:
@@ -4591,6 +4712,8 @@ class MPCPlannerStateNode:
             ### HJ : 2026-04-28 — expose plan name in tick_json for analysis.
             'plan': (self._last_plan.get('name')
                      if getattr(self, '_last_plan', None) else None),
+            ### HJ : 2026-05-02 (Phase 1) — obstacle horizon source verification.
+            'obs_horizon_source': str(obs_tag),  # 'tanchor_seq:T?+P?' if Phase 1 active
         }
 
         try:

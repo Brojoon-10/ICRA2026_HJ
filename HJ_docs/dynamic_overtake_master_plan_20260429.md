@@ -3,7 +3,10 @@
 > **Scope**: 동적 장애물만 우선 (정적 나중). 휙휙 토글하는 reactive 가 아닌, **prediction 정보 정확히 활용** + **multi-tick strategic intent** + **명시적 safety buffer** + **충돌 절대 X** 의 architecture.
 > **상태**: 작성 중. 사용자 검토 후 단계별 구현 진입.
 >
-> **이 문서가 단일 source of truth**. 진행 중 결정 / 변경은 모두 여기에 반영. 코드의 임시 patch (continuity blend, sticky tweak 등) 와 별개로 본 plan 의 layer / contract 가 우선.
+> **이 문서가 단기 안전 baseline 의 단일 source of truth** (Phase 0~6).
+> **상위 비전 / 본질 설계는 [`strategic_overtake_vision_20260501.md`](strategic_overtake_vision_20260501.md)** (Phase 7~11, 마감 무관 strategic engagement). 본 plan 의 Phase 1~6 가 baseline 이고, 그 위에 vision 문서의 strategic layer 가 얹힘. 단기 baseline 이 만들어지기 전에 strategic layer 만 쌓으면 안전 보장 깨짐.
+>
+> 진행 중 결정 / 변경은 본 plan + vision 두 문서에 반영. 코드의 임시 patch (continuity blend, sticky tweak 등) 와 별개로 plan 의 layer / contract 가 우선.
 
 ---
 

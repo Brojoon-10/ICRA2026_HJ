@@ -32,4 +32,5 @@
     <param name="fitter_script"
            value="$(find stack_master)/scripts/fit_steering_poly.py"/>
   </node>
+  
 </launch>

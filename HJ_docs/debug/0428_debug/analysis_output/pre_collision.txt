@@ -1,0 +1,335 @@
+Pre-collision window 518.0-521.5: 94 ticks
+
+========== TIMELINE (every tick) ==========
+      t   ego_s   ego_n ego_v  side pass tier          ipopt          reason d_free_L d_free_R                           obs1                           obs2
+518.024    0.12  -0.474  1.85 clear    1    0 Solve_Succeede only_right_fits   -0.212   +0.521      s=61.11,n=+0.016,sN=62.56      s=69.95,n=-0.164,sN=69.95
+518.075    0.20  -0.485  1.87 clear    1    0 Solve_Succeede only_right_fits   -0.236   +0.597      s=43.18,n=+0.036,sN=44.65      s=51.97,n=-0.164,sN=51.97
+518.092    0.22  -0.484  1.84 clear    1    0 Solve_Succeede only_right_fits   -0.421   +0.573      s=30.65,n=+0.051,sN=32.12      s=39.38,n=-0.164,sN=39.38
+518.109    0.26  -0.488  1.84 clear    1    0 Solve_Succeede    no_side_fits   +0.046   +0.079      s=21.87,n=+0.062,sN=23.35      s=30.57,n=-0.164,sN=30.57
+518.177    0.37  -0.490  1.88 clear    1    0 Solve_Succeede  only_left_fits   +0.238   +0.119      s=15.77,n=+0.060,sN=17.26      s=24.40,n=-0.164,sN=24.40
+518.211    0.43  -0.490  1.92 clear    1    0 Solve_Succeede only_right_fits   -0.343   +0.415      s=11.52,n=+0.066,sN=13.02      s=20.08,n=-0.164,sN=20.08
+518.228    0.49  -0.486  1.92 clear    1    0 Solve_Succeede only_right_fits   -0.160   +0.228       s=8.54,n=+0.070,sN=10.05      s=17.06,n=-0.164,sN=17.06
+518.262    0.50  -0.485  1.92 clear    1    0 Solve_Succeede  only_left_fits   +0.207   -0.093        s=6.47,n=+0.074,sN=7.99      s=14.94,n=-0.164,sN=14.94
+518.296    0.50  -0.485  1.95 clear    1    0 Solve_Succeede  only_left_fits   +0.353   -0.230        s=5.02,n=+0.068,sN=6.54      s=13.46,n=-0.164,sN=13.46
+518.313    0.61  -0.479  1.95 clear    1    0 Solve_Succeede  only_left_fits   +0.356   -0.190        s=4.03,n=+0.060,sN=5.56      s=12.42,n=-0.164,sN=12.42
+518.330    0.61  -0.479  1.95 clear    1    0 Solve_Succeede  only_left_fits   +0.287   -0.099        s=3.34,n=+0.068,sN=4.88      s=11.70,n=-0.164,sN=11.70
+518.381    0.69  -0.472  1.97 clear    1    0 Solve_Succeede  only_left_fits   +0.190   -0.022        s=2.89,n=+0.076,sN=4.43      s=11.19,n=-0.164,sN=11.19
+518.415    0.69  -0.472  1.98 clear    1    0 Solve_Succeede    no_side_fits   +0.113   +0.021        s=2.58,n=+0.071,sN=4.14      s=10.83,n=-0.164,sN=10.83
+518.466    0.80  -0.465  1.97 clear    1    0 Solve_Succeede    no_side_fits   +0.071   +0.035        s=2.39,n=+0.054,sN=3.97      s=10.59,n=-0.164,sN=10.59
+518.500    0.80  -0.465  1.98 trail    1    0 Solve_Succeede    no_side_fits   +0.027   +0.058        s=2.27,n=+0.055,sN=3.86      s=10.41,n=-0.164,sN=10.41
+518.500    0.86  -0.458  1.98 trail    1    0 Solve_Succeede    no_side_fits   -0.001   +0.072        s=2.20,n=+0.055,sN=3.80      s=10.29,n=-0.164,sN=10.29
+518.551    0.97  -0.446  2.05 trail    1    0 Solve_Succeede    no_side_fits   -0.008   +0.073        s=2.16,n=+0.049,sN=3.78      s=10.20,n=-0.164,sN=10.20
+518.585    0.97  -0.446  2.05 trail    1    0 Solve_Succeede    no_side_fits   -0.013   +0.073        s=2.14,n=+0.044,sN=3.76      s=10.14,n=-0.164,sN=10.14
+518.619    1.05  -0.439  2.09 trail    1    0 Solve_Succeede    no_side_fits   -0.008   +0.071        s=2.15,n=+0.044,sN=3.79      s=10.10,n=-0.164,sN=10.10
+518.636    1.11  -0.430  2.09 trail    1    0 Solve_Succeede    no_side_fits   +0.008   +0.059        s=2.17,n=+0.036,sN=3.81      s=10.07,n=-0.164,sN=10.07
+518.704    1.16  -0.421  2.10 trail    1    0 Solve_Succeede    no_side_fits   +0.007   +0.068        s=2.21,n=+0.053,sN=3.87      s=10.05,n=-0.164,sN=10.05
+518.721    1.23  -0.411  2.12 trail    1    0 Solve_Succeede    no_side_fits   +0.006   +0.073        s=2.24,n=+0.064,sN=3.90      s=10.04,n=-0.164,sN=10.04
+518.789    1.34  -0.402  2.12 trail    1    0 Solve_Succeede    no_side_fits   +0.025   +0.063        s=2.29,n=+0.064,sN=3.97      s=10.03,n=-0.164,sN=10.03
+518.823    1.34  -0.402  2.19 trail    1    0 Solve_Succeede    no_side_fits   +0.042   +0.059        s=2.36,n=+0.074,sN=4.07      s=10.02,n=-0.164,sN=10.02
+518.840    1.44  -0.389  2.19 trail    1    0 Solve_Succeede    no_side_fits   +0.050   +0.060        s=2.42,n=+0.084,sN=4.13      s=10.02,n=-0.164,sN=10.02
+518.857    1.50  -0.379  2.20 trail    1    0 Solve_Succeede    no_side_fits   +0.051   +0.066        s=2.47,n=+0.099,sN=4.19      s=10.01,n=-0.164,sN=10.01
+518.874    1.50  -0.379  2.20 trail    1    0 Solve_Succeede    no_side_fits   +0.075   +0.049        s=2.51,n=+0.087,sN=4.24      s=10.01,n=-0.164,sN=10.01
+518.925    1.50  -0.379  2.20 trail    1    0 Solve_Succeede    no_side_fits   +0.090   +0.037        s=2.53,n=+0.079,sN=4.27      s=10.01,n=-0.164,sN=10.01
+518.993    1.54  -0.369  2.24 trail    1    0 Solve_Succeede    no_side_fits   +0.111   +0.023        s=2.59,n=+0.073,sN=4.34      s=10.01,n=-0.164,sN=10.01
+519.027    1.69  -0.346  2.31 trail    1    0 Solve_Succeede    no_side_fits   +0.123   +0.020        s=2.65,n=+0.079,sN=4.42      s=10.01,n=-0.164,sN=10.01
+519.027    1.69  -0.346  2.31 trail    1    0 Solve_Succeede    no_side_fits   +0.143   +0.006        s=2.69,n=+0.072,sN=4.48      s=10.01,n=-0.164,sN=10.01
+519.044    1.74  -0.333  2.31 trail    1    0 Solve_Succeede    no_side_fits   +0.151   +0.003        s=2.73,n=+0.076,sN=4.54      s=10.01,n=-0.164,sN=10.01
+519.078    1.74  -0.333  2.33 trail    1    0 Solve_Succeede    no_side_fits   +0.177   -0.016        s=2.80,n=+0.066,sN=4.61      s=10.01,n=-0.164,sN=10.01
+519.146    1.93  -0.299  2.37 trail    1    0 Solve_Succeede    no_side_fits   +0.207   -0.042        s=2.86,n=+0.051,sN=4.69      s=10.00,n=-0.164,sN=10.00
+519.163    1.93  -0.299  2.38 trail    1    0 Solve_Succeede    no_side_fits   +0.208   -0.038        s=2.91,n=+0.065,sN=4.76      s=10.00,n=-0.164,sN=10.00
+519.197    2.16  -0.245  2.39 trail    1    0 Solve_Succeede    no_side_fits   +0.217   -0.043        s=2.99,n=+0.073,sN=4.86      s=10.00,n=-0.164,sN=10.00
+519.248    2.16  -0.244  2.40 trail    1    0 Solve_Succeede    no_side_fits   +0.223   -0.045        s=3.07,n=+0.083,sN=4.96      s=10.00,n=-0.164,sN=10.00
+519.282    2.26  -0.220  2.45 trail    1    0 Solve_Succeede    no_side_fits   +0.226   -0.045        s=3.11,n=+0.089,sN=5.01      s=10.00,n=-0.164,sN=10.00
+519.299    2.26  -0.220  2.47 trail    1    0 Solve_Succeede    no_side_fits   +0.235   -0.053        s=3.17,n=+0.091,sN=5.09      s=10.00,n=-0.164,sN=10.00
+519.333    2.44  -0.182  2.57 trail    1    0 Solve_Succeede    no_side_fits   +0.245   -0.061        s=3.24,n=+0.092,sN=5.18      s=10.00,n=-0.164,sN=10.00
+519.333    2.44  -0.182  2.57 trail    1    0 Solve_Succeede    no_side_fits   +0.253   -0.066        s=3.28,n=+0.093,sN=5.24      s=10.00,n=-0.164,sN=10.00
+519.401    2.54  -0.158  2.56 trail    1    0 Solve_Succeede    no_side_fits   +0.262   -0.074        s=3.35,n=+0.094,sN=5.33      s=10.00,n=-0.164,sN=10.00
+519.418    2.68  -0.126  2.64 trail    1    0 Solve_Succeede    no_side_fits   +0.267   -0.080        s=3.41,n=+0.096,sN=5.40      s=10.00,n=-0.164,sN=10.00
+519.469    2.72  -0.117  2.67 trail    1    0 Solve_Succeede    no_side_fits   +0.276   -0.090        s=3.48,n=+0.096,sN=5.49      s=10.00,n=-0.164,sN=10.00
+519.486    2.90  -0.077  2.71 trail    1    0 Solve_Succeede    no_side_fits   +0.285   -0.099        s=3.55,n=+0.095,sN=5.58      s=10.00,n=-0.164,sN=10.00
+519.520    2.96  -0.065  2.77 trail    1    0 Solve_Succeede    no_side_fits   +0.286   -0.100        s=3.59,n=+0.098,sN=5.63      s=10.00,n=-0.164,sN=10.00
+519.554    2.96  -0.065  2.83 trail    1    0 Solve_Succeede    no_side_fits   +0.291   -0.108        s=3.64,n=+0.097,sN=5.70      s=10.00,n=-0.164,sN=10.00
+519.605    3.12  -0.034  2.84 trail    1    0 Solve_Succeede    no_side_fits   +0.285   -0.105        s=3.71,n=+0.109,sN=5.80      s=10.00,n=-0.164,sN=10.00
+519.639    3.24  -0.010  2.89 trail    1    0 Solve_Succeede    no_side_fits   +0.294   -0.116        s=3.79,n=+0.106,sN=5.89      s=10.00,n=-0.164,sN=10.00
+519.639    3.24  -0.010  2.89 trail    1    0 Solve_Succeede    no_side_fits   +0.305   -0.131        s=3.85,n=+0.099,sN=5.98      s=10.00,n=-0.164,sN=10.00
+519.690    3.36  +0.012  2.98 trail    1    0 Solve_Succeede    no_side_fits   +0.317   -0.146        s=3.93,n=+0.092,sN=6.07      s=10.00,n=-0.164,sN=10.00
+519.741    3.52  +0.038  2.99 trail    1    0 Solve_Succeede    no_side_fits   +0.329   -0.161        s=4.00,n=+0.084,sN=6.16      s=10.00,n=-0.164,sN=10.00
+519.758    3.52  +0.038  2.99 trail    1    0 Solve_Succeede    no_side_fits   +0.331   -0.165        s=4.04,n=+0.085,sN=6.21      s=10.00,n=-0.164,sN=10.00
+519.792    3.63  +0.056  3.05 trail    1    0 Solve_Succeede    no_side_fits   +0.336   -0.173        s=4.08,n=+0.082,sN=6.27      s=10.00,n=-0.164,sN=10.00 <COLL
+519.809    3.68  +0.063  3.08 trail    1    0 Solve_Succeede    no_side_fits   +0.319   -0.157        s=4.14,n=+0.103,sN=6.34      s=10.00,n=-0.164,sN=10.00 <COLL
+519.860    3.81  +0.083  3.08 trail    1    0 Solve_Succeede    no_side_fits   +0.308   -0.149        s=4.19,n=+0.115,sN=6.41      s=10.00,n=-0.164,sN=10.00 <COLL
+519.894    3.93  +0.100  3.10 trail    1    0 Solve_Succeede    no_side_fits   +0.304   -0.149        s=4.26,n=+0.121,sN=6.50      s=10.00,n=-0.164,sN=10.00
+519.928    3.93  +0.101  3.11 trail    1    0 Solve_Succeede    no_side_fits   +0.306   -0.156        s=4.35,n=+0.122,sN=6.62      s=10.00,n=-0.164,sN=10.00
+519.945    4.08  +0.123  3.19 trail    1    0 Solve_Succeede    no_side_fits   +0.310   -0.164        s=4.42,n=+0.119,sN=6.71      s=10.00,n=-0.164,sN=10.00
+519.996    4.30  +0.154  3.20 trail    1    0 Solve_Succeede    no_side_fits   +0.313   -0.171        s=4.50,n=+0.118,sN=6.81      s=10.00,n=-0.164,sN=10.00
+520.030    4.30  +0.154  3.28 trail    1    0 Solve_Succeede    no_side_fits   +0.325   -0.187        s=4.57,n=+0.107,sN=6.89      s=10.00,n=-0.164,sN=10.00
+520.047    4.36  +0.163  3.33 trail    1    0 Solve_Succeede    no_side_fits   +0.328   -0.194        s=4.63,n=+0.103,sN=6.96      s=10.00,n=-0.164,sN=10.00
+520.081    4.36  +0.163  3.35 trail    1    0 Solve_Succeede    no_side_fits   +0.330   -0.198        s=4.67,n=+0.101,sN=7.02      s=10.00,n=-0.164,sN=10.00
+520.132    4.78  +0.212  3.44 trail    1    0 Solve_Succeede    no_side_fits   +0.330   -0.201        s=4.76,n=+0.099,sN=7.13      s=10.00,n=-0.164,sN=10.00
+520.166    4.90  +0.222  3.45 trail    1    0 Solve_Succeede    no_side_fits   +0.325   -0.197        s=4.84,n=+0.102,sN=7.24      s=10.00,n=-0.164,sN=10.00
+520.183    4.90  +0.222  3.50 trail    1    0 Solve_Succeede    no_side_fits   +0.307   -0.181        s=4.91,n=+0.118,sN=7.31      s=10.00,n=-0.164,sN=10.00
+520.217    5.07  +0.231  3.55 trail    1    0 Solve_Succeede    no_side_fits   +0.288   -0.164        s=4.98,n=+0.135,sN=7.40      s=10.00,n=-0.164,sN=10.00
+520.251    5.19  +0.235  3.55 trail    1    0 Solve_Succeede    no_side_fits   +0.290   -0.167        s=5.07,n=+0.130,sN=7.51      s=10.00,n=-0.164,sN=10.00
+520.302    5.41  +0.238  3.64 trail    1    0 Solve_Succeede    no_side_fits   +0.295   -0.175        s=5.16,n=+0.120,sN=7.62      s=10.00,n=-0.164,sN=10.00
+520.353    5.53  +0.237  3.79 trail    1    0 Solve_Succeede    no_side_fits   +0.307   -0.189        s=5.26,n=+0.103,sN=7.75      s=10.00,n=-0.164,sN=10.00
+520.387    5.61  +0.236  3.79 trail    1    0 Solve_Succeede    no_side_fits   +0.305   -0.190        s=5.34,n=+0.099,sN=7.85      s=10.00,n=-0.164,sN=10.00
+520.387    5.77  +0.234  3.96 trail    1    0 Solve_Succeede    no_side_fits   +0.288   -0.174        s=5.43,n=+0.110,sN=7.95      s=10.00,n=-0.164,sN=10.00
+520.421    5.77  +0.234  3.97 trail    1    0 Solve_Succeede    no_side_fits   +0.276   -0.163        s=5.50,n=+0.117,sN=8.04      s=10.00,n=-0.164,sN=10.00
+520.472    6.00  +0.229  4.02 trail    1    0 Solve_Succeede    no_side_fits   +0.265   -0.153        s=5.59,n=+0.120,sN=8.15      s=10.00,n=-0.164,sN=10.00
+520.489    6.00  +0.229  4.09 trail    1    0 Solve_Succeede    no_side_fits   +0.257   -0.145        s=5.66,n=+0.122,sN=8.23      s=10.00,n=-0.164,sN=10.00
+520.540    6.20  +0.226  4.09 trail    1    0 Solve_Succeede    no_side_fits   +0.234   -0.123        s=5.73,n=+0.139,sN=8.32      s=10.00,n=-0.164,sN=10.00
+520.557    6.34  +0.223  4.14 trail    1    0 Solve_Succeede    no_side_fits   +0.229   -0.119        s=5.81,n=+0.136,sN=8.41      s=10.00,n=-0.164,sN=10.00
+520.625    6.62  +0.221  4.24 trail    1    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=5.90,n=+0.133,sN=8.52      s=10.00,n=-0.164,sN=10.79
+520.625    6.80  +0.223  4.24 trail    1    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=5.98,n=+0.120,sN=8.61      s=10.00,n=-0.164,sN=11.33
+520.659    6.80  +0.223  4.41 trail    1    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=6.07,n=+0.126,sN=8.71      s=10.00,n=-0.164,sN=11.71
+520.693    7.07  +0.228  4.46 trail    1    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=6.16,n=+0.154,sN=8.81      s=10.00,n=-0.164,sN=11.97
+520.710    7.10  +0.229  4.55 trail    1    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=6.24,n=+0.164,sN=8.90      s=10.00,n=-0.164,sN=12.15
+520.778    7.33  +0.233  4.58 trail    1    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=6.30,n=+0.172,sN=8.97      s=10.00,n=-0.164,sN=12.27
+520.795    7.38  +0.234  4.58 trail    1    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=6.39,n=+0.175,sN=9.07      s=10.00,n=-0.164,sN=12.35
+520.812    7.60  +0.236  4.68 trail    1    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=6.47,n=+0.182,sN=9.16      s=10.00,n=-0.164,sN=12.39
+520.829    7.68  +0.236  4.70 trail    1    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=6.56,n=+0.191,sN=9.25      s=10.00,n=-0.164,sN=12.42
+520.931    7.79  +0.235  4.49 right    2    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=6.64,n=+0.184,sN=9.35      s=10.00,n=-0.164,sN=12.44
+521.016    8.34  +0.204  4.34 right    2    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=6.79,n=+0.194,sN=9.50      s=10.00,n=-0.164,sN=12.44
+521.084    8.44  +0.193  4.21 right    2    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=6.93,n=+0.185,sN=9.64      s=10.00,n=-0.164,sN=12.42
+521.186    8.69  +0.161  3.93 right    2    0 Solve_Succeede only_right_fits   -0.192   +0.159        s=7.11,n=+0.173,sN=9.83      s=10.00,n=-0.164,sN=12.39
+521.220    9.18  +0.083  3.89 right    2    0 Solve_Succeede    no_side_fits   -0.192   +0.159       s=7.34,n=+0.175,sN=10.05      s=10.00,n=-0.164,sN=12.35
+521.322    9.38  +0.057  0.02 right    2    0 Solve_Succeede    no_side_fits   -0.192   +0.159       s=7.54,n=+0.183,sN=10.24      s=10.00,n=-0.164,sN=12.33
+521.390    9.45  +0.184  0.00 trail    0    1 Infeasible_Pro    no_side_fits   -0.192   +0.159       s=7.75,n=+0.193,sN=10.44      s=10.00,n=-0.164,sN=12.32
+521.424    9.45  +0.180  0.08 trail    0    1 Infeasible_Pro    no_side_fits   -0.192   +0.159       s=7.96,n=+0.204,sN=10.63      s=10.00,n=-0.164,sN=12.31
+
+========== COLLISION ZONE (ego_s 8-10) ==========
+Looking for the tick where ego is just before/at obstacle id100 (s=9.8 d=-0.16):
+
+t=521.016 ego_s=8.34 ego_n=+0.204 ego_v=4.34
+  side=right pass=2 tier=0 ipopt=Solve_Succeeded sph=[P1=Infea(fail,corridor_upper); P2=Solve(ok,)]
+  solver_input: n0=+0.204 v0=4.43 vmax_min=2.31 corridor_min=0.931 nlb=[-0.879,-0.620] nub=[+0.456,+0.543]
+  obstacles(2): ['s=6.79,n=+0.194,sN=9.50,nN=+0.194', 's=10.00,n=-0.164,sN=12.44,nN=-0.164']
+  trajectory: n_min=-0.000 n_max=+0.204 n_end=+0.195 margin_L=0.389 margin_R=1.124
+  side_scores: d_free_L=-0.192 d_free_R=+0.159 reason=only_right_fits dv=2.07 v_obs=2.43 can_pass_L_corr=False can_pass_R_corr=True
+
+t=521.084 ego_s=8.44 ego_n=+0.193 ego_v=4.21
+  side=right pass=2 tier=0 ipopt=Solve_Succeeded sph=[P1=Infea(fail,corridor_upper); P2=Solve(ok,)]
+  solver_input: n0=+0.193 v0=4.34 vmax_min=2.30 corridor_min=0.931 nlb=[-0.879,-0.637] nub=[+0.436,+0.543]
+  obstacles(2): ['s=6.93,n=+0.185,sN=9.64,nN=+0.185', 's=10.00,n=-0.164,sN=12.42,nN=-0.164']
+  trajectory: n_min=+0.005 n_max=+0.265 n_end=+0.265 margin_L=0.392 margin_R=1.130
+  side_scores: d_free_L=-0.192 d_free_R=+0.159 reason=only_right_fits dv=2.09 v_obs=2.42 can_pass_L_corr=False can_pass_R_corr=True
+
+t=521.186 ego_s=8.69 ego_n=+0.161 ego_v=3.93
+  side=right pass=2 tier=0 ipopt=Solve_Succeeded sph=[P1=Infea(fail,corridor_upper); P2=Solve(ok,)]
+  solver_input: n0=+0.161 v0=4.21 vmax_min=2.27 corridor_min=0.931 nlb=[-0.879,-0.685] nub=[+0.379,+0.627]
+  obstacles(2): ['s=7.11,n=+0.173,sN=9.83,nN=+0.173', 's=10.00,n=-0.164,sN=12.39,nN=-0.164']
+  trajectory: n_min=+0.004 n_max=+0.344 n_end=+0.344 margin_L=0.396 margin_R=1.133
+  side_scores: d_free_L=-0.192 d_free_R=+0.159 reason=only_right_fits dv=2.12 v_obs=2.39 can_pass_L_corr=False can_pass_R_corr=True
+
+t=521.220 ego_s=9.18 ego_n=+0.083 ego_v=3.89
+  side=right pass=2 tier=0 ipopt=Solve_Succeeded sph=[P1=Infea(fail,corridor_upper); P2=Solve(ok,)]
+  solver_input: n0=+0.083 v0=3.93 vmax_min=2.23 corridor_min=0.931 nlb=[-0.879,-0.759] nub=[+0.288,+0.711]
+  obstacles(2): ['s=7.34,n=+0.175,sN=10.05,nN=+0.175', 's=10.00,n=-0.164,sN=12.35,nN=-0.164']
+  trajectory: n_min=-0.016 n_max=+0.437 n_end=+0.437 margin_L=0.416 margin_R=1.114
+  side_scores: d_free_L=-0.192 d_free_R=+0.159 reason=no_side_fits dv=2.16 v_obs=2.35 can_pass_L_corr=False can_pass_R_corr=True
+
+t=521.322 ego_s=9.38 ego_n=+0.057 ego_v=0.02
+  side=right pass=2 tier=0 ipopt=Solve_Succeeded sph=[P1=Infea(fail,corridor_upper); P2=Solve(ok,)]
+  solver_input: n0=+0.057 v0=2.95 vmax_min=2.21 corridor_min=0.934 nlb=[-0.879,-0.784] nub=[+0.254,+0.757]
+  obstacles(2): ['s=7.54,n=+0.183,sN=10.24,nN=+0.183', 's=10.00,n=-0.164,sN=12.33,nN=-0.164']
+  trajectory: n_min=+0.009 n_max=+0.557 n_end=+0.557 margin_L=0.392 margin_R=1.136
+  side_scores: d_free_L=-0.192 d_free_R=+0.159 reason=no_side_fits dv=2.18 v_obs=2.33 can_pass_L_corr=False can_pass_R_corr=True
+
+t=521.390 ego_s=9.45 ego_n=+0.184 ego_v=0.00
+  side=trail pass=0 tier=1 ipopt=Infeasible_Problem_Detected sph=[P1=Infea(fail,corridor_upper); P2=Infea(fail,corridor_upper)]
+  solver_input: n0=+0.184 v0=0.02 vmax_min=2.20 corridor_min=0.931 nlb=[-0.879,-0.784] nub=[+0.254,+0.789]
+  obstacles(2): ['s=7.75,n=+0.193,sN=10.44,nN=+0.193', 's=10.00,n=-0.164,sN=12.32,nN=-0.164']
+  trajectory: n_min=+0.008 n_max=+0.553 n_end=+0.553 margin_L=0.391 margin_R=1.136
+  solver_infeas: worst=corridor_upper val=0.0007 k=4 slack_peak=0.555
+  side_scores: d_free_L=-0.192 d_free_R=+0.159 reason=no_side_fits dv=2.20 v_obs=2.31 can_pass_L_corr=False can_pass_R_corr=True
+
+t=521.424 ego_s=9.45 ego_n=+0.180 ego_v=0.08
+  side=trail pass=0 tier=1 ipopt=Infeasible_Problem_Detected sph=[P1=Infea(fail,corridor_upper); P2=Infea(fail,corridor_upper)]
+  solver_input: n0=+0.180 v0=0.01 vmax_min=2.19 corridor_min=0.931 nlb=[-0.879,-0.784] nub=[+0.254,+0.789]
+  obstacles(2): ['s=7.96,n=+0.204,sN=10.63,nN=+0.204', 's=10.00,n=-0.164,sN=12.31,nN=-0.164']
+  trajectory: n_min=+0.008 n_max=+0.553 n_end=+0.553 margin_L=0.391 margin_R=1.136
+  solver_infeas: worst=corridor_upper val=0.0012 k=4 slack_peak=0.012
+  side_scores: d_free_L=-0.192 d_free_R=+0.159 reason=no_side_fits dv=2.21 v_obs=2.30 can_pass_L_corr=False can_pass_R_corr=True
+
+========== SIDE DECISION FLOW (518.0-521.4) ==========
+4 side runs:
+  clear: t=[518.024-518.466] dur=0.44s ticks=14
+  trail: t=[518.500-520.829] dur=2.33s ticks=72
+  right: t=[520.931-521.322] dur=0.39s ticks=6
+  trail: t=[521.390-521.424] dur=0.03s ticks=2
+
+========== JUST BEFORE COLLISION (t=519.5-519.83) ==========
+
+t=519.520 ego s=2.963 n=-0.065 v=2.77 psi=-0.0955
+  side=trail pass=1 tier=0 ipopt=Solve_Succeede
+  trajectory: n_min=-0.065 n_max=+0.259 n_end=+0.259
+  solver_input: nlb=[-0.461,-0.382] nub=[+0.792,+0.931]
+  obstacles:  ['s=3.59,n=+0.098', 's=10.00,n=-0.164']
+  decider: side=trail, reason=no_side_fits, dv=1.71
+
+t=519.554 ego s=2.963 n=-0.065 v=2.83 psi=-0.0704
+  side=trail pass=1 tier=0 ipopt=Solve_Succeede
+  trajectory: n_min=-0.065 n_max=+0.276 n_end=+0.276
+  solver_input: nlb=[-0.461,-0.382] nub=[+0.792,+0.931]
+  obstacles:  ['s=3.64,n=+0.097', 's=10.00,n=-0.164']
+  decider: side=trail, reason=no_side_fits, dv=1.72
+
+t=519.605 ego s=3.116 n=-0.034 v=2.84 psi=-0.0550
+  side=trail pass=1 tier=0 ipopt=Solve_Succeede
+  trajectory: n_min=-0.034 n_max=+0.295 n_end=+0.295
+  solver_input: nlb=[-0.519,-0.367] nub=[+0.813,+0.932]
+  obstacles:  ['s=3.71,n=+0.109', 's=10.00,n=-0.164']
+  decider: side=trail, reason=no_side_fits, dv=1.73
+
+t=519.639 ego s=3.245 n=-0.010 v=2.89 psi=-0.0550
+  side=trail pass=1 tier=0 ipopt=Solve_Succeede
+  trajectory: n_min=-0.010 n_max=+0.316 n_end=+0.316
+  solver_input: nlb=[-0.552,-0.352] nub=[+0.832,+0.932]
+  obstacles:  ['s=3.79,n=+0.106', 's=10.00,n=-0.164']
+  decider: side=trail, reason=no_side_fits, dv=1.75
+
+t=519.639 ego s=3.245 n=-0.010 v=2.89 psi=-0.0329
+  side=trail pass=1 tier=0 ipopt=Solve_Succeede
+  trajectory: n_min=-0.010 n_max=+0.335 n_end=+0.335
+  solver_input: nlb=[-0.552,-0.352] nub=[+0.832,+0.932]
+  obstacles:  ['s=3.85,n=+0.099', 's=10.00,n=-0.164']
+  decider: side=trail, reason=no_side_fits, dv=1.77
+
+t=519.690 ego s=3.362 n=+0.012 v=2.98 psi=-0.0163
+  side=trail pass=1 tier=0 ipopt=Solve_Succeede
+  trajectory: n_min=+0.012 n_max=+0.355 n_end=+0.355
+  solver_input: nlb=[-0.586,-0.325] nub=[+0.862,+0.931]
+  obstacles:  ['s=3.93,n=+0.092', 's=10.00,n=-0.164']
+  decider: side=trail, reason=no_side_fits, dv=1.79
+
+t=519.741 ego s=3.520 n=+0.038 v=2.99 psi=-0.0130
+  side=trail pass=1 tier=0 ipopt=Solve_Succeede
+  trajectory: n_min=+0.038 n_max=+0.349 n_end=+0.349
+  solver_input: nlb=[-0.637,-0.311] nub=[+0.875,+0.931]
+  obstacles:  ['s=4.00,n=+0.084', 's=10.00,n=-0.164']
+  decider: side=trail, reason=no_side_fits, dv=1.80
+
+t=519.758 ego s=3.520 n=+0.038 v=2.99 psi=-0.0130
+  side=trail pass=1 tier=0 ipopt=Solve_Succeede
+  trajectory: n_min=+0.038 n_max=+0.348 n_end=+0.348
+  solver_input: nlb=[-0.637,-0.311] nub=[+0.875,+0.931]
+  obstacles:  ['s=4.04,n=+0.085', 's=10.00,n=-0.164']
+  decider: side=trail, reason=no_side_fits, dv=1.81
+
+t=519.792 ego s=3.634 n=+0.056 v=3.05 psi=+0.0143
+  side=trail pass=1 tier=0 ipopt=Solve_Succeede
+  trajectory: n_min=+0.056 n_max=+0.327 n_end=+0.327
+  solver_input: nlb=[-0.669,-0.300] nub=[+0.885,+0.932]
+  obstacles:  ['s=4.08,n=+0.082', 's=10.00,n=-0.164']
+  decider: side=trail, reason=no_side_fits, dv=1.83
+
+t=519.809 ego s=3.677 n=+0.063 v=3.08 psi=+0.0143
+  side=trail pass=1 tier=0 ipopt=Solve_Succeede
+  trajectory: n_min=+0.063 n_max=+0.319 n_end=+0.319
+  solver_input: nlb=[-0.669,-0.287] nub=[+0.894,+0.931]
+  obstacles:  ['s=4.14,n=+0.103', 's=10.00,n=-0.164']
+  decider: side=trail, reason=no_side_fits, dv=1.84
+
+========== TRAJECTORY ↔ OBSTACLE OVERLAP CHECK ==========
+For each tick, check if trajectory n range overlaps with any obstacle n+/-w region
+  t=518.024 ego_s=0.12 side=clear traj_n=[-0.485,-0.357] OVERLAP with obs s=69.95 n=-0.164
+  t=518.075 ego_s=0.20 side=clear traj_n=[-0.497,-0.324] OVERLAP with obs s=51.97 n=-0.164
+  t=518.092 ego_s=0.22 side=clear traj_n=[-0.485,-0.311] OVERLAP with obs s=39.38 n=-0.164
+  t=518.109 ego_s=0.26 side=clear traj_n=[-0.511,-0.280] OVERLAP with obs s=30.57 n=-0.164
+  t=518.177 ego_s=0.37 side=clear traj_n=[-0.490,-0.242] OVERLAP with obs s=24.40 n=-0.164
+  t=518.211 ego_s=0.43 side=clear traj_n=[-0.490,-0.206] OVERLAP with obs s=11.52 n=+0.066
+  t=518.228 ego_s=0.49 side=clear traj_n=[-0.486,-0.097] OVERLAP with obs s=8.54 n=+0.070
+  t=518.262 ego_s=0.50 side=clear traj_n=[-0.485,+0.066] OVERLAP with obs s=6.47 n=+0.074
+  t=518.296 ego_s=0.50 side=clear traj_n=[-0.485,-0.059] OVERLAP with obs s=5.02 n=+0.068
+  t=518.313 ego_s=0.61 side=clear traj_n=[-0.479,-0.163] OVERLAP with obs s=4.03 n=+0.060
+  t=518.330 ego_s=0.61 side=clear traj_n=[-0.479,-0.187] OVERLAP with obs s=3.34 n=+0.068
+  t=518.381 ego_s=0.69 side=clear traj_n=[-0.472,-0.194] OVERLAP with obs s=2.89 n=+0.076
+  t=518.415 ego_s=0.69 side=clear traj_n=[-0.472,-0.210] OVERLAP with obs s=2.58 n=+0.071
+  t=518.466 ego_s=0.80 side=clear traj_n=[-0.465,-0.188] OVERLAP with obs s=2.39 n=+0.054
+  t=518.500 ego_s=0.80 side=trail traj_n=[-0.465,-0.247] OVERLAP with obs s=10.41 n=-0.164
+  t=518.500 ego_s=0.86 side=trail traj_n=[-0.458,-0.214] OVERLAP with obs s=2.20 n=+0.055
+  t=518.551 ego_s=0.97 side=trail traj_n=[-0.446,-0.179] OVERLAP with obs s=2.16 n=+0.049
+  t=518.585 ego_s=0.97 side=trail traj_n=[-0.446,-0.166] OVERLAP with obs s=2.14 n=+0.044
+  t=518.619 ego_s=1.05 side=trail traj_n=[-0.439,-0.144] OVERLAP with obs s=2.15 n=+0.044
+  t=518.636 ego_s=1.11 side=trail traj_n=[-0.430,-0.136] OVERLAP with obs s=2.17 n=+0.036
+  t=518.704 ego_s=1.16 side=trail traj_n=[-0.421,-0.130] OVERLAP with obs s=2.21 n=+0.053
+  t=518.721 ego_s=1.23 side=trail traj_n=[-0.411,-0.123] OVERLAP with obs s=2.24 n=+0.064
+  t=518.789 ego_s=1.34 side=trail traj_n=[-0.402,-0.111] OVERLAP with obs s=2.29 n=+0.064
+  t=518.823 ego_s=1.34 side=trail traj_n=[-0.402,-0.108] OVERLAP with obs s=2.36 n=+0.074
+  t=518.840 ego_s=1.44 side=trail traj_n=[-0.389,-0.103] OVERLAP with obs s=2.42 n=+0.084
+  t=518.857 ego_s=1.50 side=trail traj_n=[-0.379,-0.102] OVERLAP with obs s=2.47 n=+0.099
+  t=518.874 ego_s=1.50 side=trail traj_n=[-0.379,-0.100] OVERLAP with obs s=2.51 n=+0.087
+  t=518.925 ego_s=1.50 side=trail traj_n=[-0.379,-0.100] OVERLAP with obs s=2.53 n=+0.079
+  t=518.993 ego_s=1.54 side=trail traj_n=[-0.369,-0.082] OVERLAP with obs s=2.59 n=+0.073
+  t=519.027 ego_s=1.69 side=trail traj_n=[-0.346,-0.053] OVERLAP with obs s=2.65 n=+0.079
+  t=519.027 ego_s=1.69 side=trail traj_n=[-0.346,-0.038] OVERLAP with obs s=2.69 n=+0.072
+  t=519.044 ego_s=1.74 side=trail traj_n=[-0.333,-0.027] OVERLAP with obs s=2.73 n=+0.076
+  t=519.078 ego_s=1.74 side=trail traj_n=[-0.333,+0.000] OVERLAP with obs s=2.80 n=+0.066
+  t=519.146 ego_s=1.93 side=trail traj_n=[-0.299,+0.024] OVERLAP with obs s=2.86 n=+0.051
+  t=519.163 ego_s=1.93 side=trail traj_n=[-0.299,+0.029] OVERLAP with obs s=2.91 n=+0.065
+  t=519.197 ego_s=2.16 side=trail traj_n=[-0.245,+0.059] OVERLAP with obs s=2.99 n=+0.073
+  t=519.248 ego_s=2.16 side=trail traj_n=[-0.244,+0.069] OVERLAP with obs s=3.07 n=+0.083
+  t=519.282 ego_s=2.26 side=trail traj_n=[-0.220,+0.083] OVERLAP with obs s=3.11 n=+0.089
+  t=519.299 ego_s=2.26 side=trail traj_n=[-0.220,+0.103] OVERLAP with obs s=3.17 n=+0.091
+  t=519.333 ego_s=2.44 side=trail traj_n=[-0.182,+0.127] OVERLAP with obs s=3.24 n=+0.092
+  t=519.333 ego_s=2.44 side=trail traj_n=[-0.182,+0.167] OVERLAP with obs s=3.28 n=+0.093
+  t=519.401 ego_s=2.54 side=trail traj_n=[-0.158,+0.193] OVERLAP with obs s=3.35 n=+0.094
+  t=519.418 ego_s=2.68 side=trail traj_n=[-0.126,+0.204] OVERLAP with obs s=3.41 n=+0.096
+  t=519.469 ego_s=2.72 side=trail traj_n=[-0.117,+0.225] OVERLAP with obs s=3.48 n=+0.096
+  t=519.486 ego_s=2.90 side=trail traj_n=[-0.077,+0.240] OVERLAP with obs s=3.55 n=+0.095
+  t=519.520 ego_s=2.96 side=trail traj_n=[-0.065,+0.259] OVERLAP with obs s=3.59 n=+0.098
+  t=519.554 ego_s=2.96 side=trail traj_n=[-0.065,+0.276] OVERLAP with obs s=3.64 n=+0.097
+  t=519.605 ego_s=3.12 side=trail traj_n=[-0.034,+0.295] OVERLAP with obs s=3.71 n=+0.109
+  t=519.639 ego_s=3.24 side=trail traj_n=[-0.010,+0.316] OVERLAP with obs s=3.79 n=+0.106
+  t=519.639 ego_s=3.24 side=trail traj_n=[-0.010,+0.335] OVERLAP with obs s=3.85 n=+0.099
+  t=519.690 ego_s=3.36 side=trail traj_n=[+0.012,+0.355] OVERLAP with obs s=3.93 n=+0.092
+  t=519.741 ego_s=3.52 side=trail traj_n=[+0.038,+0.349] OVERLAP with obs s=4.00 n=+0.084
+  t=519.758 ego_s=3.52 side=trail traj_n=[+0.038,+0.348] OVERLAP with obs s=4.04 n=+0.085
+  t=519.792 ego_s=3.63 side=trail traj_n=[+0.056,+0.327] OVERLAP with obs s=4.08 n=+0.082
+  t=519.809 ego_s=3.68 side=trail traj_n=[+0.063,+0.319] OVERLAP with obs s=4.14 n=+0.103
+  t=519.860 ego_s=3.81 side=trail traj_n=[+0.083,+0.286] OVERLAP with obs s=4.19 n=+0.115
+  t=519.894 ego_s=3.93 side=trail traj_n=[+0.100,+0.264] OVERLAP with obs s=4.26 n=+0.121
+  t=519.928 ego_s=3.93 side=trail traj_n=[+0.101,+0.252] OVERLAP with obs s=4.35 n=+0.122
+  t=519.945 ego_s=4.08 side=trail traj_n=[+0.123,+0.234] OVERLAP with obs s=4.42 n=+0.119
+  t=519.996 ego_s=4.30 side=trail traj_n=[+0.154,+0.247] OVERLAP with obs s=4.50 n=+0.118
+  t=520.030 ego_s=4.30 side=trail traj_n=[+0.154,+0.240] OVERLAP with obs s=4.57 n=+0.107
+  t=520.047 ego_s=4.36 side=trail traj_n=[+0.163,+0.240] OVERLAP with obs s=4.63 n=+0.103
+  t=520.081 ego_s=4.36 side=trail traj_n=[+0.163,+0.237] OVERLAP with obs s=4.67 n=+0.101
+  t=520.132 ego_s=4.78 side=trail traj_n=[+0.150,+0.246] OVERLAP with obs s=4.76 n=+0.099
+  t=520.166 ego_s=4.90 side=trail traj_n=[+0.125,+0.248] OVERLAP with obs s=4.84 n=+0.102
+  t=520.183 ego_s=4.90 side=trail traj_n=[+0.124,+0.242] OVERLAP with obs s=4.91 n=+0.118
+  t=520.217 ego_s=5.07 side=trail traj_n=[+0.111,+0.241] OVERLAP with obs s=4.98 n=+0.135
+  t=520.251 ego_s=5.19 side=trail traj_n=[+0.095,+0.243] OVERLAP with obs s=5.07 n=+0.130
+  t=520.302 ego_s=5.41 side=trail traj_n=[+0.060,+0.238] OVERLAP with obs s=5.16 n=+0.120
+  t=520.353 ego_s=5.53 side=trail traj_n=[+0.038,+0.237] OVERLAP with obs s=5.26 n=+0.103
+  t=520.387 ego_s=5.61 side=trail traj_n=[+0.025,+0.241] OVERLAP with obs s=5.34 n=+0.099
+  t=520.387 ego_s=5.77 side=trail traj_n=[+0.007,+0.236] OVERLAP with obs s=5.43 n=+0.110
+  t=520.421 ego_s=5.77 side=trail traj_n=[+0.005,+0.235] OVERLAP with obs s=5.50 n=+0.117
+  t=520.472 ego_s=6.00 side=trail traj_n=[-0.019,+0.229] OVERLAP with obs s=5.59 n=+0.120
+  t=520.489 ego_s=6.00 side=trail traj_n=[-0.023,+0.234] OVERLAP with obs s=5.66 n=+0.122
+  t=520.540 ego_s=6.20 side=trail traj_n=[-0.048,+0.226] OVERLAP with obs s=5.73 n=+0.139
+  t=520.557 ego_s=6.34 side=trail traj_n=[-0.062,+0.238] OVERLAP with obs s=5.81 n=+0.136
+  t=520.625 ego_s=6.62 side=trail traj_n=[-0.074,+0.225] OVERLAP with obs s=5.90 n=+0.133
+  t=520.625 ego_s=6.80 side=trail traj_n=[-0.071,+0.224] OVERLAP with obs s=5.98 n=+0.120
+  t=520.659 ego_s=6.80 side=trail traj_n=[-0.062,+0.224] OVERLAP with obs s=6.07 n=+0.126
+  t=520.693 ego_s=7.07 side=trail traj_n=[-0.051,+0.233] OVERLAP with obs s=6.16 n=+0.154
+  t=520.710 ego_s=7.10 side=trail traj_n=[-0.040,+0.233] OVERLAP with obs s=6.24 n=+0.164
+  t=520.778 ego_s=7.33 side=trail traj_n=[-0.031,+0.236] OVERLAP with obs s=6.30 n=+0.172
+  t=520.795 ego_s=7.38 side=trail traj_n=[-0.022,+0.236] OVERLAP with obs s=6.39 n=+0.175
+  t=520.812 ego_s=7.60 side=trail traj_n=[-0.019,+0.238] OVERLAP with obs s=6.47 n=+0.182
+  t=520.829 ego_s=7.68 side=trail traj_n=[-0.012,+0.236] OVERLAP with obs s=6.56 n=+0.191
+  t=520.931 ego_s=7.79 side=right traj_n=[-0.003,+0.235] OVERLAP with obs s=6.64 n=+0.184
+  t=521.016 ego_s=8.34 side=right traj_n=[-0.000,+0.204] OVERLAP with obs s=6.79 n=+0.194
+  t=521.084 ego_s=8.44 side=right traj_n=[+0.005,+0.265] OVERLAP with obs s=6.93 n=+0.185
+  t=521.186 ego_s=8.69 side=right traj_n=[+0.004,+0.344] OVERLAP with obs s=7.11 n=+0.173
+  t=521.220 ego_s=9.18 side=right traj_n=[-0.016,+0.437] OVERLAP with obs s=7.34 n=+0.175
+  t=521.322 ego_s=9.38 side=right traj_n=[+0.009,+0.557] OVERLAP with obs s=7.54 n=+0.183
+  t=521.390 ego_s=9.45 side=trail traj_n=[+0.008,+0.553] OVERLAP with obs s=7.75 n=+0.193
+  t=521.424 ego_s=9.45 side=trail traj_n=[+0.008,+0.553] OVERLAP with obs s=7.96 n=+0.204
+
+========== COST ANALYSIS IN COLLISION ZONE ==========
+  t=521.016 obs=9802 others=6 bias=0.0 slack=0.00 ratio=1538.8x
+  t=521.084 obs=9885 others=6 bias=0.0 slack=0.00 ratio=1542.2x
+  t=521.186 obs=9985 others=8 bias=0.0 slack=0.00 ratio=1185.9x
+  t=521.220 obs=9961 others=14 bias=0.0 slack=0.00 ratio=727.4x
+  t=521.322 obs=9941 others=18 bias=0.0 slack=0.00 ratio=567.1x

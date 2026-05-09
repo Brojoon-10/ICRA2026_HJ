@@ -20,7 +20,7 @@
   3 will branch config per state (state_{observe,overtake,recovery}.yaml).
 -->
 <launch>
-  <arg name="state"                 default="observe"
+  <arg name="state"                 default="auto"
        doc="overtake | recovery | observe | auto  (auto = Phase X refactored 2-state FSM)"/>
   <arg name="use_pred_variance"     default="True"
        doc="When true, inflate sigma_s_obs/sigma_n_obs per tick using the predictor's vs_var/vd_var over horizon. Makes the bubble wider when prediction is uncertain."/>
@@ -40,7 +40,7 @@
             config_file:=$(find mpc_planner)/config/state_overtake.yaml state:=observe"/>
   <arg name="config_file"           default="$(find mpc_planner)/config/state_overtake.yaml"
        if="$(eval arg('state') == 'auto')"/>
-  <arg name="attach_to_statemachine" default="false"
+  <arg name="attach_to_statemachine" default="true"
        doc="Phase X gate. false (default) → role output remapped to *_observation; true → real topic."/>
   <arg name="output_topic"          default=""
        doc="When non-empty, overrides the role-specific topic remap entirely."/>

@@ -1,60 +1,40 @@
-# ### HJ : sampling_planner_state_node — OVERTAKE preset.
-# Loaded by sampling_planner_state.launch (state:=overtake) and mirrored as the
-# live target of rqt_reconfigure save_params / reset_params.
-
 rate_hz: 30.0
 frame_id: map
-
-# Horizon & sampling grid
-horizon:      1.0     # 1 s horizon matches the observation node; keep short for tight overtakes
-num_samples:  30
-n_samples:    11
-v_samples:    5
-
-# Safety / physics
-safety_distance: 0.20
-gg_abs_margin:   0.0
-gg_margin_rel:   0.0
+horizon: 1.2
+num_samples: 15
+n_samples: 11
+v_samples: 5
+safety_distance: 0.3
+gg_abs_margin: 0.0
+gg_margin_rel: 0.0
 friction_check_2d: false
-s_dot_min:       2.5
-kappa_thr:       1.5
+s_dot_min: 2.5
+kappa_thr: 1.5
 relative_generation: true
-
-# Overtake: obstacle avoidance dominates; raceline looser; continuity strong.
-# ### HJ : Phase 2 splits "best lateral candidate" into three modes
-# (follow / ot_left / ot_right). The base cost weights below are shared across
-# modes — per-mode behavior is shaped by side_weight (target_n) +
-# progress_weight + hysteresis (see below).
 cost:
-  raceline_weight:   0.05
-  velocity_weight:   100.0
-  prediction_weight: 5000.0
-  continuity_weight: 50.0
-  boundary_weight:   100.0
-  safety_margin_m:   0.15      # keep-out band inside half-width
-  side_weight:       100.0     # mode-targeted lateral pull (only OT modes)
-  progress_weight:   5.0       # reward Σs (only OT modes; 0 for follow)
-  opp_pred_ttl_s:    0.5       # drop opponent predictions older than this
-
-# Mode hysteresis — mode-level decision lock to prevent left/right toggling
-# at high speed (PPC cannot follow oscillating reference).
+  # ### HJ : Option C (per-tick min-max norm × weight) — 각 항이 [0, w] 범위.
+  # raceline 은 follow mode 핵심, prediction 은 충돌 회피 핵심, continuity 는
+  # mode 안 jitter 억제용. side > prediction 이면 OT 양보로 기우니 prediction 우선.
+  raceline_weight: 30.0
+  velocity_weight: 50.0
+  prediction_weight: 150.0
+  continuity_weight: 40.0
+  boundary_weight: 60.0
+  safety_margin_m: 0.15
+  side_weight: 300.0   # ### HJ : 80 → 300 (A/B 검증: 80 은 base term 합에 묻혀 endpoint n swing 너무 작음)
+  progress_weight: 5.0  # ### HJ : 25 → 5 (auto-reward 가 OT mode 에 항상 -progress 만큼 가산되어 mode bias)
+  detour_weight: 0.0   # ### HJ : 가성비 (Σ(n - n_rl)² · dt). 0=비활성. 1000 검증: follow 비율 16%→83%, OT 채택 시 n_end commit 강해짐. 일단 0, 실차 따라 200~500 시도
+  opp_pred_ttl_s: 0.5
+endpoint_chi_raceline_only: true  # ### HJ : L1 fix - kill wall-tangent interp wobble at endpoint chi/n_ddot
 hysteresis:
-  ttl_s:       1.0     # minimum dwell time after a mode switch
-  margin:      0.3     # require new mode cost < (1-margin)*active mode cost
-  kappa_dot_max: 5.0   # PPC sanity warn threshold on |dκ/dt|
-
-# 1-pole EMA between ticks on (d, V). 1.0 = no filter, 0.0 = frozen.
-filter_alpha: 0.7
-
-# MPPI-style weighted blending — enabled by default to smooth argmin switches.
+  ttl_s: 0.6
+  margin: 0.05
+  kappa_dot_max: 5.0
+filter_alpha: 0.6   # ### HJ : L2 fix - EMA on (d,V) to kill tick-to-tick endpoint jumps (was 1.0 off)
 mppi:
-  enable:          true
-  temperature_rel: 0.25
-  temporal_weight: 100.0
-
-# Uniform arc-length resampling of the output waypoints (matches race_stack ~0.1 m grid).
+  enable: false     # ### HJ : MPPI blend off (cost-가중평균이 mode/detour 차이를 평균화시킴 → 순수 best argmin 사용)
+  temperature_rel: 0.3
+  temporal_weight: 30.0
 resample_enable: true
-resample_ds_m:   0.1
-
-# OTWpntArray emission default — state machine reads this field to pick overtake side.
+resample_ds_m: 0.1
 ot_side_default: right

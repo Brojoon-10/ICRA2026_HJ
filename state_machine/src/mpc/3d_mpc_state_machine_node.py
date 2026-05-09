@@ -1914,6 +1914,24 @@ class StateMachine:
                 wpnts.extend(extra_wpnts)
             return wpnts
 
+        # ### HJ : 2026-05-02 — recovery_wpnts not yet initialized (spawn,
+        # MPC node still warming up, or recovery publisher dead). After the
+        # 2026-05-01 SM redesign LOSTLINE → RECOVERY now reaches this state
+        # function instead of GB_TRACK, which used to mask the missing init.
+        # Fall back to a GB raceline slice so the controller has SOMETHING
+        # valid (NaN-safe waypoints) to track. This is the lone exception
+        # to "ego 멀면 GB 안 씀" — only fires when recovery source itself is
+        # absent. As soon as MPC publishes /planner/mpc/wpnts the if-branch
+        # above takes over.
+        try:
+            gb_start_idx = int(self.cur_s / self.wpnt_dist) % len(
+                self.cur_gb_wpnts.list)
+            return [self.cur_gb_wpnts.list[(gb_start_idx + i) % len(self.cur_gb_wpnts.list)]
+                    for i in range(self.n_loc_wpnts)]
+        except Exception:
+            # GB list also not ready — return empty so caller can detect.
+            return []
+
     # ===== HJ ADDED: Helper function for waypoint shortage =====
     def get_extra_waypoints(self, last_s_m: float, num_needed: int) -> List[Wpnt]:
         """
@@ -2063,7 +2081,12 @@ class StateMachine:
         loc_markers.markers.append(del_mrk)
 
         loc_wpnts = WpntArray()
-        loc_wpnts.wpnts = wpts
+        # ### HJ : 2026-05-02 — None defense. After the 2026-05-01 SM
+        # redesign LOSTLINE can route to states[RECOVERY] which may
+        # return None when cur_recovery_wpnts is not yet initialized
+        # (spawn). Treat None as empty list so we don't crash; controller
+        # sees an empty publish and brakes (Phase 0 behaviour).
+        loc_wpnts.wpnts = wpts if wpts is not None else []
         loc_wpnts.header.stamp = rospy.Time.now()
         loc_wpnts.header.frame_id = "map"
 

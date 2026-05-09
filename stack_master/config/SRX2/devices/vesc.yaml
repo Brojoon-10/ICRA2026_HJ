@@ -93,6 +93,6 @@ vesc_driver:
   servo_max: 1.0
 
 # Simple Mux Paramater
-joy_max_speed: 6.0
+joy_max_speed: 9.0
 joy_max_steer: 0.6
 joy_freshness_threshold: 1.0

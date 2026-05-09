@@ -35,6 +35,221 @@
 
 ---
 
+## 1.5 Strategic Overtake — 단계적 로드맵 (2026-05-01 갱신)
+
+> 본질 비전: [`HJ_docs/strategic_overtake_vision_20260501.md`](HJ_docs/strategic_overtake_vision_20260501.md)
+> 단기 안전 baseline: [`HJ_docs/dynamic_overtake_master_plan_20260429.md`](HJ_docs/dynamic_overtake_master_plan_20260429.md)
+>
+> **원칙**: 한 milestone = 1 세션 작업 단위. 한 phase 안에 milestone 2~4개. 각 milestone 은 **빌드 + 짧은 bag 검증** 까지 끝난 상태로 닫고 다음으로 넘어감. 한 세션에 phase 두 개 묶어 가는 거 금지 (어거지 없이).
+>
+> **Architecture 결정 (2026-05-01)**:
+> - Strategy = **`planner/mpc_planner/src/strategy_planner.py` 모듈**. 별도 노드 X. MPC 노드 import 호출.
+> - Strategy 와 MPC 분리 디버깅은 별도 디버그 토픽 (`/strategy/debug/plan_json` 등) 으로.
+> - 다른 백엔드 필요 시 그때 갖다 쓰기 / 별도 패키지 분리.
+>
+> **Strategy 결정 정책**:
+> - **Side commit (LEFT/RIGHT) 은 Strategy 가 macro 로 확정**. MPC 는 micro d(k) trajectory 만 풀이 (Design X).
+> - Commit lookahead = 5s, hold = encounter window + 1s, abort 4 트리거 (margin / 예측 빗나감 / 새 obs / 추적 실패).
+> - Sector 라벨 의존성 X (horizon-based / s-function). ot_sectors.yaml 의 추월 금지 sector 만 hard rule.
+> - 명시적 sigmoid 시정수 강제 X. 큰 점프 안전망 (1-tick max delta) 만.
+
+### 현재 스택의 본질 문제 (2026-05-01 시점)
+
+| # | 문제 | 증상 | 해결 phase |
+|---|------|------|----------|
+| P-1 | GP timestep-별 정보 미활용 | `_merge_obs_sources` 가 prediction 의 N timestep 시퀀스를 버리고 vs/vd 만 추출 → constant 외삽. 코너 / 가속 변화 무시 | Phase 1 |
+| P-2 | Trailing/Overtake 가 1-tick 반응 | "옆이 비었나?" 즉석 판단 → reactive 토글, PASS 안전성 보장 X. directive #4 위반 | Phase 2~3 |
+| **P-3a** | **Painter 가 NLP `v[k]` 를 덮어씀 (architecture defect A)** | NLP 가 plan-aware 로 푼 속도 시퀀스 `v[k]` 가 `_post_process_speed` 에서 GB raceline `vx_lookup(s)` 로 통째 교체. plan 의도 (TRAIL/PASS 속도) 가 `trajectory.vx_mps` 까지 전달 안 됨 | Phase 4 (4.1~4.3) |
+| **P-3b** | **Controller TRAILING PID 가 trajectory.vx_mps 무시 (architecture defect B)** | `Controller.py:537-557` 가 `local_wpnts_src==TRAILING` 일 때 자체 PID 로 `target_v = obs.vs - gap_err·kp` 계산. trajectory.vx_mps 미사용. wpnts_src=OVERTAKE 케이스에서는 PID 자체가 비활성 → obs 인지 사라짐 → catch-up 충돌 19/31 의 직접 원인 | Phase 4 (4.4) |
+| P-4 | Trailing → Overtake 전이 시 가속 점프 | trailing PID off → ref_v 풀린 raceline 1-tick 안에 +2 m/s. 차량 거동 불안정. P-3a/b 가 풀려야 의미 있음 | Phase 7, 10 |
+| P-5 | 누적 observation 미활용 | `/opponent_trajectory` 가 publish 되고 있으나 MPC 는 안 씀. sector-level lap 통계 / driver style 추정 없음 | Phase 8~9 |
+| **P-6** | **TRAIL 이 baseline 만, 전략 없음** | 현재 TRAIL = "obs 뒤 따라가기 + ref_v cap". 사용자 비전 — TRAIL 은 다음 PASS window 를 위한 능동적 자세 잡기 (lateral preposition + dynamic closure rate + sector 인지). 즉 **단순 obs 추적이 아니라 strategic engagement 의 한 phase**. 본질 baseline (Phase 1 끝) 후 Phase 7~10 에서 도입. | Phase 7 (intent), Phase 9 (encounter forecaster), Phase 10 (commit 정밀화) |
+| **P-7** | **NLP obs cost 가 corridor 위반 만듦 (Phase 1 분석에서 발견)** | Gaussian bubble (`J_obs = w_obs * exp(-xy_dist²/σ²)`) 가 ego 를 obs 반대 방향 lateral push. corridor 좁으면 wall 침범 → IPOPT `Infeasible_Problem_Detected` (mm 위반에도 strict fail). 사용자 비전 = TRAIL 은 lateral free + 종방향 ref_v cap (속도가 obs.vs 보다 낮으면 ego 가 따라잡지 못함 = 자연 충돌 회피). PASS 만 lateral repulsion 유지. | Phase 1 (TRAIL w_obs=0 적용 완료), Phase 4 (PASS 의 collision constraint 도입) |
+
+> **P-3a, P-3b 가 Phase 4 의 핵심**. 두 wall 모두 무너뜨려야 NLP 가 푼 `v[k]` 가 controller 까지 살아남고, 그 위에서 비로소 vision §3 의 단계적 ramp / continuous engagement 가 emerging behavior 로 성립. 한쪽만 풀면 다른 쪽이 trajectory 속도를 지움.
+
+### Phase 0 — Publish + SM 정리 [완료]
+
+이전 세션 결과물. 현재 baseline 의 시작점.
+
+- [x] `_validate_publish_wpnts` ds_min 0.05→0.02 + sparsify 후처리. publish blackout 제거 (commit b8580b4)
+- [x] `_check_close_to_raceline_heading` heading 버그 fix
+- [x] `NonObstacleTransition_GBMode` 의 `_check_on_spline` 게이트 제거. ego 멀면 무조건 RECOVERY (사용자 directive 반영)
+- [x] `RecoveryTransition` 의 sustain-fail GB 폴백 제거. 종료 조건은 `close_tight K tick` 단일화
+
+### Phase 1 — Layer A: ObstacleHorizon (P-1 해결)
+
+**목표**: prediction 의 N=20 timestep 을 그대로 obs_arr 에 넣어 NLP 가 timestep 별 (s, d) 를 보고 collision avoidance 하게.
+
+- [ ] **1.1** `_merge_obs_sources` 가 매칭된 prediction opponent 의 **N timestep 시퀀스 전체** 를 보관하도록 변경. 현재 vs/vd 만 뽑던 부분 폐기. (~80줄)
+- [ ] **1.2** `_extrapolate_obs_traj` 의 vs/vd constant propagation 폐기, `obs_arr[n_used, k, 0/1]` 가 prediction sequence 를 직접 인덱싱. prediction 짧으면 tail 은 마지막 (s,d) 유지. (~60줄)
+- [ ] **1.3** 검증: 30s bag (정적 + 동적 obs 1대), tick_json 에 `obs_horizon_source` 필드 추가. constant 외삽 vs sequence 결과 RViz 에서 비교. min_distance 수렴 패턴 / collision 빈도 차이 확인.
+- [x] **1.4** [2026-05-02] tail (k≥M) 처리 = vs/vd extrapolate (마지막 점 hold 폐기). prediction horizon < NLP horizon 시 obs sequence 가 freeze 되던 버그 fix.
+- [x] **1.5** [2026-05-02] obs_arr 빌드의 s 처리 = per-timestep ego_s 도메인 unwrap (통째 offset 폐기). lap 경계 wrap 처리.
+- [x] **1.6** [2026-05-02] `_ObsWithHorizon` wrapper class 도입. ROS msg `__slots__` 우회, sidecar attribute 추가 가능.
+- [x] **1.7** [2026-05-02] PLAN_TRAIL `w_obs=0`, `q_n_target=0`. obs Gaussian bubble 의 lateral push 가 corridor 위반 만들어 NLP infeasibility 유발 → TRAIL = lateral free + 종방향 ref_v cap (이미 있음). **사용자 비전 직접 반영 (P-6, P-7)**.
+- [x] **1.8** [2026-05-02] 부수 fix — SM `get_recovery_wpts` None defense + GB raceline fallback. spawn 직후 `cur_recovery_wpnts.is_init=False` 케이스 처리.
+
+**검증 통과 기준**: NLP solve_ms p99 변화 ±10% 이내, collision count 가 baseline 대비 같거나 감소, **`Infeasible_Problem_Detected` 빈도 baseline 회귀 (이전 분석 11건 → ≤2건 기대)**, TRAIL plan 시 SIDE DECISION 토글 빈도 baseline 회귀.
+
+**검증 상태**: 코드 / 빌드 OK. 1.7 (PLAN_TRAIL) 까지 적용 후 사용자 새 bag 검증 대기.
+
+### Phase 2 — Layer B: EncounterAnalyzer (단순) (P-2 1단계)
+
+**목표**: 매 obstacle 에 대해 LEFT/RIGHT pass margin + ttc 계산. SM 단순 toggle 을 대체할 정량 지표.
+
+- [ ] **2.1** `EncounterReport` 데이터 구조 + `_analyze_encounter(obs, ego, corridor)` 함수. LEFT/RIGHT pass margin = corridor 폭 − obs 폭 − safety buffer.
+- [ ] **2.2** ttc / closure rate 계산 (`(obs.s - ego.s) / max(ego.vs - obs.vs, eps)`).
+- [ ] **2.3** 디버그 publish: `~debug/encounter_json` (per-tick), tick_json 에도 요약 추가. RViz marker 로 pass margin / ttc 시각화.
+
+**검증 통과 기준**: 30s bag 동안 encounter_json 매 tick publish, RViz 에서 pass margin / ttc 가 안정적 (oscillation 없음).
+
+### Phase 3 — Layer C: StrategicPlanner (rule-based) (P-2 2단계)
+
+**목표**: encounter report 받아 plan + commit_phase FSM 운용. 1-tick 반응 토글 제거.
+
+- [ ] **3.1** plan = `{LEFT_PASS, RIGHT_PASS, TRAIL, WAIT}` 단순 rule (pass_margin > buffer AND ttc > min_ttc → PASS, else TRAIL).
+- [ ] **3.2** commit_phase FSM (DETECT → APPROACH → WAIT → COMMIT → PASS → RECOVER → CLEAR). state 별 dwell 보장.
+- [ ] **3.3** 한 번 COMMIT 진입 후 hysteresis: COMMIT → PASS 진입은 safety guard 통과 시만, 한 번 PASS 진입하면 dwell K_pass tick 보장.
+- [ ] **3.4** publish: `~debug/plan_json` (plan, commit_phase, dwell, reason).
+
+**검증 통과 기준**: plan transition 빈도 < 5/min, commit_phase 가 정상 FSM 흐름 (역행 없음).
+
+### Phase 4 — Layer D: PlanAwareMPC (P-3a + P-3b 해결, 가장 큰 효과)
+
+**목표**: NLP 가 푼 `v[k]` 가 painter / continuity guard / controller 어디서도 덮어씌워지지 않고 controller 의 PID 추적 ref 까지 살아남게. 즉 **MPC 속도가 시스템 끝까지 사용되도록**.
+
+- 이 phase 가 Phase 7~10 의 strategic vision 전체의 전제. 4.1~4.4 (P-3a) 가 painter side, 4.5 (P-3b) 가 controller side. 두 wall 모두 무너져야 vision §3 (continuous intent) / §5 (단계적 ramp) 가 가능.
+
+- [ ] **4.1 [P-3a]** `_post_process_speed` 가 NLP `v[k]` 를 **출발점으로 사용** — 현재처럼 GB raceline `vx_lookup(s)` 로 통째 교체하지 않음. painter 의 역할은 GB cap (절대 상한) + curvature cap + seam blend 만 적용. NLP 출력 보존이 default, 덮어쓰기는 명시 위반 시만.
+- [ ] **4.2 [P-3a]** plan-aware ref_v cap — plan=TRAIL 일 때 NLP `v[k]` 위에 추가 cap = `obs.vs + safety_buffer` 적용. plan=PASS 일 때 cap 없음 (raceline_v 까지 허용).
+- [ ] **4.3 [P-3a]** plan-aware a_max — TRAIL 시 brake 강도 허용 (a_dec 증가). PASS 시 a_acc 충분 보장. continuity guard 가 painter 결과를 ego_v±0.15 로 강제 clip 하던 부분도 plan-aware 화 (TRAIL 시 brake 허용).
+- [ ] **4.4 [P-3a 검증]** painter 출력 검증 — tick_json 에 `nlp_v0`, `painter_v0`, `cap_source` 필드 추가. NLP `v[0]` 와 painter `v[0]` 가 plan=TRAIL 시 일관 (GB raceline 으로 점프 안 함).
+- [ ] **4.5 [P-3b]** Controller TRAILING PID 제거 → `trajectory.vx_mps` 충실 추적. `Controller.py:537-557` trailing 분기 삭제. **반드시 4.1~4.4 통과 후 진입** — 단독 적용 시 trailing 자체 사라져 즉시 충돌. 검증 시 wpnts_src=OVERTAKE 케이스에서도 ego 가 trajectory.vx_mps 추적하는지 확인.
+- [ ] **4.6** directional obstacle bubble — plan side 반대편 hard, plan side soft hinge. solver 수정 (~50줄). NLP 가 plan side 로 lateral 이동 시 cost 발산 안 하도록.
+- [ ] **4.7** 통합 검증: 30분 bag 에서 catch-up 충돌 (TRAILING 인데 ego.v > obs.vs+1.0 인 충돌) **19 → 0**. 전체 collision count baseline (run01) 31 대비 **50% 이상 감소**. tick_json 의 `nlp_v0` 와 controller 가 추적한 실제 ego.v 사이 추적 오차 < 0.3 m/s.
+
+**검증 통과 기준**: catch-up 충돌 0. NLP `v[k]` 가 controller 까지 살아남는 게 데이터로 확인 (tick_json 시계열 + ego.v 비교).
+
+### Phase 5 — Safety buffer (P-1, P-2 보강)
+
+**목표**: prediction uncertainty 를 명시적으로 lateral margin 에 반영. directive #6.
+
+- [ ] **5.1** Phase 2 의 pass margin 계산에 `vd_var * horizon_time` 더해서 uncertainty inflation.
+- [ ] **5.2** obs.n 의 rolling stddev (최근 N tick) 도 추가.
+- [ ] **5.3** Phase 4 의 directional bubble 폭이 uncertainty 비례.
+
+**검증 통과 기준**: high-uncertainty obstacle (rolling stddev > 0.1) 만나는 케이스에서 PASS commit 안 함, TRAIL 유지.
+
+### Phase 6 — 통합 검증 (안전 baseline 완성)
+
+**목표**: master plan 의 충돌 0 contract 확인.
+
+- [ ] **6.1** 10분 bag × 5 회 (시나리오: 직선/코너/혼합).
+- [ ] **6.2** `analyze_long_bag.py` + `coll_plan_breakdown.py` 결과 표 작성.
+- [ ] **6.3** 100/50 시나리오 (가능 시) 또는 추정.
+
+**검증 통과 기준**: 30분 bag × 5회 = 150분 충돌 0건. PASS 성공률 50% 이상.
+
+---
+
+> 여기까지가 **단기 안전 baseline (Phase 0~6)**. ICRA 마감 안 도달 목표.
+> 아래는 **중기 strategic vision (Phase 7~11)**. 마감 후 / 여유 시 / strategic 기능 추가.
+
+### Phase 7 — TRAILING sub-state + Continuous intent + strategy_planner.py 모듈 (P-4 1단계)
+
+**목표**: `planner/mpc_planner/src/strategy_planner.py` 모듈 신설. TRAILING 안에 PASSIVE / INTENT sub-state 분할. intent scalar 도입.
+
+- [ ] **7.1** `strategy_planner.py` 신설 — `StrategyPlanner` 클래스 + `StrategyPlan` dataclass + `decide(ego_state, obs_pred, opp_traj) → StrategyPlan` 인터페이스.
+- [ ] **7.2** intent scalar `e ∈ [0,1]` 계산 — closure rate / pass margin / corridor_efficiency(s) 가중합. Phase 3 의 plan + commit_phase 위에 얹기.
+- [ ] **7.3** TRAILING_PASSIVE (e<0.3) / TRAILING_INTENT (0.3≤e<0.7) sub-state 분할. 외부 mode 는 둘 다 TRAILING.
+- [ ] **7.4** MPC 노드에서 `strategy.decide()` import 호출. `/strategy/debug/plan_json` publish.
+- [ ] **7.5** painter ref_v 가 e 의 함수: PASSIVE → obs.vs+0.2, INTENT → obs.vs + 단계적 (1-tick max delta 0.5 m/s).
+- [ ] **7.6** [디버그 마커 M1] **상대 예측 경로 색깔 heatmap (0.5s 단위 binning)** — `3d_opp_prediction.py` 의 marker color 필드를 `time_to_color_binned(t, bin_size=0.5)` 로 변경. 형태 / 위치 / 개수 변경 X. 0.5s 단위 색 띠 → RViz 에서 "이 구간은 몇 초 후" 즉시 인식. ~10줄 변경.
+
+**검증 통과 기준**: intent 시계열 smooth, TRAIL→PASS 전이 시 ref_v step ≤ 0.5 m/s/tick. 충돌 0 유지.
+
+### Phase 8 — Layer 1: Opponent Profile (horizon-based, P-5 1단계)
+
+**목표**: `/opponent_trajectory` + GP prior 활용. sector 라벨 의존성 X.
+
+- [ ] **8.1** `opp_profile.py` 모듈 — `/opponent_trajectory` 구독 hook + lap 누적 trajectory cache.
+- [ ] **8.2** s 함수 산출: `opp_d_profile(s)`, `opp_v_profile(s)`, `opp_brake_points` (기존 GP prior 추출 + s 함수 wrapping).
+- [ ] **8.3** `stationarity_score` 계산 — lap 간 opp_d_profile std 적분.
+- [ ] **8.4** `/strategy/debug/opp_profile` publish — RViz 에서 s 위 d_pref 곡선 + stationarity 시각화.
+
+**검증 통과 기준**: lap 1 후부터 opp_d_profile / stationarity_score 산출. rule-based 시뮬에서 stationarity < 0.2, reactive 시뮬에서 > 0.5 분리 확인.
+
+### Phase 9 — Layer 2: Encounter Forecaster (P-5 2단계)
+
+**목표**: 5s lookahead rollout + Bayesian (단기 GP + lap prior) blend. sector 라벨 의존성 X.
+
+- [ ] **9.1** `encounter_forecaster.py` 모듈 — 5s lookahead rollout (dt=0.1s) 함수. ego raceline 가정 + obs trajectory 시퀀스 (단기 GP / lap prior blend).
+- [ ] **9.2** Bayesian blend: t ≤ GP horizon 에서는 GP, 그 이후 prior. confidence = 1 − stationarity.
+- [ ] **9.3** encounter_window list 출력 — `(t_start, t_end, side, pass_margin, ttc, confidence, obs_d_seq)`. obs_d_seq 가 commit window 안 obs lateral 시퀀스 (사용자 시나리오 in→out swap 처리용).
+- [ ] **9.4** `/strategy/debug/encounter_windows` publish (선택, 부족함 느끼면 추가). 우선은 plan_json 시계열로 충분.
+
+**검증 통과 기준**: encounter window list 가 lap 2+ 에서 prior 영향 받음. obs_d_seq 시퀀스가 RViz 에서 시각 확인 가능.
+
+### Phase 10 — Layer 3 commit 정밀화 + Layer 4 확장 (P-4 2단계)
+
+**목표**: side LOCK macro + obs(t) 기반 micro d(k). commit lookahead 5s + hold + abort 4 트리거. 명시적 sigmoid ramp 강제 X.
+
+- [ ] **10.1** Layer 3 commit decision 5s lookahead — single-side same-side corridor 폭 5s 내내 충분 검사 (MVP). 사용자 원칙 "벽과 obs 사이 좁혀질 공간 절대 안 들어감" 직접 반영.
+- [ ] **10.1b** Forward reachable feasibility check (옵션 A) — t=1.0 obs LEFT 벽 / t=1.5 obs RIGHT 벽 같이 obs 가 시간 따라 lateral 변동하는 케이스 대응. lateral 도달 범위 시퀀스 갱신 후 비어있지 않으면 commit OK. single-side fail 시 fallback 으로 활성화.
+- [ ] **10.2** Commit hold (encounter_window 길이 + 1s) + abort 4 트리거 (margin / 예측 빗나감 / 새 obs / 추적 실패). TTC 는 closure_rate 기반 (정지 / 동적 obs 통합), 미래 closure (obs brake 시작 케이스) 도 검사.
+- [ ] **10.3** Layer 4 directional bubble 이 obs(k) 시간 함수 받아 timestep 별 cost 다르게 적용. side LOCK 안에서 micro d(k) 자유 풀이.
+- [ ] **10.4** ref_v 1-tick max delta 0.5 m/s 안전망. d_ref 1-tick max delta 0.1m 안전망. 의도된 점프 (emergency brake) 는 flag 로 우회.
+- [ ] **10.5** D_ref(t) phase 별 정의 (WAIT 진입 시 0 → ±0.2, COMMIT 진입 시 → ±0.4). 명시적 시정수 강제 X.
+- [ ] **10.6** [디버그 마커] **abort 발동 시 텍스트 마커 (M3)** — `strategy_planner.py` 안 `DebugMarkerPublisher.publish_abort(reason)`. lifetime 1s, 빨강 텍스트.
+
+**검증 통과 기준**: 사용자 시나리오 케이스 스터디 §5 + 사용자 시나리오 (in→out swap) 둘 다 bag 에서 재현. abort 트리거 발동 시 안전 RECOVER. ref_v / d_ref step ≤ 안전망 안.
+
+### Phase 11 — 검증 / 튜닝
+
+- [ ] **11.1** vision 문서 §5 시나리오 (우측 뒤 trail → 코너 직전 PASS) 재현.
+- [ ] **11.2** 사용자 시나리오 (상대 in→out swap, ego 가 반대 side commit 후 안전 통과) 재현.
+- [ ] **11.3** 30분 bag × 5 회. commit_phase / intent / encounter window 시각 분석.
+- [ ] **11.4** PASS 성공률 70% 이상, 충돌 0. abort 발동률 / 원인 분포 확인.
+
+---
+
+### 우선순위 정리
+
+| 우선순위 | Phase | 이유 |
+|---------|-------|------|
+| **P0 (다음 세션 후보)** | Phase 1 | P-1 해결 + Phase 4 의 전제. 가장 작은 단위로 시작 가능 |
+| **P0** | Phase 4 (4.1~4.4 painter side, P-3a) | NLP `v[k]` 보존. 단독으로도 효과 있음 |
+| **P0** | Phase 4 (4.5 controller side, P-3b) | 4.1~4.4 통과 후. 단독 적용 금지 |
+| **P0** | Phase 4 (4.6, 4.7) | directional bubble + 통합 검증. catch-up 충돌 19→0 |
+| **P1** | Phase 2, 3 | strategic plan 의 뼈대. Phase 4 결과 위에 얹기 |
+| **P2** | Phase 5, 6 | safety buffer + 통합 검증. baseline 완성 |
+| **P3 (마감 후)** | Phase 7~11 | strategic vision. 안전 baseline 위에 얹기 |
+
+> **Phase 4 의 milestone 순서가 매우 중요**:
+> - 4.5 (controller PID 제거) 를 4.1~4.4 (painter NLP `v[k]` 보존) 보다 먼저 적용하면 → trailing 자체가 사라져 **즉시 충돌**.
+> - 4.1~4.4 만 적용하고 4.5 안 하면 → NLP `v[k]` 가 painter 까지는 살아남지만 controller 가 자체 PID 로 또 무시 → vision 의 ramp 가 emerging 안 함.
+> - 두 wall 모두 무너뜨려야 strategic vision 의 전제가 성립.
+
+### 한 세션 단위 작업 추천
+
+다음 세션에 들어갈 후보:
+
+| 후보 | 범위 | 예상 코드량 | 효과 |
+|------|------|-----------|------|
+| **A** | Phase 1.1 + 1.2 + 1.3 | ~150줄 + 검증 bag | obs horizon 정확도 ↑. 다른 phase 의 전제 |
+| **B** | Phase 4.1 + 4.2 + 4.3 + 4.4 | ~100줄 + tick_json 필드 + 검증 bag | painter 가 NLP `v[k]` 보존. tick_json 으로 검증 |
+| **C** | Phase 4.5 + 4.6 + 4.7 | ~50줄 (controller) + ~50줄 (bubble) + 30분 bag | catch-up 충돌 19→0. **B 통과 후만 진입** |
+
+**권장 순서**: A (Phase 1) → B (Phase 4 painter side) → C (Phase 4 controller side + 통합 검증).
+한 세션에 A 와 B 묶지 않음. 각 후보 끝에 **빌드 + 검증 bag** 까지 닫고 commit, 다음 세션에 진입.
+
+**금기 사항**:
+- 한 세션에 painter 수정 (B) + controller 수정 (C) 동시 진입 (위험도 높음, 디버깅 분리 어려움).
+- Phase 1 안 한 상태에서 Phase 4 진입 — NLP 가 부정확한 obs horizon 으로 풀린 `v[k]` 를 보존해도 의미 적음. 가능은 하지만 권장 X.
+
+---
+
 ## 2. 단기 TODO — HJ 집중 백엔드 (P0)
 
 ### 2.1 Sampling + MPPI (state-aware)
