@@ -9,6 +9,7 @@
   <!-- LAUNCH GLIL Localization -->
   <include file="$(find glim_ros)/launch/glil_cpu.launch">
     <arg name="rviz" value="false"/>
+    <arg name="map" value="$(arg map)" />
   </include>
 
   <!-- remap odom topic with relay -->
