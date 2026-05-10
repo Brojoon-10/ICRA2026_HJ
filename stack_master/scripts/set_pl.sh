@@ -120,23 +120,27 @@ monitor_loop() {
   local logdir="${HOME:-/tmp}/.set_pl_monitor"
   mkdir -p "$logdir"
   local logfile="$logdir/$(date +%Y-%m-%d-%H-%M-%S).log"
+  local nproc; nproc=$(nproc 2>/dev/null || echo 22)
 
   echo "[INFO] monitor interval=${interval}s  Ctrl-C to stop"
   echo "[INFO] log: $logfile"
+  echo "[INFO] flags: THROTTLE=clock cap | HOT=pkg>95C | IO=iowait>5% | IRQ=softirq>10% | LOAD=load1>nproc | MEM=used>90%"
   echo
 
   # baseline counters
-  local prev_thr_pkg
+  local prev_thr_pkg prev_thr_core prev_e prev_t
   prev_thr_pkg=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count 2>/dev/null || echo 0)
-  local prev_thr_core
   prev_thr_core=$(awk '{s+=$1} END{print s+0}' /sys/devices/system/cpu/cpu*/thermal_throttle/core_throttle_count 2>/dev/null)
-  local prev_e
   prev_e=$(cat "$PL_DIR/energy_uj" 2>/dev/null || echo 0)
-  local prev_t
   prev_t=$(date +%s.%N)
 
+  # baseline /proc/stat (for CPU breakdown deltas)
+  # cpu  user nice system idle iowait irq softirq steal guest guest_nice
+  local prev_user prev_nice prev_sys prev_idle prev_iow prev_irq prev_sirq prev_steal
+  read _ prev_user prev_nice prev_sys prev_idle prev_iow prev_irq prev_sirq prev_steal _ < /proc/stat
+
   # CSV header
-  local header="ts,PL1_W,PL2_W,pct,pkg_C,core_max_C,nvme_C,freq_avg_MHz,freq_max_MHz,thr_pkg_dt,thr_core_dt,pkg_W,top1,top1_pct"
+  local header="ts,PL1_W,PL2_W,pct,pkg_C,core_max_C,nvme_C,freq_avg_MHz,freq_max_MHz,thr_pkg_dt,thr_core_dt,pkg_W,usr%,sys%,iowait%,soft%,load1,mem_used%,top1,top1_pct"
   echo "$header" | tee "$logfile"
 
   trap 'echo; echo "[INFO] monitor stopped. log: '"$logfile"'"; exit 0' INT TERM
@@ -174,23 +178,58 @@ monitor_loop() {
     fi
     prev_e=$e
 
+    # CPU time breakdown from /proc/stat delta (system-wide, all cores aggregated)
+    local cur_user cur_nice cur_sys cur_idle cur_iow cur_irq cur_sirq cur_steal
+    read _ cur_user cur_nice cur_sys cur_idle cur_iow cur_irq cur_sirq cur_steal _ < /proc/stat
+    local d_user=$((cur_user-prev_user)) d_nice=$((cur_nice-prev_nice)) d_sys=$((cur_sys-prev_sys))
+    local d_idle=$((cur_idle-prev_idle)) d_iow=$((cur_iow-prev_iow)) d_irq=$((cur_irq-prev_irq))
+    local d_sirq=$((cur_sirq-prev_sirq)) d_steal=$((cur_steal-prev_steal))
+    local d_total=$((d_user+d_nice+d_sys+d_idle+d_iow+d_irq+d_sirq+d_steal))
+    local p_usr p_sys p_iow p_soft
+    if [ "$d_total" -gt 0 ]; then
+      p_usr=$(awk -v u=$d_user -v n=$d_nice -v t=$d_total 'BEGIN{printf "%.1f", 100*(u+n)/t}')
+      p_sys=$(awk -v s=$d_sys -v t=$d_total 'BEGIN{printf "%.1f", 100*s/t}')
+      p_iow=$(awk -v i=$d_iow -v t=$d_total 'BEGIN{printf "%.1f", 100*i/t}')
+      p_soft=$(awk -v s=$d_sirq -v t=$d_total 'BEGIN{printf "%.1f", 100*s/t}')
+    else
+      p_usr=0; p_sys=0; p_iow=0; p_soft=0
+    fi
+    prev_user=$cur_user; prev_nice=$cur_nice; prev_sys=$cur_sys; prev_idle=$cur_idle
+    prev_iow=$cur_iow; prev_irq=$cur_irq; prev_sirq=$cur_sirq; prev_steal=$cur_steal
+
+    # Load average (1 min)
+    local load1
+    load1=$(awk '{print $1}' /proc/loadavg)
+
+    # Memory used %
+    local mem_used
+    mem_used=$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{if(t)printf "%.1f", 100*(t-a)/t; else print "0.0"}' /proc/meminfo)
+
+    # Top CPU process
     top1=$(ps -eo pcpu,comm --sort=-pcpu --no-headers 2>/dev/null | head -1)
     t1n=$(echo "$top1" | awk '{print $2}')
     t1c=$(echo "$top1" | awk '{print $1}')
 
-    # Color: red if thr_pkg_dt > 0
-    if [ "$thr_pkg_dt" -gt 0 ] || [ "$thr_core_dt" -gt 0 ]; then
-      mark=$'\e[31mTHROTTLE\e[0m '
-    elif [ "$pkg_c" -gt 95 ] 2>/dev/null; then
-      mark=$'\e[33mHOT\e[0m      '
-    else
+    # Build flags string. Each flag = a stack-affecting issue.
+    local flags=""
+    [ "$thr_pkg_dt" -gt 0 ] || [ "$thr_core_dt" -gt 0 ] && flags="$flags THROTTLE"
+    [ "$pkg_c" -gt 95 ] 2>/dev/null && flags="$flags HOT"
+    awk -v v=$p_iow 'BEGIN{exit !(v>5.0)}' && flags="$flags IO"
+    awk -v v=$p_soft 'BEGIN{exit !(v>10.0)}' && flags="$flags IRQ"
+    awk -v l=$load1 -v n=$nproc 'BEGIN{exit !(l>n)}' && flags="$flags LOAD"
+    awk -v v=$mem_used 'BEGIN{exit !(v>90.0)}' && flags="$flags MEM"
+    if [ -z "$flags" ]; then
       mark=$'\e[32mOK\e[0m       '
+    else
+      mark=$'\e[31m'"${flags# }"$'\e[0m'
+      # pad to ~8 chars for alignment
+      mark=$(printf "%-30s" "$mark")
     fi
 
-    line="$ts,$pl1,$pl2,$pct,$pkg_c,$core_max,${nvme:-?},$favg,$fmx,$thr_pkg_dt,$thr_core_dt,${pkg_w:-?},${t1n:-?},${t1c:-?}"
+    line="$ts,$pl1,$pl2,$pct,$pkg_c,$core_max,${nvme:-?},$favg,$fmx,$thr_pkg_dt,$thr_core_dt,${pkg_w:-?},$p_usr,$p_sys,$p_iow,$p_soft,$load1,$mem_used,${t1n:-?},${t1c:-?}"
     echo "$line" >> "$logfile"
-    printf "%s [%s] PL=%s/%s pct=%s%%  pkg=%s°C core=%s°C  freq=%s/%s MHz  thr_dt=%s/%s  pkg=%sW  top=%s(%s%%)\n" \
-      "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_c" "$core_max" "$favg" "$fmx" "$thr_pkg_dt" "$thr_core_dt" "${pkg_w:-?}" "${t1n:-?}" "${t1c:-?}"
+    printf "%s [%s] PL=%s/%s pct=%s%%  pkg=%s°C core=%s°C  freq=%s/%s  thr=%s/%s  W=%s  usr=%s%% sys=%s%% iow=%s%% soft=%s%%  load1=%s  mem=%s%%  top=%s(%s%%)\n" \
+      "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_c" "$core_max" "$favg" "$fmx" "$thr_pkg_dt" "$thr_core_dt" "${pkg_w:-?}" "$p_usr" "$p_sys" "$p_iow" "$p_soft" "$load1" "$mem_used" "${t1n:-?}" "${t1c:-?}"
   done
 }
 
