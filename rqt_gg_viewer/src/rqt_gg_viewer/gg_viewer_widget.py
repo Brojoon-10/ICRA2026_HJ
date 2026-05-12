@@ -642,10 +642,10 @@ class GGViewerWidget(QWidget):
         self.ax_plot.grid(True, which='major', alpha=0.35)
         self.ax_plot.grid(True, which='minor', alpha=0.2)
         ## IY : end
-        ## IY : fixed ±10 m/s² range on both axes — same scale across all V/g
+        ## IY : fixed ±20 m/s² range on both axes — same scale across all V/g
         ##       combos for visual comparison. adjustable='box' keeps plot square.
-        self.ax_plot.set_xlim(-10.0, 10.0)
-        self.ax_plot.set_ylim(-10.0, 10.0)
+        self.ax_plot.set_xlim(-20.0, 20.0)
+        self.ax_plot.set_ylim(-20.0, 20.0)
         self.ax_plot.set_aspect('equal', adjustable='box')
         ## IY : end
         self.ax_plot.axhline(y=0, color='k', linewidth=0.5)
