@@ -931,11 +931,11 @@ class GGTunerNode:
                     ## IY : overlay rqt RACELINE_KEYS onto latest yml (idempotent)
                     self._update_raceline_keys_in_yml(vehicle_name, tuning)
                     ## IY : end
-                    ## IY : g_weight no longer routed from rqt; raceline launch
-                    ##   default (1.0) is used. Re-add a slider if needed.
+                    ## IY : raceline keeps the old g_weight signature; map from bridge_effect
                     ok = self._run_raceline(
                         vehicle_name, run_opts['map'],
-                        safety_distance=run_opts['safety_distance'])
+                        safety_distance=run_opts['safety_distance'],
+                        g_weight=run_opts['bridge_effect'])
                     ## IY : end
                     if not ok:
                         rospy.logerr(f"[GGTuner] raceline failed")
@@ -946,30 +946,26 @@ class GGTunerNode:
                 ## IY : Stage 4 single-engine dispatch (vel_engine selector)
                 engine = run_opts.get('vel_engine', 'none')
                 force_restart = bool(run_opts['regen_raceline'])
-                ## IY : 'fbga' branch hidden — vel_engine enum no longer
-                ##   exposes 'fbga' in rqt. Helpers _run_fbga_planner /
-                ##   _kill_fbga_planner remain for re-enabling later.
-                # if engine == 'fbga':
-                #     self._kill_velopt_planner()       # ensure other engine off
-                #     ok = self._run_fbga_planner(
-                #         vehicle_name,
-                #         enable_mu=run_opts['enable_mu'],
-                #         force_restart=force_restart,
-                #         bridge_effect=run_opts['bridge_effect'],
-                #         g_tilde_soft_beta=run_opts['g_tilde_soft_beta'],
-                #         smooth_mu=run_opts['smooth_mu'],
-                #         mu_smooth_window=run_opts['mu_smooth_window'],
-                #         mu_smooth_polyorder=run_opts['mu_smooth_polyorder'],
-                #         smooth_kappa=run_opts['smooth_kappa'],
-                #         kappa_smooth_window=run_opts['kappa_smooth_window'],
-                #         kappa_smooth_polyorder=run_opts['kappa_smooth_polyorder'],
-                #         slope_brake_margin=run_opts['slope_brake_margin'],
-                #         slope_brake_vmax=run_opts['slope_brake_vmax'])
-                #     if not ok:
-                #         return
-                #     self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
-                # elif engine == 'velopt':
-                if engine == 'velopt':
+                if engine == 'fbga':
+                    self._kill_velopt_planner()       # ensure other engine off
+                    ok = self._run_fbga_planner(
+                        vehicle_name,
+                        enable_mu=run_opts['enable_mu'],
+                        force_restart=force_restart,
+                        bridge_effect=run_opts['bridge_effect'],
+                        g_tilde_soft_beta=run_opts['g_tilde_soft_beta'],
+                        smooth_mu=run_opts['smooth_mu'],
+                        mu_smooth_window=run_opts['mu_smooth_window'],
+                        mu_smooth_polyorder=run_opts['mu_smooth_polyorder'],
+                        smooth_kappa=run_opts['smooth_kappa'],
+                        kappa_smooth_window=run_opts['kappa_smooth_window'],
+                        kappa_smooth_polyorder=run_opts['kappa_smooth_polyorder'],
+                        slope_brake_margin=run_opts['slope_brake_margin'],
+                        slope_brake_vmax=run_opts['slope_brake_vmax'])
+                    if not ok:
+                        return
+                    self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
+                elif engine == 'velopt':
                     self._kill_fbga_planner()         # ensure other engine off
                     ## IY : rqt vo_* keys → velopt_opts dict (internal keys
                     ##   match _run_velopt_planner's ROS-param-style names).
@@ -1084,22 +1080,19 @@ class GGTunerNode:
             ## IY : Stage 4 single selector (replaces run_fbga bool)
             'vel_engine':       str(config.vel_engine),
             ## IY : end
+            'enable_mu':        bool(config.enable_mu),
             'safety_distance':  float(config.safety_distance),
-            ## IY : FBGA knobs hidden in rqt — defaults kept here so the FBGA
-            ##   helpers still have something to read if re-enabled. The
-            ##   `if engine == 'fbga'` branch in _run_full_pipeline is
-            ##   commented out, so these are effectively unused.
-            # 'enable_mu':                bool(config.enable_mu),
-            # 'bridge_effect':            float(config.bridge_effect),
-            # 'g_tilde_soft_beta':        float(config.g_tilde_soft_beta),
-            # 'smooth_mu':                bool(config.smooth_mu),
-            # 'mu_smooth_window':         int(config.mu_smooth_window),
-            # 'mu_smooth_polyorder':      int(config.mu_smooth_polyorder),
-            # 'smooth_kappa':             bool(config.smooth_kappa),
-            # 'kappa_smooth_window':      int(config.kappa_smooth_window),
-            # 'kappa_smooth_polyorder':   int(config.kappa_smooth_polyorder),
-            # 'slope_brake_margin':       float(config.slope_brake_margin),
-            # 'slope_brake_vmax':         float(config.slope_brake_vmax),
+            ## IY : FBGA knobs (used when vel_engine='fbga'; bridge_effect also shared by velopt)
+            'bridge_effect':            float(config.bridge_effect),
+            'g_tilde_soft_beta':        float(config.g_tilde_soft_beta),
+            'smooth_mu':                bool(config.smooth_mu),
+            'mu_smooth_window':         int(config.mu_smooth_window),
+            'mu_smooth_polyorder':      int(config.mu_smooth_polyorder),
+            'smooth_kappa':             bool(config.smooth_kappa),
+            'kappa_smooth_window':      int(config.kappa_smooth_window),
+            'kappa_smooth_polyorder':   int(config.kappa_smooth_polyorder),
+            'slope_brake_margin':       float(config.slope_brake_margin),
+            'slope_brake_vmax':         float(config.slope_brake_vmax),
             ## IY : end
             ## IY : VelOpt knobs (rqt names shortened velopt_* → vo_*).
             'vo_bridge':         float(config.vo_bridge),
