@@ -3,7 +3,9 @@
 import os
 import sys
 import copy
+import glob
 import json
+import re
 import shutil
 import struct
 import subprocess
@@ -685,6 +687,97 @@ class GGTunerNode:
         rospy.loginfo("[GGTuner] [sectors] killed")
     ## IY : end
 
+    ## IY : Save/Load *all* GGTuner.cfg dynamic_reconfigure values to a
+    ##   versioned yml under rqt_gg_viewer/velopt_tun/. Triggered by the
+    ##   `save_params` / `load_params` bool fields rendered at the top of the
+    ##   rqt_reconfigure page. Same auto-clear pattern as `apply` / `save_now`.
+    _PARAM_SKIP_ON_LOAD = (
+        # never re-apply trigger bools — would fire the pipeline as a side effect
+        'apply', 'apply_ggv', 'apply_raceline', 'apply_fbga', 'apply_velopt',
+        'save_now', 'save_params', 'load_params',
+    )
+
+    def _params_yml_dir(self):
+        d = os.path.join(self.race_stack_root, 'rqt_gg_viewer', 'velopt_tun')
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _scan_param_versions(self):
+        pat = os.path.join(self._params_yml_dir(), 'gg_params_v*.yml')
+        out = []
+        for fpath in glob.glob(pat):
+            m = re.match(r'gg_params_v(\d+)\.yml$', os.path.basename(fpath))
+            if m:
+                out.append((int(m.group(1)), fpath))
+        return sorted(out)
+
+    def _save_params_yaml(self, config):
+        params = {}
+        for k, v in dict(config).items():
+            if k == 'groups' or k.startswith('_'):
+                continue
+            # persist triggers as False so a yml reload never auto-fires them
+            if k in ('apply', 'apply_ggv', 'apply_raceline', 'apply_fbga',
+                     'apply_velopt', 'save_now', 'save_params', 'load_params'):
+                params[k] = False
+                continue
+            if isinstance(v, bool):
+                params[k] = bool(v)
+            elif isinstance(v, (int, float)):
+                params[k] = float(v) if isinstance(v, float) else int(v)
+            else:
+                params[k] = v
+        versions = self._scan_param_versions()
+        next_n = (versions[-1][0] + 1) if versions else 1
+        fpath = os.path.join(self._params_yml_dir(),
+                             f'gg_params_v{next_n}.yml')
+        payload = {
+            'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'version': next_n,
+            'source': '/gg_tuner dynamic_reconfigure',
+            'params': params,
+        }
+        with open(fpath, 'w') as f:
+            yaml.dump(payload, f, default_flow_style=False, sort_keys=True)
+        rospy.loginfo(
+            f"[GGTuner] save_params: {len(params)} keys → {fpath}")
+        self.status_pub.publish(f"PARAMS_SAVED_v{next_n}")
+        return next_n
+
+    def _load_params_yaml_into(self, config):
+        versions = self._scan_param_versions()
+        if not versions:
+            rospy.logwarn("[GGTuner] load_params: no gg_params_v*.yml found")
+            self.status_pub.publish("PARAMS_LOAD_NONE")
+            return None
+        n, fpath = versions[-1]
+        with open(fpath) as f:
+            payload = yaml.safe_load(f) or {}
+        params = payload.get('params') if isinstance(payload, dict) else None
+        if not isinstance(params, dict) or not params:
+            rospy.logwarn(
+                f"[GGTuner] load_params: no params field in v{n}.yml")
+            self.status_pub.publish(f"PARAMS_LOAD_EMPTY_v{n}")
+            return n
+        applied = 0
+        skipped = 0
+        for k, v in params.items():
+            if k in self._PARAM_SKIP_ON_LOAD:
+                continue
+            try:
+                config[k] = v
+                applied += 1
+            except (KeyError, TypeError) as e:
+                rospy.logwarn(
+                    f"[GGTuner] load_params: skip {k} ({type(v).__name__}): {e}")
+                skipped += 1
+        rospy.loginfo(
+            f"[GGTuner] load_params: gg_params_v{n}.yml → "
+            f"applied={applied} skipped={skipped}")
+        self.status_pub.publish(f"PARAMS_LOADED_v{n}_n{applied}")
+        return n
+    ## IY : end
+
     ## IY : persist velopt tuning to a single overwritten yaml so the latest
     ##   slider state survives session restarts. Path is fixed under
     ##   rqt_gg_viewer/velopt_tun/ to keep tuning artifacts close to the UI.
@@ -1042,6 +1135,32 @@ class GGTunerNode:
                     rospy.logerr(f"[GGTuner] SAVE exception: {e}")
                     self.status_pub.publish(f"SAVE_EXCEPTION: {str(e)[:80]}")
             config.save_now = False
+            if not apply_any:
+                return config
+        ## IY : end
+
+        ## IY : Save/Load *all* params (rqt_reconfigure top-of-page triggers).
+        ##   Auto-clear after handling; early-return when no apply pending so a
+        ##   tuning yml round-trip never accidentally fires the pipeline.
+        if getattr(config, 'save_params', False):
+            try:
+                self._save_params_yaml(config)
+            except Exception as e:
+                rospy.logerr(f"[GGTuner] save_params exception: {e}")
+                self.status_pub.publish(
+                    f"SAVE_PARAMS_EXCEPTION: {str(e)[:80]}")
+            config.save_params = False
+            if not apply_any:
+                return config
+
+        if getattr(config, 'load_params', False):
+            try:
+                self._load_params_yaml_into(config)
+            except Exception as e:
+                rospy.logerr(f"[GGTuner] load_params exception: {e}")
+                self.status_pub.publish(
+                    f"LOAD_PARAMS_EXCEPTION: {str(e)[:80]}")
+            config.load_params = False
             if not apply_any:
                 return config
         ## IY : end
