@@ -38,6 +38,9 @@
         type="livox_ros_driver2_node" required="true"
         output="log" args="$(arg cmdline_arg)"/>
 
+  <!-- ### HJ : RoboSense LiDAR (rslidar_sdk) -->
+  <include file="$(find rslidar_sdk)/launch/start.launch"/>
+
   <group if="$(arg rosbag_enable)">
     <node pkg="rosbag" type="record" name="record" output="screen" args="-a"/>
   </group>
@@ -121,7 +124,7 @@
 
   <node pkg="stack_master" type="relay_node.py" name="relay_node" output="screen"/>
 
-  <!-- <node pkg="joy" type="joy_node" name="joy_node" output="screen"/> -->
+  <node pkg="joy" type="joy_node" name="joy_node" output="screen"/>
   <!-- ### HJ : use ELRS receiver instead of USB joystick -->
   <include file="$(find elrs_joy)/launch/elrs_joy.launch"/>
 
