@@ -194,10 +194,38 @@
 
 ---
 
+## 4.5 GG/Velocity 최적화 — Bridge 센터라인 + 마찰 스케일링 (2026-05-13)
+
+> 목적: (1) 3D 트랙의 다리 구간에서 racing line이 종방향과 평행 / 센터 부근에 머물러 양 바퀴 동시 접지 보장, (2) 짧은 friction 패치에 대해 별도 GGV 디렉토리 생성 없이 NLP 안에서 (ax_max, ay_max, |ax_min|)에 per-point mu scale을 곱해 친구 sector를 즉시 반영. 기존 multi-GGV 경로는 백업으로 유지하되 짧은 패치에는 과잉이라 새 토글로 우회.
+
+- [x] **`bridge_sector_tuner_3d` 신규 패키지** — `f110_utils/nodes/3d_bridge_sector_tuner/`. `3d_sector_tuner`와 동일 UI 구조이되 입력이 **post-opt `global_waypoints.json` 이 아니라 pre-opt `<map>/<map>_3d_smoothed.csv`** (다리는 racing line이 아니라 맵 속성). 출력은 `<map>/bridge_sectors.yaml` (`start, end, pre_m, post_m, force_center, chi_max_rad` per bridge). yaml load/save round-trip 지원 — re-launch 시 슬라이더 init.
+- [x] **`bridge_tuner.launch`** in package — `map:=<name>` 단일 인자, smoothed_csv 자동 해소.
+- [x] **`GGTuner.cfg` Bridge 그룹** — `run_bridge_tuner`(spawn/kill 토글), `bridge_constraints_enable`(opt 시 yaml 읽기 on/off), `apply_bridge`(다른 apply mirror들과 동일 — 단순 트리거). VelOpt 그룹에 `vo_use_friction_scaling` 추가.
+- [x] **`gg_tuner_node.py`** — `_run_bridge_tuner` / `_kill_bridge_tuner` (sector_slicing 패턴 그대로), `reconfigure_cb`에 toggle handling + APPLY_KEYS에 `apply_bridge`, `_run_raceline`에 `bridge_constraints_enable` 인자, `_run_velopt_planner`에 `use_friction_scaling` rosparam + cold-start CLI arg.
+- [x] **`3d_global_line.launch` + `run_pipeline.sh`** — `bridge_constraints_enable` arg를 받아 `gen_global_racing_line.py`에 src-injection (params dict의 `bridge_constraints_enable` / `bridge_yaml_dir` 오버라이드).
+- [x] **`gen_global_racing_line.py`** — `_build_bridge_state_table` helper (yaml 부재/0 다리 무해 처리), `_state_bounds(idx)`로 lbw/ubw 빌드 통일, 다리 zone에서 `force_center=True` 시 n에 ±1e-3, `chi_max_rad>=0` 시 |chi|≤chi_max. 두 옵션 OR-merge (겹침 시 tighter), closed-loop wrap 처리. yaml 부재 시 grid 전체 None → 기존 동작 그대로.
+- [x] **`3d_optimized_vel_planner.py`** — `_build_mu_scale` helper, `use_friction_scaling` rosparam, True면 multi-GGV 우회 (`gg_list=None, gg_idx=None`) + `mu_scale_k` 빌드, NLP step 안에서 `ax_max/ay_max/ax_min` 곱 적용 (`build_and_solve(mu_scale_k=...)`).
+- [ ] **Docker 빌드 + cfg generation 확인** — `catkin build bridge_sector_tuner_3d stack_master`. cfg가 `GGTunerConfig`에 새 키 노출하는지 rqt에서 확인.
+- [ ] **gazebo_wall_2 sanity** — bridge yaml 없는 상태로 raceline regen → 기존 결과와 동일한지 확인 (no-op 검증). 그 다음 yaml 만들고 force_center=True / chi_max=0 각각 활성화 후 n_opt, chi_opt 그래프 확인.
+
+핵심 파일 (현 세션 신규/수정):
+- 신규: `f110_utils/nodes/3d_bridge_sector_tuner/{package.xml,CMakeLists.txt,src/bridge_slicing.py,launch/bridge_tuner.launch}`
+- 수정 (`_backup_20260513.<ext>` 보존): `stack_master/cfg/GGTuner.cfg`, `stack_master/scripts/gg_tuner_node.py`, `stack_master/scripts/3d_optimized_vel_planner.py`, `stack_master/launch/3d_global_line.launch`, `planner/3d_gb_optimizer/global_line/global_racing_line/gen_global_racing_line.py`, `planner/3d_gb_optimizer/global_line/scripts/run_pipeline.sh`
+
+설계 메모:
+- 다리는 racing line이 어디 지나가느냐와 무관한 *맵 속성*이라 sector 인덱스를 raceline waypoint가 아닌 **smoothed centerline CSV row**로 잡았음. 이래야 raceline regen이 새 wpnt 인덱스를 만들 때마다 sector 재마킹 안 함.
+- `bridge_constraints_enable=False` 또는 `<map>/bridge_sectors.yaml` 부재 시 모든 곳이 silent no-op — 다리 없는 맵 (`gazebo_wall_2` 등) 영향 0.
+- `vo_use_friction_scaling=True` 시 multi-GGV (`<base>_fNNN/velocity_frame/`)를 명시적으로 우회. 두 경로가 동시 활성되면 mu_scale이 이중으로 곱해지므로 분기 처리. 길이 짧은 friction 패치(예: 다리 2 m)는 LUT 재생성보다 NLP 곱셈이 압도적으로 저렴 — 친구분 지적 그대로.
+- `apply_bridge`는 다른 apply mirror들과 동일하게 *pipeline trigger*만 — 실제 opt 실행은 `regen_raceline=True` 또는 `vel_engine=velopt` 토글에 의존 (기존 UX 일관).
+
+---
+
 ## 5. 장기 / 판단 보류
 
 - [x] **`/local_waypoints/markers` 165Hz → 80Hz (2026-04-30)** — `_pub_local_wpnts()`가 DELETEALL marker를 별도 publish하는 패턴이라 state_machine 80Hz loop마다 publish 2번 (실측 165Hz). DELETEALL을 동일 MarkerArray의 첫 element로 합쳐 publish 1회로 정리. 파일: `state_machine/src/mpc/3d_mpc_state_machine_node.py:_pub_local_wpnts`. 동일 함수 다른 marker는 정상. 효과: cross-host packet rate 감소(특히 70.9에 rviz subscriber 다수일 때 N배 영향). 평균/spike ping과의 인과는 별개 — packet rate ↔ ping correlation 측정 r²=0.008로 직접 변동 원인은 미확정 상태.
 - [x] **wifi cross-host ping 평균 ~3ms 영구 적용 (2026-05-01)** — gazebo(70.9) ↔ stack(70.2) cross-host TCPROS가 wifi airtime 점유 시 ping 평균 7~10ms / max 200~280ms spike 발생. 원인은 (a) Linux `tcp_rto_min=200ms` 기본값 (TCP loss 시 spike 폭 결정), (b) mac80211 BE 큐 saturation/큐잉, (c) AX211 BT coex jitter. 4단계 ablation으로 효과 분리: WMM Voice queue (DSCP EF, ICMP만) **-3.22ms**, RTO_min 50 (spike 200대→50대), BT off (-0.38ms, 사실상 noise). 적용 결과 평균 **2.39ms / max 70ms / >100ms 0건** (60s ping 300packets 기준). cross-host TCP까지 EF로 보내면 voice 큐 saturate → 오히려 악화 (ablation으로 검증, ping max 189ms 발생) → 의도적으로 ICMP만 EF, ROS는 BE 큐 유지. 영구 hook: `/etc/NetworkManager/dispatcher.d/99-wifi-tune` (NetworkManager가 wifi up/DHCP 마다 자동 재적용). bashrc 함수: `wifitune-on / -off / -status` (`~/.bashrc`의 `# >>> HJ wifi tune <<<` 블록). 다른 머신 호환: dispatcher script + bashrc 둘 다 default route iface/subnet/src IP 자동 감지, hardcoded 없음. 환경변수 `WIFITUNE_IFACE`, `WIFITUNE_SUBNET`로 override 가능. 70.9에 같은 변경 적용은 **무효** (효과 없음 확인됨, 70.2 측만 유지). 남은 50~100ms 단발 spike (1% 미만)는 클라이언트 측에서 못 잡는 영역 — AP↔70.9 hop, AP 펌웨어, RF 환경 본질.
+- [x] **다리 구간 racing-line 종방향 평행/센터 강제 (2026-05-13)** — 3D 트랙의 다리 구간(경사+평지+경사)에서 raceline이 대각으로 가 한쪽 바퀴만 먼저 접지하는 문제. 신규 `f110_utils/nodes/3d_bridge_sector_tuner/` — smoothed CSV(pre-opt centerline) 위에서 3D matplotlib GUI로 다리 start/end 마킹 + per-bridge `pre_m/post_m/force_center/chi_max_rad` 슬라이더 → `stack_master/maps/<map>/bridge_sectors.yaml`. `gen_global_racing_line.py`가 yaml을 옵션으로 로드(없으면 silent no-op, 다리 없는 맵 그대로 동작) → `_state_bounds(k)` helper로 NLP step별 lateral bound `n` 좁힘(force_center) 또는 heading `chi` 좁힘(chi_max_rad). rqt Bridge 그룹: `run_bridge_tuner` 체크박스 + `bridge_constraints_enable` 토글 + apply mirror.
+- [x] **Friction sector → velopt ax/ay 스케일링 (2026-05-13)** — 기존 multi-GGV(per-friction `<base>_fNNN` 디렉토리) 경로는 2m짜리 짧은 다리 patch에 비효율(별도 GGV 재생성 부담). rqt VelOpt 그룹 `vo_use_friction_scaling` 토글 → `3d_optimized_vel_planner.py`가 multi-GGV 디렉토리 lookup bypass + `/friction_map_params/Sector{i}/friction`로 per-grid-point `mu_scale_k` 빌드 → `build_and_solve()`에서 LUT 출력 `(ax_max, ay_max, ax_min)`에 `mu_scale_k[k]` 직접 곱(LUT 재생성 불필요). `friction` = `base p_Dx_1`이면 ratio=1. Hot-reload 매번 재빌드.
 - [ ] **경사면 속도 보상** — `mu_rad` 기반 속도 커맨드 보정 (controller or vel_planner)
 - [ ] **Controller nearest_waypoint 3D 전환** — 현재 local 내부 검색이라 2D로 충분하나 경로 겹침 시 필요
 - [ ] **시각화 마커 z 반영** — sector_server 등 z=0 하드코딩 수정 (controller 마커는 완료)

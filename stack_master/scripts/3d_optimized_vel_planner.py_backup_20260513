@@ -198,21 +198,6 @@ def build_and_solve(track, gg, vehicle_params,
                     n_fixed, chi_fixed, v_init, ax_init,
                     w_T=1.0, w_jx=1e-2, V_min=0.0, RK4_steps=1, sol_opt=None,
                     gg_list=None, gg_idx=None,
-                    ### HJ : per-point friction scaling applied at NLP layer.
-                    ###      Cheaper than rebuilding per-friction GGV
-                    ###      directories for short patches (e.g. 2 m bridge).
-                    ###      `mu_scale_k` is a length-N float array
-                    ###      multiplying (ax_max, ay_max, |ax_min|) at each
-                    ###      grid point k. None ⇒ no scaling (legacy).
-                    mu_scale_k=None,
-                    ### HJ : extra global multipliers split by direction.
-                    ###      Friction is theoretically isotropic but in
-                    ###      practice (e.g. on bridges) ax-grip and ay-grip
-                    ###      can degrade differently. Defaults 1.0 ≡ isotropic
-                    ###      (legacy behavior). Applied on top of mu_scale_k.
-                    mu_scale_x=1.0,
-                    mu_scale_y=1.0,
-                    ### HJ : end
                     w_jx_acc=None, w_jx_brk=None,
                     # === New (tanh-based) ===
                     w_jx_curv_alpha_acc=0.0, w_jx_curv_alpha_brk=0.0,
@@ -390,25 +375,6 @@ def build_and_solve(track, gg, vehicle_params,
             gg_k.acc_interpolator(ca.vertcat(Xk[0], gt_k))
         )
         ## IY(0416) : end
-        ### HJ : per-point friction scaling (cheap alternative to per-friction
-        ###      GGV directories). Applies to *all three* envelope outputs so
-        ###      the diamond constraint stays self-consistent: scaling only
-        ###      ax_max / ay_max while leaving ax_min unscaled would shrink
-        ###      accel side while leaving brake side at full grip, which is
-        ###      physically wrong for a mu drop. ax_min is signed-negative
-        ###      from the LUT, so we scale by mu directly (|ax_min|·mu is the
-        ###      reduced brake force at that point). gg_exp untouched —
-        ###      friction changes envelope size, not envelope shape.
-        if mu_scale_k is not None:
-            mu_k = float(mu_scale_k[k])
-            ### HJ : per-direction split — defaults 1.0 reduce to isotropic
-            ###      (ax_max *= mu_k; ay_max *= mu_k; ax_min *= mu_k) which is
-            ###      the original behavior. mu_scale_x/y act *on top of* the
-            ###      friction sector mu so per-sector tuning is preserved.
-            ax_max = ax_max * mu_k * mu_scale_x
-            ay_max = ay_max * mu_k * mu_scale_y
-            ax_min = ax_min * mu_k * mu_scale_x
-        ### HJ : end
         g += [ay_max - ca.fabs(ayt_k)]
         lbg += [0.0]; ubg += [np.inf]
 
@@ -601,20 +567,6 @@ class VelOptNode:
         self.w_jx_brk = self.w_jx * self.w_jx_brk_ratio
         ## IY : bridge_effect (shared with fbga; fed into Track3D as g_weight)
         self.bridge_effect = float(rospy.get_param('~bridge_effect', 1.0))
-        ### HJ : per-point friction scaling (cheap alt to multi-GGV).
-        ###      When True, friction sector mu is applied as a per-grid-point
-        ###      scalar multiplier inside the NLP — no per-friction GGV
-        ###      directories are needed. Multi-GGV directory lookup is
-        ###      bypassed so the two paths don't double-scale.
-        self.use_friction_scaling = bool(
-            rospy.get_param('~use_friction_scaling', False))
-        ### HJ : extra per-direction scale on top of sector mu. Default 1.0
-        ###      preserves the (theoretically isotropic) sector-mu behavior.
-        ###      Re-read inside _load_and_solve so every hot-reload picks up
-        ###      live rqt slider changes without restarting the node.
-        self.mu_scale_x = float(rospy.get_param('~mu_scale_x', 1.0))
-        self.mu_scale_y = float(rospy.get_param('~mu_scale_y', 1.0))
-        ### HJ : end
         ## IY : end
         ## IY : end
 
@@ -656,51 +608,14 @@ class VelOptNode:
             _full_params = yaml.safe_load(_f)
         _base_p_Dx_1 = _full_params.get('tire_params', {}).get('p_Dx_1', 0.56)
         friction_sectors = _read_friction_sectors()
-        ### HJ : when per-point friction scaling is on, skip multi-GGV
-        ###      directory lookup entirely (avoid double-application). Sector
-        ###      data is reused below to build mu_scale_k.
-        if self.use_friction_scaling:
-            self.gg_list, self.gg_idx = None, None
-            rospy.loginfo('[velopt] multi-GGV bypassed (use_friction_scaling=True)')
+        self.gg_list, self.gg_idx = _build_friction_gg_map(
+            friction_sectors, self.track.s.size, self.gg_path,
+            self.gg_margin, _base_p_Dx_1)
+        if self.gg_list is not None:
+            rospy.loginfo(f'[velopt] multi-GGV active: {len(self.gg_list)} GGVs, '
+                          f'base p_Dx_1={_base_p_Dx_1:.3f}')
         else:
-            self.gg_list, self.gg_idx = _build_friction_gg_map(
-                friction_sectors, self.track.s.size, self.gg_path,
-                self.gg_margin, _base_p_Dx_1)
-            if self.gg_list is not None:
-                rospy.loginfo(f'[velopt] multi-GGV active: {len(self.gg_list)} GGVs, '
-                              f'base p_Dx_1={_base_p_Dx_1:.3f}')
-            else:
-                rospy.loginfo('[velopt] multi-GGV inactive (single GGV)')
-        ### HJ : build per-point mu_scale_k from friction sectors.
-        ###      Map sector index ranges (defined on the original raceline
-        ###      grid) onto the resampled NLP grid the same way
-        ###      _build_friction_gg_map does — proportional rescale. Sectors
-        ###      with friction <= 0 are skipped (treated as "no override").
-        ###      Reference for mu=1 is base_p_Dx_1 so sectors set to that
-        ###      value leave the envelope unchanged.
-        self.mu_scale_k = None
-        if self.use_friction_scaling and friction_sectors:
-            self.mu_scale_k = np.ones(self.track.s.size, dtype=float)
-            n_grid = self.track.s.size
-            valid = [s for s in friction_sectors if s['friction'] > 0]
-            if valid:
-                total_original = max(s['end'] for s in valid) + 1
-                for sec in valid:
-                    ratio = sec['friction'] / max(_base_p_Dx_1, 1e-6)
-                    grid_start = int(round(sec['start'] / total_original * n_grid))
-                    grid_end   = int(round((sec['end'] + 1) / total_original * n_grid))
-                    grid_start = max(0, min(grid_start, n_grid - 1))
-                    grid_end   = max(0, min(grid_end, n_grid))
-                    self.mu_scale_k[grid_start:grid_end] = ratio
-                rospy.loginfo(
-                    f'[velopt] mu_scale_k built from {len(valid)} sector(s), '
-                    f'range=[{self.mu_scale_k.min():.3f}, '
-                    f'{self.mu_scale_k.max():.3f}] '
-                    f'(base p_Dx_1={_base_p_Dx_1:.3f})')
-            else:
-                rospy.loginfo('[velopt] use_friction_scaling=True but no valid '
-                              'friction sectors found — mu_scale_k ≡ 1')
-        ### HJ : end
+            rospy.loginfo('[velopt] multi-GGV inactive (single GGV)')
         ## IY(0416) : end
 
         # Load fixed path (n_opt, chi_opt) + warm-start v/ax from timeoptimal csv
@@ -743,12 +658,6 @@ class VelOptNode:
             v_init=self.v_init, ax_init=self.ax_init, V_min=self.V_min,
             w_T=self.w_T, w_jx=self.w_jx,
             gg_list=self.gg_list, gg_idx=self.gg_idx,
-            ### HJ : per-point friction scaling (cheap alt to multi-GGV)
-            mu_scale_k=self.mu_scale_k,
-            ### HJ : extra per-direction scale on top of sector mu
-            mu_scale_x=self.mu_scale_x,
-            mu_scale_y=self.mu_scale_y,
-            ### HJ : end
             w_jx_acc=self.w_jx_acc, w_jx_brk=self.w_jx_brk,
             # tanh-saturated curvature weighting (α corner + β transition)
             w_jx_curv_alpha_acc=self.w_jx_curv_alpha_acc,

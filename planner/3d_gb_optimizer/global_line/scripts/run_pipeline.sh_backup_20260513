@@ -25,18 +25,6 @@ START_FROM="1"
 ## IY : bridge mu scale baked into raceline (1.0=as-is)
 G_WEIGHT="1.0"
 ## IY : end
-### HJ : bridge centerline / heading-lock.
-###      Yaml at <map>/bridge_sectors.yaml stores positions only (start/end).
-###      Tuning knobs (pre/post/force_center/chi_max) are GLOBAL — applied to
-###      every bridge in the yaml. Default values reproduce legacy behavior:
-###      pre=post=0 (no extension), force_center=false, chi_max<0 (disabled).
-###      Missing yaml ⇒ silent no-op.
-BRIDGE_CONSTRAINTS_ENABLE="true"
-BRIDGE_PRE_M="0.0"
-BRIDGE_POST_M="0.0"
-BRIDGE_FORCE_CENTER="false"
-BRIDGE_CHI_MAX_RAD="-1.0"
-### HJ : end
 RAW_CSV="auto"
 GEN3D_CSV="auto"
 SMOOTHED_CSV="auto"
@@ -55,13 +43,6 @@ while [[ $# -gt 0 ]]; do
         --output)          OUTPUT="$2"; shift 2 ;;
         --start-from)      START_FROM="$2"; shift 2 ;;
         --g-weight)        G_WEIGHT="$2"; shift 2 ;;
-        ### HJ : bridge constraints + global tuning (yaml read at NLP setup)
-        --bridge-constraints-enable) BRIDGE_CONSTRAINTS_ENABLE="$2"; shift 2 ;;
-        --bridge-pre-m)              BRIDGE_PRE_M="$2"; shift 2 ;;
-        --bridge-post-m)             BRIDGE_POST_M="$2"; shift 2 ;;
-        --bridge-force-center)       BRIDGE_FORCE_CENTER="$2"; shift 2 ;;
-        --bridge-chi-max-rad)        BRIDGE_CHI_MAX_RAD="$2"; shift 2 ;;
-        ### HJ : end
         --raw-csv)         RAW_CSV="$2"; shift 2 ;;
         --gen3d-csv)       GEN3D_CSV="$2"; shift 2 ;;
         --smoothed-csv)    SMOOTHED_CSV="$2"; shift 2 ;;
@@ -118,7 +99,6 @@ echo "  gen3d   : ${GEN3D_CSV}"
 echo "  smoothed: ${SMOOTHED_CSV}"
 echo "  raceline: ${RACELINE_CSV}"
 echo "  g_weight: ${G_WEIGHT}"
-echo "  bridge  : enable=${BRIDGE_CONSTRAINTS_ENABLE}, pre=${BRIDGE_PRE_M}m, post=${BRIDGE_POST_M}m, force_center=${BRIDGE_FORCE_CENTER}, chi_max=${BRIDGE_CHI_MAX_RAD}rad"
 echo "======================================================"
 
 # ─── Step 1: Bag + wall.pcd → boundary CSV ─────────────────────────────────────
@@ -238,27 +218,6 @@ src = re.sub(r"'step_size_opt'\s*:.*", f"'step_size_opt': ${OPT_STEP},", src)
 ## IY : override bridge mu scale
 src = re.sub(r"'g_weight'\s*:.*", f"'g_weight': ${G_WEIGHT},", src)
 ## IY : end
-### HJ : forward bridge args so gen_global_racing_line.py can locate
-###      <map>/bridge_sectors.yaml (positions only) and apply the global
-###      tuning knobs. Bash bool ('true'/'false') → Python bool.
-def _to_py_bool(s):
-    s = s.strip().lower()
-    return "True" if s == "true" else ("False" if s == "false" else s.capitalize())
-_b_enable = _to_py_bool("${BRIDGE_CONSTRAINTS_ENABLE}")
-_b_force  = _to_py_bool("${BRIDGE_FORCE_CENTER}")
-src = re.sub(r"'bridge_constraints_enable'\s*:.*",
-             f"'bridge_constraints_enable': {_b_enable},", src)
-src = re.sub(r"'bridge_yaml_dir'\s*:.*",
-             f"'bridge_yaml_dir': '${MAP_DIR}',", src)
-src = re.sub(r"'bridge_pre_m'\s*:.*",
-             f"'bridge_pre_m': ${BRIDGE_PRE_M},", src)
-src = re.sub(r"'bridge_post_m'\s*:.*",
-             f"'bridge_post_m': ${BRIDGE_POST_M},", src)
-src = re.sub(r"'bridge_force_center'\s*:.*",
-             f"'bridge_force_center': {_b_force},", src)
-src = re.sub(r"'bridge_chi_max_rad'\s*:.*",
-             f"'bridge_chi_max_rad': ${BRIDGE_CHI_MAX_RAD},", src)
-### HJ : end
 
 # Override data directories when using map-dir mode
 map_dir = '${MAP_DIR}'
