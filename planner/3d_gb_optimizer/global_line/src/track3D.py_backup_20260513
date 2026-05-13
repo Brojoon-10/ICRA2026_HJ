@@ -11,34 +11,6 @@ import os.path
 g_earth = 9.81
 
 
-### HJ : Probe HSL ma27 once at import; fall back to MUMPS if libhsl.so is
-###      not loadable. Same pattern as gen_global_racing_line.py — ma27 is
-###      typically 1.5–3× faster than MUMPS for these NLPs. No workflow
-###      change when HSL is absent: MUMPS is the default and still works.
-def _select_linear_solver(verbose=True):
-    try:
-        _x = ca.MX.sym('x')
-        _probe = ca.nlpsol(
-            'hsl_probe', 'ipopt',
-            {'x': _x, 'f': (_x - 1.0) ** 2},
-            {'ipopt.linear_solver': 'ma27',
-             'ipopt.print_level': 0, 'print_time': 0})
-        _probe(x0=0.0)
-        if _probe.stats().get('success', False):
-            if verbose:
-                print('[track3D] linear_solver: ma27 (HSL)')
-            return 'ma27'
-    except Exception:
-        pass
-    if verbose:
-        print('[track3D] linear_solver: mumps (HSL not available, fallback)')
-    return 'mumps'
-
-
-_LINEAR_SOLVER = _select_linear_solver()
-### HJ : end
-
-
 def rad2deg(rad):
     return rad*180/np.pi
 
@@ -630,12 +602,6 @@ class Track3D:
         opts = {"expand": False,
                 "verbose": False,
                 }
-        ### HJ : opt-in HSL ma27 (probed once at import). If unavailable
-        ###      _LINEAR_SOLVER is 'mumps' and the solver call is identical
-        ###      to the original behaviour — no risk of dying due to a
-        ###      missing libhsl.so.
-        opts["ipopt.linear_solver"] = _LINEAR_SOLVER
-        ### HJ : end
         solver = ca.nlpsol('solver', 'ipopt', nlp, opts)  # ipopt
 
         # Solve the NLP.
