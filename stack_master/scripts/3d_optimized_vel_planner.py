@@ -100,6 +100,10 @@ def _read_friction_sectors():
                 'start': int(rospy.get_param(f'/friction_map_params/Sector{i}/start', 0)),
                 'end':   int(rospy.get_param(f'/friction_map_params/Sector{i}/end', 0)),
                 'friction': float(rospy.get_param(f'/friction_map_params/Sector{i}/friction', -1.0)),
+                ### IY : per-sector mu_scale_x / mu_scale_y on top of sector mu.
+                ###      Default 1.0 if not set ⇒ legacy isotropic behavior.
+                'mu_scale_x': float(rospy.get_param(f'/friction_map_params/Sector{i}/mu_scale_x', 1.0)),
+                'mu_scale_y': float(rospy.get_param(f'/friction_map_params/Sector{i}/mu_scale_y', 1.0)),
             })
         return sectors
     except Exception:
@@ -210,8 +214,15 @@ def build_and_solve(track, gg, vehicle_params,
                     ###      practice (e.g. on bridges) ax-grip and ay-grip
                     ###      can degrade differently. Defaults 1.0 ≡ isotropic
                     ###      (legacy behavior). Applied on top of mu_scale_k.
-                    mu_scale_x=1.0,
-                    mu_scale_y=1.0,
+                    # mu_scale_x=1.0,   ### IY : superseded by per-sector mu_scale_x_k
+                    # mu_scale_y=1.0,   ### IY : superseded by per-sector mu_scale_y_k
+                    ### IY : per-sector mu_scale_x / mu_scale_y arrays (length N,
+                    ###      one per grid point). Built from
+                    ###      /friction_map_params/Sector<i>/mu_scale_x|y in the
+                    ###      same sector→grid mapping used for mu_scale_k.
+                    ###      None ⇒ no per-direction scaling (legacy isotropic).
+                    mu_scale_x_k=None,
+                    mu_scale_y_k=None,
                     ### HJ : end
                     w_jx_acc=None, w_jx_brk=None,
                     # === New (tanh-based) ===
@@ -405,9 +416,17 @@ def build_and_solve(track, gg, vehicle_params,
             ###      (ax_max *= mu_k; ay_max *= mu_k; ax_min *= mu_k) which is
             ###      the original behavior. mu_scale_x/y act *on top of* the
             ###      friction sector mu so per-sector tuning is preserved.
-            ax_max = ax_max * mu_k * mu_scale_x
-            ay_max = ay_max * mu_k * mu_scale_y
-            ax_min = ax_min * mu_k * mu_scale_x
+            # ax_max = ax_max * mu_k * mu_scale_x   ### IY : superseded by per-sector mu_scale_x_k
+            # ay_max = ay_max * mu_k * mu_scale_y   ### IY : superseded by per-sector mu_scale_y_k
+            # ax_min = ax_min * mu_k * mu_scale_x   ### IY : superseded by per-sector mu_scale_x_k
+            ### IY : per-sector mu_scale_x / mu_scale_y from friction yaml.
+            ###      Each sector can independently scale longitudinal (ax) and
+            ###      lateral (ay) grip on top of its sector mu.
+            sx_k = float(mu_scale_x_k[k]) if mu_scale_x_k is not None else 1.0
+            sy_k = float(mu_scale_y_k[k]) if mu_scale_y_k is not None else 1.0
+            ax_max = ax_max * mu_k * sx_k
+            ay_max = ay_max * mu_k * sy_k
+            ax_min = ax_min * mu_k * sx_k
         ### HJ : end
         g += [ay_max - ca.fabs(ayt_k)]
         lbg += [0.0]; ubg += [np.inf]
@@ -612,8 +631,8 @@ class VelOptNode:
         ###      preserves the (theoretically isotropic) sector-mu behavior.
         ###      Re-read inside _load_and_solve so every hot-reload picks up
         ###      live rqt slider changes without restarting the node.
-        self.mu_scale_x = float(rospy.get_param('~mu_scale_x', 1.0))
-        self.mu_scale_y = float(rospy.get_param('~mu_scale_y', 1.0))
+        # self.mu_scale_x = float(rospy.get_param('~mu_scale_x', 1.0))
+        # self.mu_scale_y = float(rospy.get_param('~mu_scale_y', 1.0))
         ### HJ : end
         ## IY : end
         ## IY : end
@@ -679,8 +698,16 @@ class VelOptNode:
         ###      Reference for mu=1 is base_p_Dx_1 so sectors set to that
         ###      value leave the envelope unchanged.
         self.mu_scale_k = None
+        ### IY : per-sector mu_scale_x / mu_scale_y arrays built from the same
+        ###      sector→grid mapping used for mu_scale_k. None ⇒ legacy
+        ###      isotropic (no extra scaling).
+        self.mu_scale_x_k = None
+        self.mu_scale_y_k = None
         if self.use_friction_scaling and friction_sectors:
             self.mu_scale_k = np.ones(self.track.s.size, dtype=float)
+            ### IY : per-sector x/y scale arrays, default 1.0
+            self.mu_scale_x_k = np.ones(self.track.s.size, dtype=float)
+            self.mu_scale_y_k = np.ones(self.track.s.size, dtype=float)
             n_grid = self.track.s.size
             valid = [s for s in friction_sectors if s['friction'] > 0]
             if valid:
@@ -692,11 +719,20 @@ class VelOptNode:
                     grid_start = max(0, min(grid_start, n_grid - 1))
                     grid_end   = max(0, min(grid_end, n_grid))
                     self.mu_scale_k[grid_start:grid_end] = ratio
+                    ### IY : fill per-sector x/y scale in the same grid range
+                    self.mu_scale_x_k[grid_start:grid_end] = float(sec.get('mu_scale_x', 1.0))
+                    self.mu_scale_y_k[grid_start:grid_end] = float(sec.get('mu_scale_y', 1.0))
                 rospy.loginfo(
                     f'[velopt] mu_scale_k built from {len(valid)} sector(s), '
                     f'range=[{self.mu_scale_k.min():.3f}, '
                     f'{self.mu_scale_k.max():.3f}] '
                     f'(base p_Dx_1={_base_p_Dx_1:.3f})')
+                ### IY : per-sector x/y scale ranges (info)
+                rospy.loginfo(
+                    f'[velopt] mu_scale_x_k range=[{self.mu_scale_x_k.min():.3f}, '
+                    f'{self.mu_scale_x_k.max():.3f}], '
+                    f'mu_scale_y_k range=[{self.mu_scale_y_k.min():.3f}, '
+                    f'{self.mu_scale_y_k.max():.3f}]')
             else:
                 rospy.loginfo('[velopt] use_friction_scaling=True but no valid '
                               'friction sectors found — mu_scale_k ≡ 1')
@@ -746,8 +782,11 @@ class VelOptNode:
             ### HJ : per-point friction scaling (cheap alt to multi-GGV)
             mu_scale_k=self.mu_scale_k,
             ### HJ : extra per-direction scale on top of sector mu
-            mu_scale_x=self.mu_scale_x,
-            mu_scale_y=self.mu_scale_y,
+            # mu_scale_x=self.mu_scale_x,
+            # mu_scale_y=self.mu_scale_y,
+            ### IY : per-sector mu_scale_x / mu_scale_y arrays (replace scalars)
+            mu_scale_x_k=self.mu_scale_x_k,
+            mu_scale_y_k=self.mu_scale_y_k,
             ### HJ : end
             w_jx_acc=self.w_jx_acc, w_jx_brk=self.w_jx_brk,
             # tanh-saturated curvature weighting (α corner + β transition)

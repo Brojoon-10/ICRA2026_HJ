@@ -35,6 +35,11 @@ try:
 except ImportError:
     bridge_yaml_io = None  # graceful no-op if helper missing
 ### HJ : end
+## IY : safety sector tuner — friction-pattern node. safety_sector_server.py
+##      is spawned by 3d_base_system.launch and owns the
+##      /safety_sector_params/... rosparam tree. gg_tuner_node only triggers
+##      the slicing GUI here; it doesn't read/write yaml directly.
+## IY : end
 
 
 class GGTunerNode:
@@ -125,6 +130,11 @@ class GGTunerNode:
         ###      when the user picks a different map (yaml is per-map).
         self._last_bridge_yaml_map = None
         ### HJ : end
+        ## IY : safety_sector_server.py is spawned by 3d_base_system.launch
+        ##      and owns the /safety_sector_params/... rosparam tree. The
+        ##      safety slicing GUI rides along in 3d_sector_slicing.launch
+        ##      (= run_sector_slicing trigger). Nothing to track here.
+        ## IY : end
 
         rospy.on_shutdown(self._shutdown_cleanup)
 
@@ -151,6 +161,10 @@ class GGTunerNode:
         if initial_map:
             self._sync_bridge_cfg_from_yaml(initial_map)
         ### HJ : end
+        ## IY : safety sector server (in 3d_base_system.launch) owns the
+        ##      /safety_sector_params/... rosparam tree and the yaml sync.
+        ##      Nothing to sync here in gg_tuner.
+        ## IY : end
 
     ### HJ : bridge yaml ↔ rqt cfg synchronisation helpers.
     ###      yaml is the single source of truth; rqt is just an editor that
@@ -218,6 +232,7 @@ class GGTunerNode:
         except Exception as e:
             rospy.logwarn(f"[GGTuner] bridge yaml save failed: {e}")
     ### HJ : end
+
 
     ## IY : viewer-driven save_version
     def _save_version_cb(self, req):
@@ -790,9 +805,11 @@ class GGTunerNode:
 
     def _kill_sector_slicing(self):
         rospy.loginfo("[GGTuner] [sectors] kill requested (checkbox off)")
-        # kill the four nodes in the launch
+        # kill the nodes in the launch
         for node in ('/sector_node_3d', '/ot_sector_node_3d',
-                     '/static_obs_sector_node_3d', '/friction_sector_node'):
+                     '/static_obs_sector_node_3d', '/friction_sector_node',
+                     ## IY : also clean up the safety slicing node
+                     '/safety_sector_node_3d'):
             try:
                 subprocess.run(['rosnode', 'kill', node],
                                capture_output=True, timeout=3, check=False)
@@ -1039,10 +1056,10 @@ class GGTunerNode:
                         bool(use_friction_scaling))
         ### HJ : extra per-direction mu scale. Default 1.0 ≡ legacy isotropic
         ###      scaling. Re-read by vel_opt every hot-reload / cold-start.
-        rospy.set_param('/vel_opt_3d/mu_scale_x',
-                        float(velopt_opts.get('mu_scale_x', 1.0)))
-        rospy.set_param('/vel_opt_3d/mu_scale_y',
-                        float(velopt_opts.get('mu_scale_y', 1.0)))
+        # rospy.set_param('/vel_opt_3d/mu_scale_x',
+        #                 float(velopt_opts.get('mu_scale_x', 1.0)))
+        # rospy.set_param('/vel_opt_3d/mu_scale_y',
+        #                 float(velopt_opts.get('mu_scale_y', 1.0)))
         ### HJ : end
 
         if not force_restart:
@@ -1104,8 +1121,8 @@ class GGTunerNode:
             ### HJ : per-point friction scaling toggle
             f'_use_friction_scaling:={str(bool(use_friction_scaling)).lower()}',
             ### HJ : extra per-direction mu scale
-            f'_mu_scale_x:={float(velopt_opts.get("mu_scale_x", 1.0))}',
-            f'_mu_scale_y:={float(velopt_opts.get("mu_scale_y", 1.0))}',
+            # f'_mu_scale_x:={float(velopt_opts.get("mu_scale_x", 1.0))}',
+            # f'_mu_scale_y:={float(velopt_opts.get("mu_scale_y", 1.0))}',
         ]
         rospy.loginfo(f"[GGTuner] [velopt] cold start: {' '.join(cmd)}")
         try:
@@ -1291,8 +1308,8 @@ class GGTunerNode:
                         ### HJ : extra per-direction mu scale (persisted in
                         ###      velopt_tuning.yml via _save_velopt_yaml prefixing
                         ###      vo_*; vel_opt reads them as rosparam each reload).
-                        'mu_scale_x':           run_opts['vo_mu_scale_x'],
-                        'mu_scale_y':           run_opts['vo_mu_scale_y'],
+                        # 'mu_scale_x':           run_opts['vo_mu_scale_x'],
+                        # 'mu_scale_y':           run_opts['vo_mu_scale_y'],
                         ### HJ : end
                     }
                     ## IY : persist velopt slider state (single overwriting yml)
@@ -1404,6 +1421,10 @@ class GGTunerNode:
             if not apply_any:
                 return config
         ### HJ : end
+        ## IY : safety slicing GUI is spawned via the shared
+        ##      run_sector_slicing trigger (3d_sector_slicing.launch now
+        ##      includes safety_sector_slicing.py alongside the other
+        ##      slicers). No separate trigger needed.
 
         ### HJ : if the user switched maps in rqt, re-sync bridge sliders from
         ###      the new map's yaml. Done here (in reconfigure_cb) because
@@ -1417,6 +1438,9 @@ class GGTunerNode:
             if not apply_any:
                 return config
         ### HJ : end
+        ## IY : safety yaml sync is handled by safety_sector_server.py
+        ##      (callback fires on every reconfigure). gg_tuner doesn't need
+        ##      to mirror map changes — the server reads /map on its own.
 
         if not apply_any:
             return config
@@ -1484,8 +1508,8 @@ class GGTunerNode:
             ###      Default 1.0 ≡ legacy isotropic scaling. Re-read from
             ###      rosparam by vel_opt every reload, so this updates each
             ###      apply with no node restart needed.
-            'vo_mu_scale_x': float(config.vo_mu_scale_x),
-            'vo_mu_scale_y': float(config.vo_mu_scale_y),
+            # 'vo_mu_scale_x': float(config.vo_mu_scale_x),
+            # 'vo_mu_scale_y': float(config.vo_mu_scale_y),
             ### HJ : end
             ### HJ : bridge centerline / heading-lock toggle (raceline NLP).
             ###      Bridge zones (start/end indices) live in
@@ -1499,6 +1523,9 @@ class GGTunerNode:
             'bridge_force_center':       bool(config.bridge_force_center),
             'bridge_chi_max_rad':        float(config.bridge_chi_max_rad),
             ### HJ : end
+            ## IY : safety sector params (per-sector wall margin + default)
+            ##      live in /safety_sector_params/... rosparam tree, owned by
+            ##      safety_sector_server.py. Nothing to collect here.
         }
         ## IY : end
 
@@ -1518,6 +1545,9 @@ class GGTunerNode:
         ###      both come from yaml, not CLI args, for the per-bridge case).
         self._dump_bridge_cfg_to_yaml(run_opts)
         ### HJ : end
+        ## IY : safety sector dump is handled by safety_sector_server.py's
+        ##      save_params trigger (in rqt /dyn_sector_tuner/safety). gg_tuner
+        ##      doesn't write the yaml.
 
         ## IY : background thread
         self.pipeline_thread = threading.Thread(

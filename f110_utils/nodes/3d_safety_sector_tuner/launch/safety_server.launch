@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- ## IY : dynamic_reconfigure server. Always-on. Reads
+         <map>/safety_sectors.yaml on startup, mirrors slider state to
+         /safety_sector_params/... rosparam tree. gen_global_racing_line.py
+         reads the rosparam tree at NLP setup time. -->
+    <arg name="map" default="$(optenv MAP_NAME gazebo_wall_2)" />
+
+    <param name="/map" value="$(arg map)" />
+
+    <node pkg="safety_sector_tuner_3d"
+          type="safety_sector_server.py"
+          name="safety_sector_tuner_3d"
+          output="screen">
+        <param name="map" value="$(arg map)" />
+    </node>
+</launch>

@@ -62,6 +62,12 @@ class FrictionSectorPublisher:
             rospy.set_param(f'/friction_map_params/{sector_key}/start', start)
             rospy.set_param(f'/friction_map_params/{sector_key}/end', end)
             rospy.set_param(f'/friction_map_params/{sector_key}/friction', float(sector_friction))
+            ### IY : per-sector mu_scale_x / mu_scale_y (on top of sector friction).
+            ###      Consumed by 3d_optimized_vel_planner per-sector arrays.
+            mu_scale_x = float(getattr(config, f"{sector_key}_mu_scale_x", 1.0))
+            mu_scale_y = float(getattr(config, f"{sector_key}_mu_scale_y", 1.0))
+            rospy.set_param(f'/friction_map_params/{sector_key}/mu_scale_x', mu_scale_x)
+            rospy.set_param(f'/friction_map_params/{sector_key}/mu_scale_y', mu_scale_y)
             # s-based lookup (for planners with local paths)
             if self.glb_waypoints is not None:
                 s_start = self.glb_waypoints[min(start, len(self.glb_waypoints)-1)][3]
@@ -76,6 +82,11 @@ class FrictionSectorPublisher:
             self.yaml_data["global_friction_limit"] = config.global_friction_limit
             for key in self.sectors:
                 self.yaml_data[key]['friction'] = float(getattr(config, key, None))
+                ### IY : persist per-sector mu_scale_x / mu_scale_y to yaml.
+                self.yaml_data[key]['mu_scale_x'] = float(
+                    getattr(config, f"{key}_mu_scale_x", 1.0))
+                self.yaml_data[key]['mu_scale_y'] = float(
+                    getattr(config, f"{key}_mu_scale_y", 1.0))
             with open(self.yaml_file_path, "w") as yaml_file:
                 yaml.dump(self.yaml_data, yaml_file, default_flow_style=False)
             rospy.loginfo("Friction config saved to: %s", self.yaml_file_path)
@@ -97,6 +108,10 @@ class FrictionSectorPublisher:
         self.sectors = {k: v for k, v in yaml_data.items() if k.startswith('Sector')}
         for key, item in self.sectors.items():
             default_config[key] = float(item['friction'])
+            ### IY : per-sector mu_scale_x / mu_scale_y default = 1.0 if missing
+            ###      (back-compat with old yamls lacking the field).
+            default_config[f"{key}_mu_scale_x"] = float(item.get('mu_scale_x', 1.0))
+            default_config[f"{key}_mu_scale_y"] = float(item.get('mu_scale_y', 1.0))
         return default_config
 
     def glb_wpnts_cb(self, data):
@@ -128,6 +143,9 @@ class FrictionSectorPublisher:
 
                 # Read live friction value from rosparam
                 friction_val = rospy.get_param(f'/friction_map_params/Sector{i}/friction', 1.0)
+                ### IY : per-sector mu_scale_x / mu_scale_y for RViz label
+                mu_scale_x_val = rospy.get_param(f'/friction_map_params/Sector{i}/mu_scale_x', 1.0)
+                mu_scale_y_val = rospy.get_param(f'/friction_map_params/Sector{i}/mu_scale_y', 1.0)
 
                 marker = Marker()
                 marker.header.frame_id = "map"
@@ -154,7 +172,7 @@ class FrictionSectorPublisher:
                 marker_text.header.frame_id = "map"
                 marker_text.header.stamp = rospy.Time.now()
                 marker_text.type = marker_text.TEXT_VIEW_FACING
-                marker_text.text = f"Friction {i} ({friction_val:.2f})"
+                marker_text.text = f"Friction {i} ({friction_val:.2f}, {mu_scale_x_val:.2f}, {mu_scale_y_val:.2f})"
                 marker_text.scale.z = 0.4
                 marker_text.color.r = 1.0
                 marker_text.color.g = 0.5
