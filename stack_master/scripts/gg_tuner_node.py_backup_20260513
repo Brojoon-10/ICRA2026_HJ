@@ -3,9 +3,7 @@
 import os
 import sys
 import copy
-import glob
 import json
-import re
 import shutil
 import struct
 import subprocess
@@ -22,19 +20,6 @@ from stack_master.cfg import GGTunerConfig
 ## IY : Trigger service for FBGA hot-reload + viewer-driven save_version
 from std_srvs.srv import Trigger, TriggerResponse
 ## IY : end
-### HJ : bridge yaml IO — single source of truth for bridge positions + tuning.
-###      Add the bridge_sector_tuner_3d package src dir to sys.path so we can
-###      import its shared helper without needing it on PYTHONPATH at launch.
-_BRIDGE_TUNER_SRC = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    '..', 'f110_utils', 'nodes', '3d_bridge_sector_tuner', 'src')
-if os.path.isdir(_BRIDGE_TUNER_SRC) and _BRIDGE_TUNER_SRC not in sys.path:
-    sys.path.insert(0, _BRIDGE_TUNER_SRC)
-try:
-    import bridge_yaml_io
-except ImportError:
-    bridge_yaml_io = None  # graceful no-op if helper missing
-### HJ : end
 
 
 class GGTunerNode:
@@ -116,15 +101,6 @@ class GGTunerNode:
         ## IY : sector_slicing roslaunch handle
         self.sector_slicing_proc = None
         self._last_sector_slicing_state = False
-        ### HJ : bridge_tuner roslaunch handle (separate from sector_slicing
-        ###      because bridges live on the smoothed centerline, not on the
-        ###      raceline waypoints, so it doesn't need /global_waypoints).
-        self.bridge_tuner_proc = None
-        self._last_bridge_tuner_state = False
-        ### HJ : track last map name so we can re-sync rqt sliders from yaml
-        ###      when the user picks a different map (yaml is per-map).
-        self._last_bridge_yaml_map = None
-        ### HJ : end
 
         rospy.on_shutdown(self._shutdown_cleanup)
 
@@ -140,73 +116,6 @@ class GGTunerNode:
 
         self.srv = Server(GGTunerConfig, self.reconfigure_cb)
         rospy.loginfo("[GGTuner] Ready. Use rqt_reconfigure → /gg_tuner")
-        ### HJ : on startup, pull bridge tuning from the current map's yaml
-        ###      so the rqt sliders reflect what's actually on disk (yaml is
-        ###      the single source of truth). Done after Server creation so
-        ###      update_configuration takes effect.
-        try:
-            initial_map = self.srv.config.get('map', '')
-        except Exception:
-            initial_map = ''
-        if initial_map:
-            self._sync_bridge_cfg_from_yaml(initial_map)
-        ### HJ : end
-
-    ### HJ : bridge yaml ↔ rqt cfg synchronisation helpers.
-    ###      yaml is the single source of truth; rqt is just an editor that
-    ###      pre-populates from yaml on map switch and writes back on apply.
-    def _map_dir(self, map_name):
-        return os.path.join(self.maps_dir, map_name) if map_name else ''
-
-    def _sync_bridge_cfg_from_yaml(self, map_name):
-        """Read <map>/bridge_sectors.yaml and push values into rqt cfg.
-        Tuning is global per-rqt-slider; we pull from the first bridge if
-        present (all bridges share the same tuning under the current UI)."""
-        if bridge_yaml_io is None or not map_name:
-            return
-        map_dir = self._map_dir(map_name)
-        if not os.path.isdir(map_dir):
-            return
-        enable, bridges = bridge_yaml_io.load_bridges(map_dir)
-        upd = {'bridge_constraints_enable': bool(enable)}
-        if bridges:
-            b = bridges[0]
-            upd.update({
-                'bridge_pre_m':        float(b['pre_m']),
-                'bridge_post_m':       float(b['post_m']),
-                'bridge_force_center': bool(b['force_center']),
-                'bridge_chi_max_rad':  float(b['chi_max_rad']),
-            })
-        try:
-            self.srv.update_configuration(upd)
-            rospy.loginfo(
-                f"[GGTuner] bridge cfg synced from yaml ({map_name}): "
-                f"{len(bridges)} bridge(s), enable={enable}")
-        except Exception as e:
-            rospy.logwarn(f"[GGTuner] bridge cfg sync failed: {e}")
-        self._last_bridge_yaml_map = map_name
-
-    def _dump_bridge_cfg_to_yaml(self, run_opts):
-        """Persist current rqt bridge values into <map>/bridge_sectors.yaml.
-        Bridge positions are preserved; only the global tuning and master
-        enable flag get overwritten. Called on every apply."""
-        if bridge_yaml_io is None:
-            return
-        map_dir = self._map_dir(run_opts.get('map', ''))
-        if not os.path.isdir(map_dir):
-            return
-        try:
-            bridge_yaml_io.apply_global_tuning(
-                map_dir,
-                pre_m=run_opts['bridge_pre_m'],
-                post_m=run_opts['bridge_post_m'],
-                force_center=run_opts['bridge_force_center'],
-                chi_max_rad=run_opts['bridge_chi_max_rad'],
-                constraints_enable=run_opts['bridge_constraints_enable'],
-            )
-        except Exception as e:
-            rospy.logwarn(f"[GGTuner] bridge yaml save failed: {e}")
-    ### HJ : end
 
     ## IY : viewer-driven save_version
     def _save_version_cb(self, req):
@@ -588,17 +497,7 @@ class GGTunerNode:
 
     ## IY : raceline — passes safety_distance + g_weight from rqt
     def _run_raceline(self, vehicle_name, map_name, safety_distance=0.20,
-                      g_weight=1.0,
-                      ### HJ : bridge centerline / heading-lock.
-                      ###      Yaml at <map>/bridge_sectors.yaml stores
-                      ###      *positions only* (start/end indices). The
-                      ###      tuning knobs (pre/post extension, force_center,
-                      ###      chi_max) come from rqt and are forwarded via
-                      ###      roslaunch args to gen_global_racing_line.py.
-                      ###      Missing yaml ⇒ silent no-op.
-                      bridge_constraints_enable=True,
-                      bridge_pre_m=0.0, bridge_post_m=0.0,
-                      bridge_force_center=False, bridge_chi_max_rad=-1.0):
+                      g_weight=1.0):
         if map_name not in self.available_maps:
             rospy.logerr(f"[GGTuner] map '{map_name}' not found. "
                          f"Available: {self.available_maps}")
@@ -606,24 +505,13 @@ class GGTunerNode:
             return False
         self.status_pub.publish(f"RACELINE_STARTED: {vehicle_name}")
         rospy.loginfo(f"[GGTuner] [raceline] map={map_name}, vehicle={vehicle_name}, "
-                      f"safety_distance={safety_distance}, g_weight={g_weight:.3f}, "
-                      f"bridge_constraints_enable={bridge_constraints_enable}, "
-                      f"bridge_pre_m={bridge_pre_m:.2f}, "
-                      f"bridge_post_m={bridge_post_m:.2f}, "
-                      f"bridge_force_center={bridge_force_center}, "
-                      f"bridge_chi_max_rad={bridge_chi_max_rad:.3f}")
+                      f"safety_distance={safety_distance}, g_weight={g_weight:.3f}")
         cmd = [
             'roslaunch', 'stack_master', '3d_global_line.launch',
             f'map:={map_name}',
             f'vehicle:={vehicle_name}',
             f'safety_distance:={safety_distance}',
             f'g_weight:={float(g_weight)}',
-            ### HJ : forward bridge args to run_pipeline.sh → gen_global_racing_line.py
-            f'bridge_constraints_enable:={str(bool(bridge_constraints_enable)).lower()}',
-            f'bridge_pre_m:={float(bridge_pre_m)}',
-            f'bridge_post_m:={float(bridge_post_m)}',
-            f'bridge_force_center:={str(bool(bridge_force_center)).lower()}',
-            f'bridge_chi_max_rad:={float(bridge_chi_max_rad)}',
             'start_from:=5',
         ]
         ok = self._run_and_stream(cmd, tag='raceline', timeout=900)
@@ -797,151 +685,6 @@ class GGTunerNode:
         rospy.loginfo("[GGTuner] [sectors] killed")
     ## IY : end
 
-    ## IY : Save/Load *all* GGTuner.cfg dynamic_reconfigure values to a
-    ##   versioned yml under rqt_gg_viewer/velopt_tun/. Triggered by the
-    ##   `save_params` / `load_params` bool fields rendered at the top of the
-    ##   rqt_reconfigure page. Same auto-clear pattern as `apply` / `save_now`.
-    _PARAM_SKIP_ON_LOAD = (
-        # never re-apply trigger bools — would fire the pipeline as a side effect
-        'apply', 'apply_ggv', 'apply_raceline', 'apply_fbga', 'apply_velopt',
-        'save_now', 'save_params', 'load_params',
-        ### HJ : also skip our bridge trigger mirrors so reloading a saved
-        ###      yml never auto-spawns the tuner GUI or fires apply_bridge.
-        'apply_bridge', 'run_bridge_tuner', 'run_sector_slicing',
-        ### HJ : end
-    )
-
-    def _params_yml_dir(self):
-        d = os.path.join(self.race_stack_root, 'rqt_gg_viewer', 'velopt_tun')
-        os.makedirs(d, exist_ok=True)
-        return d
-
-    def _scan_param_versions(self):
-        pat = os.path.join(self._params_yml_dir(), 'gg_params_v*.yml')
-        out = []
-        for fpath in glob.glob(pat):
-            m = re.match(r'gg_params_v(\d+)\.yml$', os.path.basename(fpath))
-            if m:
-                out.append((int(m.group(1)), fpath))
-        return sorted(out)
-
-    def _save_params_yaml(self, config):
-        params = {}
-        for k, v in dict(config).items():
-            if k == 'groups' or k.startswith('_'):
-                continue
-            # persist triggers as False so a yml reload never auto-fires them
-            if k in ('apply', 'apply_ggv', 'apply_raceline', 'apply_fbga',
-                     'apply_velopt', 'save_now', 'save_params', 'load_params',
-                     ### HJ : also force HJ-side triggers to False on save
-                     'apply_bridge', 'run_bridge_tuner', 'run_sector_slicing'):
-                params[k] = False
-                continue
-            if isinstance(v, bool):
-                params[k] = bool(v)
-            elif isinstance(v, (int, float)):
-                params[k] = float(v) if isinstance(v, float) else int(v)
-            else:
-                params[k] = v
-        versions = self._scan_param_versions()
-        next_n = (versions[-1][0] + 1) if versions else 1
-        fpath = os.path.join(self._params_yml_dir(),
-                             f'gg_params_v{next_n}.yml')
-        payload = {
-            'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'version': next_n,
-            'source': '/gg_tuner dynamic_reconfigure',
-            'params': params,
-        }
-        with open(fpath, 'w') as f:
-            yaml.dump(payload, f, default_flow_style=False, sort_keys=True)
-        rospy.loginfo(
-            f"[GGTuner] save_params: {len(params)} keys → {fpath}")
-        self.status_pub.publish(f"PARAMS_SAVED_v{next_n}")
-        return next_n
-
-    def _load_params_yaml_into(self, config):
-        versions = self._scan_param_versions()
-        if not versions:
-            rospy.logwarn("[GGTuner] load_params: no gg_params_v*.yml found")
-            self.status_pub.publish("PARAMS_LOAD_NONE")
-            return None
-        n, fpath = versions[-1]
-        with open(fpath) as f:
-            payload = yaml.safe_load(f) or {}
-        params = payload.get('params') if isinstance(payload, dict) else None
-        if not isinstance(params, dict) or not params:
-            rospy.logwarn(
-                f"[GGTuner] load_params: no params field in v{n}.yml")
-            self.status_pub.publish(f"PARAMS_LOAD_EMPTY_v{n}")
-            return n
-        applied = 0
-        skipped = 0
-        for k, v in params.items():
-            if k in self._PARAM_SKIP_ON_LOAD:
-                continue
-            try:
-                config[k] = v
-                applied += 1
-            except (KeyError, TypeError) as e:
-                rospy.logwarn(
-                    f"[GGTuner] load_params: skip {k} ({type(v).__name__}): {e}")
-                skipped += 1
-        rospy.loginfo(
-            f"[GGTuner] load_params: gg_params_v{n}.yml → "
-            f"applied={applied} skipped={skipped}")
-        self.status_pub.publish(f"PARAMS_LOADED_v{n}_n{applied}")
-        return n
-    ## IY : end
-
-    ### HJ : bridge_tuner spawn/kill — mirrors _run_sector_slicing pattern.
-    ###      Launches bridge_sector_tuner_3d/bridge_tuner.launch which opens a
-    ###      matplotlib GUI on the *smoothed centerline CSV* (pre-opt). User
-    ###      marks bridge start/end and the GUI saves bridge_sectors.yaml.
-    ###      Tuning sliders live in the rqt Bridge group; yaml is the single
-    ###      source of truth. Kill is invoked when the rqt trigger auto-clears
-    ###      (we keep the function for an explicit shutdown path).
-    def _run_bridge_tuner(self, map_name):
-        if self.bridge_tuner_proc is not None and \
-                self.bridge_tuner_proc.poll() is None:
-            rospy.loginfo("[GGTuner] [bridge] already running")
-            return True
-        if map_name not in self.available_maps:
-            rospy.logerr(f"[GGTuner] [bridge] invalid map '{map_name}'")
-            self.status_pub.publish(f"FAILED_BRIDGE: invalid map")
-            return False
-        cmd = [
-            'roslaunch', 'bridge_sector_tuner_3d', 'bridge_tuner.launch',
-            f'map:={map_name}',
-        ]
-        rospy.loginfo(f"[GGTuner] [bridge] launching: {' '.join(cmd)}")
-        try:
-            self.bridge_tuner_proc = subprocess.Popen(cmd)
-            self.status_pub.publish(f"BRIDGE_TUNER_RUNNING: {map_name}")
-            return True
-        except OSError as e:
-            rospy.logerr(f"[GGTuner] [bridge] launch failed: {e}")
-            self.status_pub.publish(f"FAILED_BRIDGE: {map_name}")
-            return False
-
-    def _kill_bridge_tuner(self):
-        rospy.loginfo("[GGTuner] [bridge] kill requested (checkbox off)")
-        try:
-            subprocess.run(['rosnode', 'kill', '/bridge_sector_node_3d'],
-                           capture_output=True, timeout=3, check=False)
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-        if self.bridge_tuner_proc is not None and \
-                self.bridge_tuner_proc.poll() is None:
-            try:
-                self.bridge_tuner_proc.terminate()
-                self.bridge_tuner_proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.bridge_tuner_proc.kill()
-        self.bridge_tuner_proc = None
-        rospy.loginfo("[GGTuner] [bridge] killed")
-    ### HJ : end
-
     ## IY : persist velopt tuning to a single overwritten yaml so the latest
     ##   slider state survives session restarts. Path is fixed under
     ##   rqt_gg_viewer/velopt_tun/ to keep tuning artifacts close to the UI.
@@ -974,16 +717,10 @@ class GGTunerNode:
     ##   bridge_effect is shared with fbga (Track3D inside velopt takes
     ##   g_weight=bridge_effect → mu / Omega scale handled in track3D.py).
     def _run_velopt_planner(self, vehicle_name, map_name, velopt_opts,
-                            bridge_effect=1.0, force_restart=False,
-                            ### HJ : per-point friction scaling toggle.
-                            ###      When True, base GGV is scaled in the NLP
-                            ###      by friction_sector mu — no per-friction
-                            ###      GGV directories required.
-                            use_friction_scaling=False):
+                            bridge_effect=1.0, force_restart=False):
         rospy.loginfo(
             f"[GGTuner] [velopt] update: vehicle={vehicle_name}, map={map_name}, "
             f"opts={velopt_opts}, bridge_effect={bridge_effect:.3f}, "
-            f"use_friction_scaling={use_friction_scaling}, "
             f"force_restart={force_restart}")
         self.status_pub.publish(f"VELOPT_STARTED: {vehicle_name}")
 
@@ -1023,16 +760,6 @@ class GGTunerNode:
         rospy.set_param('/vel_opt_3d/w_ax_corner_acc',     float(velopt_opts['w_ax_corner_acc']))
         rospy.set_param('/vel_opt_3d/w_ax_corner_k',       float(velopt_opts['w_ax_corner_k']))
         rospy.set_param('/vel_opt_3d/bridge_effect',       float(bridge_effect))
-        ### HJ : per-point friction scaling toggle (bypasses multi-GGV dir).
-        rospy.set_param('/vel_opt_3d/use_friction_scaling',
-                        bool(use_friction_scaling))
-        ### HJ : extra per-direction mu scale. Default 1.0 ≡ legacy isotropic
-        ###      scaling. Re-read by vel_opt every hot-reload / cold-start.
-        rospy.set_param('/vel_opt_3d/mu_scale_x',
-                        float(velopt_opts.get('mu_scale_x', 1.0)))
-        rospy.set_param('/vel_opt_3d/mu_scale_y',
-                        float(velopt_opts.get('mu_scale_y', 1.0)))
-        ### HJ : end
 
         if not force_restart:
             try:
@@ -1090,11 +817,6 @@ class GGTunerNode:
             f'_w_ax_corner_acc:={float(velopt_opts["w_ax_corner_acc"])}',
             f'_w_ax_corner_k:={float(velopt_opts["w_ax_corner_k"])}',
             f'_bridge_effect:={float(bridge_effect)}',
-            ### HJ : per-point friction scaling toggle
-            f'_use_friction_scaling:={str(bool(use_friction_scaling)).lower()}',
-            ### HJ : extra per-direction mu scale
-            f'_mu_scale_x:={float(velopt_opts.get("mu_scale_x", 1.0))}',
-            f'_mu_scale_y:={float(velopt_opts.get("mu_scale_y", 1.0))}',
         ]
         rospy.loginfo(f"[GGTuner] [velopt] cold start: {' '.join(cmd)}")
         try:
@@ -1209,22 +931,11 @@ class GGTunerNode:
                     ## IY : overlay rqt RACELINE_KEYS onto latest yml (idempotent)
                     self._update_raceline_keys_in_yml(vehicle_name, tuning)
                     ## IY : end
-                    ## IY : raceline keeps the old g_weight signature; map from bridge_effect
-                    ### HJ : also thread bridge constraints + tuning from rqt
-                    ###      so gen_global_racing_line.py can read both yaml
-                    ###      (positions) and rqt (global knobs). Defaults in
-                    ###      _run_raceline reproduce legacy behaviour if any
-                    ###      bridge_* keys are absent.
+                    ## IY : g_weight no longer routed from rqt; raceline launch
+                    ##   default (1.0) is used. Re-add a slider if needed.
                     ok = self._run_raceline(
                         vehicle_name, run_opts['map'],
-                        safety_distance=run_opts['safety_distance'],
-                        g_weight=run_opts['bridge_effect'],
-                        bridge_constraints_enable=run_opts[
-                            'bridge_constraints_enable'],
-                        bridge_pre_m=run_opts['bridge_pre_m'],
-                        bridge_post_m=run_opts['bridge_post_m'],
-                        bridge_force_center=run_opts['bridge_force_center'],
-                        bridge_chi_max_rad=run_opts['bridge_chi_max_rad'])
+                        safety_distance=run_opts['safety_distance'])
                     ## IY : end
                     if not ok:
                         rospy.logerr(f"[GGTuner] raceline failed")
@@ -1235,26 +946,30 @@ class GGTunerNode:
                 ## IY : Stage 4 single-engine dispatch (vel_engine selector)
                 engine = run_opts.get('vel_engine', 'none')
                 force_restart = bool(run_opts['regen_raceline'])
-                if engine == 'fbga':
-                    self._kill_velopt_planner()       # ensure other engine off
-                    ok = self._run_fbga_planner(
-                        vehicle_name,
-                        enable_mu=run_opts['enable_mu'],
-                        force_restart=force_restart,
-                        bridge_effect=run_opts['bridge_effect'],
-                        g_tilde_soft_beta=run_opts['g_tilde_soft_beta'],
-                        smooth_mu=run_opts['smooth_mu'],
-                        mu_smooth_window=run_opts['mu_smooth_window'],
-                        mu_smooth_polyorder=run_opts['mu_smooth_polyorder'],
-                        smooth_kappa=run_opts['smooth_kappa'],
-                        kappa_smooth_window=run_opts['kappa_smooth_window'],
-                        kappa_smooth_polyorder=run_opts['kappa_smooth_polyorder'],
-                        slope_brake_margin=run_opts['slope_brake_margin'],
-                        slope_brake_vmax=run_opts['slope_brake_vmax'])
-                    if not ok:
-                        return
-                    self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
-                elif engine == 'velopt':
+                ## IY : 'fbga' branch hidden — vel_engine enum no longer
+                ##   exposes 'fbga' in rqt. Helpers _run_fbga_planner /
+                ##   _kill_fbga_planner remain for re-enabling later.
+                # if engine == 'fbga':
+                #     self._kill_velopt_planner()       # ensure other engine off
+                #     ok = self._run_fbga_planner(
+                #         vehicle_name,
+                #         enable_mu=run_opts['enable_mu'],
+                #         force_restart=force_restart,
+                #         bridge_effect=run_opts['bridge_effect'],
+                #         g_tilde_soft_beta=run_opts['g_tilde_soft_beta'],
+                #         smooth_mu=run_opts['smooth_mu'],
+                #         mu_smooth_window=run_opts['mu_smooth_window'],
+                #         mu_smooth_polyorder=run_opts['mu_smooth_polyorder'],
+                #         smooth_kappa=run_opts['smooth_kappa'],
+                #         kappa_smooth_window=run_opts['kappa_smooth_window'],
+                #         kappa_smooth_polyorder=run_opts['kappa_smooth_polyorder'],
+                #         slope_brake_margin=run_opts['slope_brake_margin'],
+                #         slope_brake_vmax=run_opts['slope_brake_vmax'])
+                #     if not ok:
+                #         return
+                #     self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
+                # elif engine == 'velopt':
+                if engine == 'velopt':
                     self._kill_fbga_planner()         # ensure other engine off
                     ## IY : rqt vo_* keys → velopt_opts dict (internal keys
                     ##   match _run_velopt_planner's ROS-param-style names).
@@ -1277,12 +992,6 @@ class GGTunerNode:
                         ## IY : direct ax_pos^2 corner penalty
                         'w_ax_corner_acc':      run_opts['vo_w_axc'],
                         'w_ax_corner_k':        run_opts['vo_k_axc'],
-                        ### HJ : extra per-direction mu scale (persisted in
-                        ###      velopt_tuning.yml via _save_velopt_yaml prefixing
-                        ###      vo_*; vel_opt reads them as rosparam each reload).
-                        'mu_scale_x':           run_opts['vo_mu_scale_x'],
-                        'mu_scale_y':           run_opts['vo_mu_scale_y'],
-                        ### HJ : end
                     }
                     ## IY : persist velopt slider state (single overwriting yml)
                     self._save_velopt_yaml(
@@ -1292,10 +1001,7 @@ class GGTunerNode:
                     ok = self._run_velopt_planner(
                         vehicle_name, run_opts['map'], velopt_opts,
                         bridge_effect=run_opts['vo_bridge'],
-                        force_restart=force_restart,
-                        ### HJ : per-point friction scaling toggle
-                        use_friction_scaling=run_opts[
-                            'vo_use_friction_scaling'])
+                        force_restart=force_restart)
                     if not ok:
                         return
                     self.status_pub.publish(f"DONE_ALL: {vehicle_name}")
@@ -1324,9 +1030,7 @@ class GGTunerNode:
         ##   change here. dict.get() (not getattr) is the correct fallback for
         ##   dynamic_reconfigure.Config — getattr can't catch its KeyError.
         APPLY_KEYS = ('apply', 'apply_ggv', 'apply_raceline',
-                      'apply_fbga', 'apply_velopt',
-                      ### HJ : Bridge group apply mirror
-                      'apply_bridge')
+                      'apply_fbga', 'apply_velopt')
         apply_any = any(bool(config.get(k, False)) for k in APPLY_KEYS)
         ## IY : end
 
@@ -1346,76 +1050,17 @@ class GGTunerNode:
                 return config
         ## IY : end
 
-        ## IY : Save/Load *all* params (rqt_reconfigure top-of-page triggers).
-        ##   Auto-clear after handling; early-return when no apply pending so a
-        ##   tuning yml round-trip never accidentally fires the pipeline.
-        if getattr(config, 'save_params', False):
-            try:
-                self._save_params_yaml(config)
-            except Exception as e:
-                rospy.logerr(f"[GGTuner] save_params exception: {e}")
-                self.status_pub.publish(
-                    f"SAVE_PARAMS_EXCEPTION: {str(e)[:80]}")
-            config.save_params = False
-            if not apply_any:
-                return config
-
-        if getattr(config, 'load_params', False):
-            try:
-                self._load_params_yaml_into(config)
-            except Exception as e:
-                rospy.logerr(f"[GGTuner] load_params exception: {e}")
-                self.status_pub.publish(
-                    f"LOAD_PARAMS_EXCEPTION: {str(e)[:80]}")
-            config.load_params = False
+        ## IY : sector_slicing toggle (independent of apply trigger)
+        new_sector_state = bool(getattr(config, 'run_sector_slicing', False))
+        if new_sector_state != self._last_sector_slicing_state:
+            if new_sector_state:
+                self._run_sector_slicing(str(config.map))
+            else:
+                self._kill_sector_slicing()
+            self._last_sector_slicing_state = new_sector_state
             if not apply_any:
                 return config
         ## IY : end
-
-        ### HJ : sector_slicing / bridge_tuner are now *trigger* checkboxes
-        ###      (mirroring apply/save_now): clicking True spawns the GUI and
-        ###      the box auto-returns to False. The matplotlib GUIs own their
-        ###      own lifecycle — user clicks Done or closes the window to
-        ###      terminate, no separate "uncheck to kill" step. This avoids
-        ###      the prior stale-toggle confusion where leaving the box True
-        ###      across sessions silently re-spawned the GUI on next launch.
-        ###      Already-running spawn requests are no-ops (logged).
-        if bool(getattr(config, 'run_sector_slicing', False)):
-            self._run_sector_slicing(str(config.map))
-            config.run_sector_slicing = False
-            self._last_sector_slicing_state = False
-            if not apply_any:
-                return config
-        if bool(getattr(config, 'run_bridge_tuner', False)):
-            self._run_bridge_tuner(str(config.map))
-            config.run_bridge_tuner = False
-            self._last_bridge_tuner_state = False
-            if not apply_any:
-                return config
-        ### HJ : end
-
-        ### HJ : if the user switched maps in rqt, re-sync bridge sliders from
-        ###      the new map's yaml. Done here (in reconfigure_cb) because
-        ###      this is the only callback that sees `config.map` changes.
-        cur_map = str(getattr(config, 'map', '') or '')
-        if cur_map and cur_map != self._last_bridge_yaml_map:
-            self._sync_bridge_cfg_from_yaml(cur_map)
-            ### HJ : update_configuration above triggers another callback —
-            ###      but the values are already aligned so it's a no-op.
-            ###      Read the (possibly updated) config back for downstream
-            ###      use so we don't dump pre-sync rqt values to yaml.
-            try:
-                synced = self.srv.config
-                for k in ('bridge_constraints_enable', 'bridge_pre_m',
-                          'bridge_post_m', 'bridge_force_center',
-                          'bridge_chi_max_rad'):
-                    if k in synced:
-                        setattr(config, k, synced[k])
-            except Exception:
-                pass
-            if not apply_any:
-                return config
-        ### HJ : end
 
         if not apply_any:
             return config
@@ -1439,19 +1084,22 @@ class GGTunerNode:
             ## IY : Stage 4 single selector (replaces run_fbga bool)
             'vel_engine':       str(config.vel_engine),
             ## IY : end
-            'enable_mu':        bool(config.enable_mu),
             'safety_distance':  float(config.safety_distance),
-            ## IY : FBGA knobs (used when vel_engine='fbga'; bridge_effect also shared by velopt)
-            'bridge_effect':            float(config.bridge_effect),
-            'g_tilde_soft_beta':        float(config.g_tilde_soft_beta),
-            'smooth_mu':                bool(config.smooth_mu),
-            'mu_smooth_window':         int(config.mu_smooth_window),
-            'mu_smooth_polyorder':      int(config.mu_smooth_polyorder),
-            'smooth_kappa':             bool(config.smooth_kappa),
-            'kappa_smooth_window':      int(config.kappa_smooth_window),
-            'kappa_smooth_polyorder':   int(config.kappa_smooth_polyorder),
-            'slope_brake_margin':       float(config.slope_brake_margin),
-            'slope_brake_vmax':         float(config.slope_brake_vmax),
+            ## IY : FBGA knobs hidden in rqt — defaults kept here so the FBGA
+            ##   helpers still have something to read if re-enabled. The
+            ##   `if engine == 'fbga'` branch in _run_full_pipeline is
+            ##   commented out, so these are effectively unused.
+            # 'enable_mu':                bool(config.enable_mu),
+            # 'bridge_effect':            float(config.bridge_effect),
+            # 'g_tilde_soft_beta':        float(config.g_tilde_soft_beta),
+            # 'smooth_mu':                bool(config.smooth_mu),
+            # 'mu_smooth_window':         int(config.mu_smooth_window),
+            # 'mu_smooth_polyorder':      int(config.mu_smooth_polyorder),
+            # 'smooth_kappa':             bool(config.smooth_kappa),
+            # 'kappa_smooth_window':      int(config.kappa_smooth_window),
+            # 'kappa_smooth_polyorder':   int(config.kappa_smooth_polyorder),
+            # 'slope_brake_margin':       float(config.slope_brake_margin),
+            # 'slope_brake_vmax':         float(config.slope_brake_vmax),
             ## IY : end
             ## IY : VelOpt knobs (rqt names shortened velopt_* → vo_*).
             'vo_bridge':         float(config.vo_bridge),
@@ -1474,30 +1122,6 @@ class GGTunerNode:
             'vo_w_axc':          float(config.vo_w_axc),
             'vo_k_axc':          float(config.vo_k_axc),
             ## IY : end
-            ### HJ : per-point friction scaling toggle (velopt NLP layer).
-            ###      When True the base GGV is scaled in-NLP by mu_scale_k[k]
-            ###      from /friction_map_params/Sector{i}/friction; multi-GGV
-            ###      directory lookup is bypassed.
-            'vo_use_friction_scaling': bool(config.vo_use_friction_scaling),
-            ### HJ : extra per-direction scale on top of sector mu (live yaml).
-            ###      Default 1.0 ≡ legacy isotropic scaling. Re-read from
-            ###      rosparam by vel_opt every reload, so this updates each
-            ###      apply with no node restart needed.
-            'vo_mu_scale_x': float(config.vo_mu_scale_x),
-            'vo_mu_scale_y': float(config.vo_mu_scale_y),
-            ### HJ : end
-            ### HJ : bridge centerline / heading-lock toggle (raceline NLP).
-            ###      Bridge zones (start/end indices) live in
-            ###      <map>/bridge_sectors.yaml; the *tuning* lives here in
-            ###      rqt and is forwarded as roslaunch args so a single yaml
-            ###      can be tuned without reopening the GUI. Missing yaml ⇒
-            ###      no-op (silent).
-            'bridge_constraints_enable': bool(config.bridge_constraints_enable),
-            'bridge_pre_m':              float(config.bridge_pre_m),
-            'bridge_post_m':             float(config.bridge_post_m),
-            'bridge_force_center':       bool(config.bridge_force_center),
-            'bridge_chi_max_rad':        float(config.bridge_chi_max_rad),
-            ### HJ : end
         }
         ## IY : end
 
@@ -1510,13 +1134,6 @@ class GGTunerNode:
                 setattr(config, k, False)
             return config
         ## IY : end
-
-        ### HJ : persist current bridge sliders to <map>/bridge_sectors.yaml
-        ###      on every apply. yaml is the single source of truth — the
-        ###      raceline NLP reads tuning back from it (positions + tuning
-        ###      both come from yaml, not CLI args, for the per-bridge case).
-        self._dump_bridge_cfg_to_yaml(run_opts)
-        ### HJ : end
 
         ## IY : background thread
         self.pipeline_thread = threading.Thread(
@@ -1555,16 +1172,6 @@ class GGTunerNode:
                 self.sector_slicing_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.sector_slicing_proc.kill()
-        ### HJ : also clean up bridge_tuner roslaunch
-        if self.bridge_tuner_proc is not None and \
-                self.bridge_tuner_proc.poll() is None:
-            rospy.loginfo("[GGTuner] Terminating bridge_tuner roslaunch...")
-            try:
-                self.bridge_tuner_proc.terminate()
-                self.bridge_tuner_proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.bridge_tuner_proc.kill()
-        ### HJ : end
 
 
 if __name__ == '__main__':

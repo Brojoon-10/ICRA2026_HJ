@@ -17,15 +17,6 @@
   <arg name="start_from"       default="1" />
   <!-- ## IY : bridge mu scale baked into raceline -->
   <arg name="g_weight"         default="1.0" />
-  <!-- ### HJ : bridge centerline / heading-lock.
-       Yaml at maps/<map>/bridge_sectors.yaml stores positions only
-       (start/end). Tuning knobs come from rqt (Bridge group) and are
-       forwarded here as args. Missing yaml ⇒ silent no-op. -->
-  <arg name="bridge_constraints_enable" default="true" />
-  <arg name="bridge_pre_m"              default="0.0" />
-  <arg name="bridge_post_m"             default="0.0" />
-  <arg name="bridge_force_center"       default="false" />
-  <arg name="bridge_chi_max_rad"        default="-1.0" />
 
   <!-- ── Step 0: GG diagram generation (optional, one-time per vehicle) ──── -->
   <node if="$(arg run_gg)"
@@ -38,5 +29,5 @@
   <node unless="$(arg run_gg)"
         pkg="global_line_3d" type="run_pipeline.sh" name="run_pipeline"
         output="screen"
-        args="--map-dir $(find stack_master)/maps/$(arg map) --track $(arg map) --vehicle $(arg vehicle) --gg-mode $(arg gg_mode) --safety-distance $(arg safety_distance) --bin-size $(arg bin_size) --smooth-step $(arg smooth_step) --opt-step $(arg opt_step) --output $(arg output) --raw-csv $(arg raw_csv) --gen3d-csv $(arg gen3d_csv) --smoothed-csv $(arg smoothed_csv) --raceline-csv $(arg raceline_csv) --start-from $(arg start_from) --g-weight $(arg g_weight) --bridge-constraints-enable $(arg bridge_constraints_enable) --bridge-pre-m $(arg bridge_pre_m) --bridge-post-m $(arg bridge_post_m) --bridge-force-center $(arg bridge_force_center) --bridge-chi-max-rad $(arg bridge_chi_max_rad)" />
+        args="--map-dir $(find stack_master)/maps/$(arg map) --track $(arg map) --vehicle $(arg vehicle) --gg-mode $(arg gg_mode) --safety-distance $(arg safety_distance) --bin-size $(arg bin_size) --smooth-step $(arg smooth_step) --opt-step $(arg opt_step) --output $(arg output) --raw-csv $(arg raw_csv) --gen3d-csv $(arg gen3d_csv) --smoothed-csv $(arg smoothed_csv) --raceline-csv $(arg raceline_csv) --start-from $(arg start_from) --g-weight $(arg g_weight)" />
 </launch>

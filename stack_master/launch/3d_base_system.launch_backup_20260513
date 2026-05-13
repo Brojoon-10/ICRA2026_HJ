@@ -91,9 +91,6 @@
     <node pkg="overtaking_sector_tuner_3d" type="ot_sector_server.py" name="overtake" output="screen" />
     <node pkg="static_obstacle_sector_tuner_3d" type="static_obs_sector_server.py" name="static_obs" output="screen" />
     <node pkg="friction_sector_tuner" type="friction_sector_server.py" name="friction" output="screen" />
-    <!-- ### HJ : bridge sector marker publisher — RViz visualisation of
-         <map>/bridge_sectors.yaml. Missing yaml ⇒ no markers (silent). -->
-    <node pkg="bridge_sector_tuner_3d" type="bridge_sector_server.py" name="bridge" output="screen" />
   </group>
 
   <!-- Velocity scaler -->

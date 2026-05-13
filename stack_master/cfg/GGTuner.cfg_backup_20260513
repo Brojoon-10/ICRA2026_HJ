@@ -7,40 +7,24 @@ from dynamic_reconfigure.parameter_generator_catkin import *
 
 gen = ParameterGenerator()
 
-## IY : Save/Load Params triggers — rendered at the top of the rqt_reconfigure
-##   page (defined before any group). save_params dumps ALL current values to
-##   rqt_gg_viewer/velopt_tun/gg_params_v<N+1>.yml. load_params reads the
-##   highest-versioned yml back into the dynamic_reconfigure server so the
-##   rqt sliders auto-update. Both auto-clear after handling (same pattern
-##   as `apply` / `save_now`).
-gen.add("save_params", bool_t, 0,
-        "Save all current GGTuner.cfg values to velopt_tun/gg_params_v<N+1>.yml "
-        "(auto-cleared after trigger)",
-        False)
-gen.add("load_params", bool_t, 0,
-        "Load latest velopt_tun/gg_params_v*.yml into rqt sliders "
-        "(auto-cleared after trigger)",
-        False)
-## IY : end
-
 # ========== GGV group ==========
 ggv = gen.add_group("GGV", state=True)
 
 # Grip scales (lap-time dominant)
 ggv.add("lambda_mu_x", double_t, 0,
         "Longitudinal grip scale (straight accel/brake limit)",
-        1.0, 0.2, 2.5)
+        1.2, 0.6, 1.5)
 ggv.add("lambda_mu_y", double_t, 0,
         "Lateral grip scale (corner speed limit)",
-        1.0, 0.2, 2.5)
+        1.2, 0.6, 1.5)
 
 # Power / top speed
 ggv.add("P_max", double_t, 0,
         "Motor max power [W]",
-        300.0, 50.0, 1000.0)
+        300.0, 100.0, 500.0)
 ggv.add("v_max", double_t, 0,
         "Absolute top speed [m/s]",
-        15.0, 4.0, 15.0)
+        12.0, 4.0, 15.0)
 
 # Combined slip shape (load dependence)
 ggv.add("p_Dx_2", double_t, 0,
@@ -66,7 +50,7 @@ ggv.add("epsilon", double_t, 0,
 # NLP caps (0 = unlimited)
 ggv.add("P_brake_max", double_t, 0,
         "Brake power cap [W] (0=unlimited, F_brake*V <= cap)",
-        300.0, 50.0, 1000.0)
+        0.0, 0.0, 500.0)
 ggv.add("ax_max_cap", double_t, 0,
         "Accel cap [m/s^2] (0=unlimited)",
         0.0, 0.0, 10.0)
@@ -113,13 +97,13 @@ raceline.add("regen_raceline", bool_t, 0,
              False)
 raceline.add("map", str_t, 0,
              "Map name (required for raceline regen; maps/<name>/)",
-             "eng_")
+             "eng_0410_v5")
 raceline.add("safety_distance", double_t, 0,
              "Track wall margin [m] (reduce for narrow tracks)",
              0.20, 0.05, 0.50)
 raceline.add("V_min", double_t, 0,
              "Raceline minimum speed [m/s] (0=unlimited)",
-             1.0, 0.0, 5.0)
+             2.0, 0.0, 5.0)
 raceline.add("w_T", double_t, 0,
              "Time weight (1=min-time optimization)",
              1.0, 0.0, 10.0)
@@ -141,59 +125,63 @@ raceline.add("apply_raceline", bool_t, 0,
 # ========== Stage 4 vel engine selector (root) ==========
 ## IY : single selector replaces run_fbga (bool). Only one engine publishes
 ##   /global_waypoints at a time → publisher conflict prevented.
+## IY : 'fbga' option hidden — FBGA group disabled (rqt + node callers).
+##   Re-enable by uncommenting fbga const + the FBGA group below + node bits.
 vel_engine_enum = gen.enum([
     gen.const("none",   str_t, "none",   "Stage 4 disabled"),
-    gen.const("fbga",   str_t, "fbga",   "FBGA forward/backward (C++ binary)"),
+    # gen.const("fbga",   str_t, "fbga",   "FBGA forward/backward (C++ binary)"),
     gen.const("velopt", str_t, "velopt", "3d_optimized_vel_planner NLP"),
 ], "Stage 4 velocity engine selector")
 gen.add("vel_engine", str_t, 0,
-        "Stage 4 engine: none / fbga / velopt",
+        "Stage 4 engine: none / velopt",
         "none", edit_method=vel_engine_enum)
 ## IY : end
 
-# ========== FBGA group ==========
-fbga = gen.add_group("FBGA", state=True)
-
-fbga.add("enable_mu", bool_t, 0,
-         "FBGA mu compensation (True=use pitch/slope, False=g_tilde only)",
-         True)
-## IY : bridge_effect (renamed from g_weight, matches 2.5d_vel_planner slope_correction)
-##   sin(mu)*N scaling on C++ FBGA ax_gravity. 1=physics, higher=more conservative.
-fbga.add("bridge_effect", double_t, 0,
-         "Slope ax_grav scale (1=physics, higher=more conservative). "
-         "Same role as 2.5d_vel_planner slope_correction.",
-         1.0, 0.0, 5.0)
-fbga.add("g_tilde_soft_beta", double_t, 0,
-         "softplus floor sharpness for g_tilde (1/beta m/s^2)",
-         20.0, 1.0, 100.0)
-fbga.add("smooth_mu", bool_t, 0,
-         "SG filter on mu / dmu_ds (kills cm-scale PCD noise)",
-         True)
-fbga.add("mu_smooth_window", int_t, 0,
-         "SG window length for mu (odd)",
-         21, 5, 51)
-fbga.add("mu_smooth_polyorder", int_t, 0,
-         "SG polynomial order for mu",
-         3, 1, 5)
-fbga.add("smooth_kappa", bool_t, 0,
-         "SG filter on kappa for vel calc only (path preserved)",
-         True)
-fbga.add("kappa_smooth_window", int_t, 0,
-         "SG window length for kappa (odd)",
-         21, 5, 51)
-fbga.add("kappa_smooth_polyorder", int_t, 0,
-         "SG polynomial order for kappa",
-         3, 1, 5)
-fbga.add("slope_brake_margin", double_t, 0,
-         "Pre-slope braking distance [m] (0=off)",
-         0.0, 0.0, 10.0)
-fbga.add("slope_brake_vmax", double_t, 0,
-         "Pre-slope Vmax cap [m/s]",
-         5.0, 0.5, 15.0)
-## IY : per-group Apply mirror
-fbga.add("apply_fbga", bool_t, 0,
-         "Apply (same as root `apply`, mirrored here for convenience)",
-         False)
+# ========== FBGA group (HIDDEN) ==========
+## IY : FBGA group fully commented out per request — rqt UI only.
+##   The FBGA python helpers in gg_tuner_node.py remain but are no longer
+##   reachable through rqt (vel_engine='fbga' enum removed). Re-enable by
+##   uncommenting this block AND the corresponding run_opts entries +
+##   `if engine == 'fbga'` branch in gg_tuner_node._run_full_pipeline.
+# fbga = gen.add_group("FBGA", state=True)
+#
+# fbga.add("enable_mu", bool_t, 0,
+#          "FBGA mu compensation (True=use pitch/slope, False=g_tilde only)",
+#          True)
+# fbga.add("bridge_effect", double_t, 0,
+#          "Slope ax_grav scale (1=physics, higher=more conservative). "
+#          "Same role as 2.5d_vel_planner slope_correction.",
+#          1.0, 0.0, 5.0)
+# fbga.add("g_tilde_soft_beta", double_t, 0,
+#          "softplus floor sharpness for g_tilde (1/beta m/s^2)",
+#          20.0, 1.0, 100.0)
+# fbga.add("smooth_mu", bool_t, 0,
+#          "SG filter on mu / dmu_ds (kills cm-scale PCD noise)",
+#          True)
+# fbga.add("mu_smooth_window", int_t, 0,
+#          "SG window length for mu (odd)",
+#          21, 5, 51)
+# fbga.add("mu_smooth_polyorder", int_t, 0,
+#          "SG polynomial order for mu",
+#          3, 1, 5)
+# fbga.add("smooth_kappa", bool_t, 0,
+#          "SG filter on kappa for vel calc only (path preserved)",
+#          True)
+# fbga.add("kappa_smooth_window", int_t, 0,
+#          "SG window length for kappa (odd)",
+#          21, 5, 51)
+# fbga.add("kappa_smooth_polyorder", int_t, 0,
+#          "SG polynomial order for kappa",
+#          3, 1, 5)
+# fbga.add("slope_brake_margin", double_t, 0,
+#          "Pre-slope braking distance [m] (0=off)",
+#          0.0, 0.0, 10.0)
+# fbga.add("slope_brake_vmax", double_t, 0,
+#          "Pre-slope Vmax cap [m/s]",
+#          5.0, 0.5, 15.0)
+# fbga.add("apply_fbga", bool_t, 0,
+#          "Apply (same as root `apply`, mirrored here for convenience)",
+#          False)
 ## IY : end
 
 # ========== VelOpt group (3d_optimized_vel_planner NLP) ==========
@@ -221,7 +209,7 @@ velopt.add("vo_w_jx", double_t, 0,
            "VelOpt jerk regularization base (higher=smoother accel/brake). "
            "Range tightened to 0~0.1 for fine slider control "
            "(text input still accepts any value).",
-           0.01, 0.0, 0.5)
+           0.01, 0.0, 0.1)
 ## IY : asymmetric jerk + corner-only smoothing (multiplied with w_jx).
 ##   ratio=1, alpha=0 → identical to legacy symmetric behavior.
 velopt.add("vo_acc_r", double_t, 0,
@@ -247,7 +235,7 @@ velopt.add("vo_k_alpha", double_t, 0,
            "(smaller=earlier saturation; |Omega_z|=k_alpha -> 76% activation)",
            0.2, 0.05, 2.0)
 velopt.add("vo_beta_acc", double_t, 0,
-           "[-] beta gain for accel-side jerk in transition zone " 
+           "[-] beta gain for accel-side jerk in transition zone "
            "(|dOmega_z/ds|-weighted, sharp entries/exits only)",
            0.0, 0.0, 10.0)
 velopt.add("vo_beta_brk", double_t, 0,
@@ -256,7 +244,7 @@ velopt.add("vo_beta_brk", double_t, 0,
            0.0, 0.0, 10.0)
 velopt.add("vo_k_beta", double_t, 0,
            "[1/m^2] beta tanh saturation scale for |dOmega_z/ds|",
-           0.5, 0.001, 5.0)
+           0.5, 0.05, 5.0)
 ## IY : end
 ## IY : direct ax_pos^2 penalty in corners. Catches steady-state corner
 ##   acceleration that jerk weighting cannot see (jx=0 once ax is constant).
@@ -269,39 +257,8 @@ velopt.add("vo_w_axc", double_t, 0,
 velopt.add("vo_k_axc", double_t, 0,
            "[1/m] ax_pos corner tanh saturation scale "
            "(smaller=earlier saturation; |Omega_z|=k_axc -> 76% activation)",
-           0.2, 0.001, 5.0)
+           0.2, 0.05, 2.0)
 ## IY : end
-### HJ : per-point friction scaling (multiply base ax_max/ay_max/ax_min by
-###      friction_sector mu). When True, multi-GGV (separate <base>_fNNN
-###      directories) is bypassed and the *base* GGV is scaled in-NLP by
-###      mu_scale_k[k] from /friction_map_params/Sector{i}/friction. This
-###      avoids needing per-friction GGV regenerations for short bridge
-###      patches — scaling a 2 m segment by 0.6 friction inside the NLP is
-###      far cheaper than precomputing a new GG diagram for it.
-velopt.add("vo_use_friction_scaling", bool_t, 0,
-           "Scale base GGV (ax_max/ay_max/ax_min) per-point by friction "
-           "sector mu inside the NLP. Bypasses multi-GGV directory lookup. "
-           "Recommended True for short friction patches (e.g., 2m bridges).",
-           False)
-### HJ : per-direction extra scale on top of the friction-sector mu.
-###      Friction is theoretically isotropic (same μ in x and y), but in
-###      practice longitudinal vs lateral grip can degrade differently on a
-###      bridge / wet patch (e.g. lateral often drops earlier than
-###      longitudinal). The friction_sector mu stays as-is (absolute μ);
-###      these extra factors multiply the (ax_min, ax_max) and ay_max
-###      envelopes independently. Default 1.0 = identical x/y scaling = legacy
-###      behavior. Only applied when vo_use_friction_scaling is True.
-velopt.add("vo_mu_scale_x", double_t, 0,
-           "Extra longitudinal (ax_min, ax_max) scale on top of friction "
-           "sector mu. 1.0 = use sector mu as-is. <1 reduces accel/brake "
-           "envelope further. Only active when vo_use_friction_scaling=True.",
-           1.0, 0.5, 1.5)
-velopt.add("vo_mu_scale_y", double_t, 0,
-           "Extra lateral (ay_max) scale on top of friction sector mu. "
-           "1.0 = use sector mu as-is. <1 reduces cornering envelope further. "
-           "Only active when vo_use_friction_scaling=True.",
-           1.0, 0.5, 1.5)
-### HJ : end
 ## IY : per-group Apply mirror
 velopt.add("apply_velopt", bool_t, 0,
            "Apply (same as root `apply`, mirrored here for convenience)",
@@ -309,59 +266,13 @@ velopt.add("apply_velopt", bool_t, 0,
 ## IY : end
 
 # ========== Sector slicing group ==========
-## IY : sector_slicing — checkbox spawns 3d_sector_slicing.launch
+## IY : sector_slicing — checkbox spawns/kills 3d_sector_slicing.launch
 ##   (general/ot/static_obs/friction sector tuners) for the selected map.
-### HJ : trigger-style — auto-clears after spawning. Close the GUI windows
-###      directly to terminate; the box does NOT kill on uncheck (avoids
-###      stale-True confusion across sessions).
 sectors = gen.add_group("Sectors", state=True)
 sectors.add("run_sector_slicing", bool_t, 0,
-            "Trigger: spawn 3d_sector_slicing.launch for the selected map. "
-            "Auto-clears after spawn. Close GUI windows to terminate.",
+            "Spawn/kill 3d_sector_slicing.launch for the selected map "
+            "(interactive RViz workflow). Off = nodes killed.",
             False)
-
-### HJ : Bridge centerline / heading-lock group.
-###      Defines bridge zones (start/end indices only) on the
-###      *smoothed centerline CSV* (pre-optimization). Tuning knobs
-###      (pre_m, post_m, chi_max_rad, force_center) are GLOBAL — applied to
-###      every bridge in the yaml — and live here in rqt so they can be
-###      tweaked without reopening the GUI. The yaml stores positions only;
-###      this matches the established sector-tuner pattern (GUI marks
-###      *positions*, rqt tunes *parameters*). Missing yaml ⇒ silent no-op
-###      (tracks without bridges work unchanged).
-bridge = gen.add_group("Bridge", state=True)
-bridge.add("run_bridge_tuner", bool_t, 0,
-           "Spawn/kill bridge_sector_tuner_3d GUI for the selected map. "
-           "GUI marks bridge zones (pairs of Select-S clicks) and writes "
-           "<map>/bridge_sectors.yaml with start/end indices only.",
-           False)
-bridge.add("bridge_constraints_enable", bool_t, 0,
-           "Apply bridge constraints from <map>/bridge_sectors.yaml during "
-           "raceline regen. Missing yaml ⇒ no-op (no error).",
-           True)
-### HJ : global tuning applied to every bridge in the yaml.
-bridge.add("bridge_pre_m", double_t, 0,
-           "Extend the bridge constraint zone BEFORE each bridge's start by "
-           "this many meters of s. 0 = no extension. Applied to every bridge.",
-           0.0, 0.0, 5.0)
-bridge.add("bridge_post_m", double_t, 0,
-           "Extend the bridge constraint zone AFTER each bridge's end by "
-           "this many meters of s. 0 = no extension. Applied to every bridge.",
-           0.0, 0.0, 5.0)
-bridge.add("bridge_force_center", bool_t, 0,
-           "Pin the racing line to track center (n ≈ 0) inside every bridge "
-           "zone. Safety distance is automatically satisfied.",
-           False)
-bridge.add("bridge_chi_max_rad", double_t, 0,
-           "Bound |chi| (heading vs centerline) below this value inside every "
-           "bridge zone. <0 disables (no heading constraint). 0 = strictly "
-           "parallel to bridge longitudinal direction.",
-           0.0, -1.0, 0.7854)  # max ≈ π/4
-### HJ : end
-bridge.add("apply_bridge", bool_t, 0,
-           "Apply (same as root `apply`, mirrored here for convenience)",
-           False)
-### HJ : end
 
 # ========== Triggers (root, always visible) ==========
 gen.add("apply", bool_t, 0,

@@ -76,21 +76,6 @@ params = {
     ## IY : bridge mu scale baked into raceline (1.0=as-is, 0=flat, 1.5=amplify)
     'g_weight': 1.0,
     ## IY : end
-    ### HJ : bridge centerline / heading-lock constraints.
-    ###      Yaml at <map>/bridge_sectors.yaml stores *positions only*
-    ###      (Bridge{i}: {start, end} — smoothed-CSV row indices). The tuning
-    ###      knobs below are GLOBAL — applied to every bridge in the yaml.
-    ###      They come from rqt (Bridge group) and are forwarded via
-    ###      run_pipeline.sh args. Default values reproduce legacy behavior:
-    ###      no extension, no centerline pin, no heading bound. Missing yaml
-    ###      OR bridge_constraints_enable=False ⇒ no added constraints.
-    'bridge_constraints_enable': True,
-    'bridge_yaml_dir': '',  # injected by run_pipeline.sh (MAP_DIR)
-    'bridge_pre_m':        0.0,
-    'bridge_post_m':       0.0,
-    'bridge_force_center': False,
-    'bridge_chi_max_rad':  -1.0,
-    ### HJ : end
     'w_jx': 1e-2,  # cost weight for jerk x-direction
     'w_jy': 1e-2,  # cost weight for jerk y-direction
     # min time
@@ -167,198 +152,6 @@ with open(vehicle_params_path, 'r') as stream:
 from track3D import Track3D
 from ggManager import GGManager
 
-
-### HJ : bridge sector adapter.
-###      Reads <map>/bridge_sectors.yaml (optional, positions-only) and the
-###      *global* tuning knobs forwarded from rqt, then projects them onto
-###      the NLP grid produced by track_handler.resample(...). Returns a list
-###      `bridge_state` of length track_handler.s.size where each entry is
-###      either None (no bridge ⇒ legacy bounds) or a dict
-###      {'force_center': bool, 'chi_max_rad': float}.
-###
-###      Yaml schema (positions only — tuning lives in rqt):
-###        n_bridges: N
-###        Bridge0: {start: <idx>, end: <idx>}
-###        Bridge1: {start: <idx>, end: <idx>}
-###        ...
-###
-###      Tuning args (global, from rqt → run_pipeline.sh args):
-###        pre_m, post_m  : extend each bridge zone before/after [m of s]
-###        force_center   : pin n ≈ 0 inside every bridge
-###        chi_max_rad    : bound |chi| inside every bridge (<0 disables)
-###
-###      Index mapping: yaml stores start/end as smoothed-CSV row indices
-###      (pre-resample). We resolve those to s [m] via the smoothed CSV's
-###      s_m column, extend by ±(pre_m, post_m), then mark every NLP grid
-###      step whose s falls inside the union of zones.
-###
-###      No-op cases (all silent — non-bridge maps work unchanged):
-###        - enable=False
-###        - yaml file missing / yaml has 0 bridges
-###        - force_center=False AND chi_max_rad<0 (no actual constraint set)
-###        - smoothed CSV missing (defensive)
-def _build_bridge_state_table(track_handler, smoothed_csv_path,
-                              bridge_yaml_dir, enable,
-                              pre_m, post_m, force_center, chi_max_rad):
-    n_grid = int(track_handler.s.size)
-    none_table = [None] * n_grid
-    if not enable:
-        return none_table
-    ### HJ : both knobs at "off" ⇒ nothing to enforce even if yaml exists.
-    ### HJ : early-exit only when BOTH CLI fallbacks are disabled (no yaml
-    ###      bridge can override since per-bridge entries can opt into one
-    ###      knob even if the CLI fallback has it off — but in that case the
-    ###      per-bridge fields are the truth, so we don't short-circuit here).
-    ###      yaml-enable check below subsumes the all-disabled case anyway.
-    if not bridge_yaml_dir:
-        return none_table
-    yaml_path = os.path.join(bridge_yaml_dir, 'bridge_sectors.yaml')
-    if not os.path.exists(yaml_path):
-        return none_table
-    try:
-        with open(yaml_path, 'r') as f:
-            doc = yaml.safe_load(f) or {}
-    except Exception as e:
-        print(f'[gen_global_racing_line] bridge yaml parse failed '
-              f'({yaml_path}): {e} — no-op')
-        return none_table
-    ### HJ : yaml-level master enable overrides CLI. If yaml says off, no
-    ###      bridges apply regardless of CLI args (yaml is single truth).
-    if not bool(doc.get('bridge_constraints_enable', True)):
-        return none_table
-    n_bridges = int(doc.get('n_bridges', 0))
-    if n_bridges <= 0:
-        return none_table
-    if not os.path.exists(smoothed_csv_path):
-        print(f'[gen_global_racing_line] smoothed CSV not found '
-              f'({smoothed_csv_path}) — bridge yaml ignored')
-        return none_table
-    try:
-        df_smooth = pd.read_csv(smoothed_csv_path)
-        s_smooth = df_smooth['s_m'].to_numpy()
-    except Exception as e:
-        print(f'[gen_global_racing_line] failed to read s_m from '
-              f'{smoothed_csv_path}: {e} — bridge yaml ignored')
-        return none_table
-    s_total = float(s_smooth[-1] - s_smooth[0]) if len(s_smooth) > 1 else 0.0
-    closed_loop = s_total > 0.0
-
-    s_grid = track_handler.s
-    pre_m_f = float(pre_m)
-    post_m_f = float(post_m)
-    ### HJ : per-grid-step `ramp ∈ [0, 1]` blending legacy bound (ramp=0) to
-    ###      full lock (ramp=1). NLP can solve discontinuous box constraints
-    ###      fine — the ramp just makes the tuning meaning more intuitive:
-    ###      pre_m/post_m become "ramp length" rather than "hard zone
-    ###      extension", and the corridor narrows progressively so a small
-    ###      pre_m still produces a smooth approach.
-    ###          core (s_start..s_end):                 ramp = 1
-    ###          pre  (s_start-pre_m..s_start):         ramp linear 0 → 1
-    ###          post (s_end..s_end+post_m):            ramp linear 1 → 0
-    ###          else:                                  ramp = 0 (entry None)
-    ###      Overlapping bridges take the *max* ramp at each step.
-    table = [None] * n_grid
-    n_used = 0
-
-    def _bridge_ramp(sk_in, core_start, core_end, pre, post):
-        """Return ramp value at sk_in for one bridge's extended zone.
-        Output is 1.0 in the hard core, linear 0→1 across pre, linear 1→0
-        across post, and 0.0 outside the extended zone (which we should not
-        be queried at).
-        """
-        if core_start <= sk_in <= core_end:
-            return 1.0
-        if (core_start - pre) <= sk_in < core_start and pre > 0.0:
-            return (sk_in - (core_start - pre)) / pre
-        if core_end < sk_in <= (core_end + post) and post > 0.0:
-            return 1.0 - (sk_in - core_end) / post
-        ### HJ : pre==0 or post==0 boundary case — caller already filtered
-        ### `in_extended` above, so we're inside the extended zone but the
-        ### ramp length is zero ⇒ full lock immediately (legacy hard
-        ### behaviour preserved when pre/post are 0).
-        return 1.0
-
-    for i in range(n_bridges):
-        b = doc.get(f'Bridge{i}')
-        if not isinstance(b, dict):
-            continue
-        try:
-            s_i = int(b['start'])
-            e_i = int(b['end'])
-        except (KeyError, ValueError, TypeError):
-            continue
-        s_i = max(0, min(s_i, len(s_smooth) - 1))
-        e_i = max(0, min(e_i, len(s_smooth) - 1))
-        if e_i < s_i:
-            s_i, e_i = e_i, s_i
-        ### HJ : per-bridge tuning lives in yaml (single source of truth).
-        ###      Function-level pre_m/post_m/force_center/chi_max_rad serve
-        ###      as fallbacks when a particular bridge entry omits a field
-        ###      (e.g. legacy yamls or hand-edits). All four are looked up
-        ###      independently so a partial bridge dict still works.
-        b_pre  = float(b.get('pre_m',        pre_m_f))
-        b_post = float(b.get('post_m',       post_m_f))
-        b_fc   = bool (b.get('force_center', force_center))
-        b_chi  = float(b.get('chi_max_rad',  chi_max_rad))
-        ### HJ : skip a bridge whose tuning is fully disabled — same logic
-        ###      as the early-exit at the start of this function, applied
-        ###      per-bridge so a yaml mixing armed and disarmed bridges is
-        ###      handled correctly.
-        if (not b_fc) and b_chi < 0.0:
-            continue
-        core_start = float(s_smooth[s_i])
-        core_end   = float(s_smooth[e_i])
-        ext_start  = core_start - b_pre
-        ext_end    = core_end   + b_post
-        for k in range(n_grid):
-            sk = float(s_grid[k])
-            ### HJ : place sk into the bridge's local s frame for closed-track
-            ### wrap-around. If the extended zone crosses s=0 / s=s_total,
-            ### shift sk by ±s_total to land it inside [ext_start, ext_end].
-            sk_local = sk
-            in_extended = (ext_start <= sk_local <= ext_end)
-            if (not in_extended) and closed_loop:
-                if ext_start < 0.0 and sk_local >= ext_start + s_total:
-                    sk_local -= s_total
-                    in_extended = (ext_start <= sk_local <= ext_end)
-                elif ext_end > s_total and sk_local <= ext_end - s_total:
-                    sk_local += s_total
-                    in_extended = (ext_start <= sk_local <= ext_end)
-            if not in_extended:
-                continue
-            r = _bridge_ramp(sk_local, core_start, core_end,
-                             b_pre, b_post)
-            cur = table[k]
-            if cur is None:
-                cur = {'force_center': bool(b_fc),
-                       'chi_max_rad': float(b_chi),
-                       'ramp': float(r)}
-                table[k] = cur
-            else:
-                ### HJ : overlapping bridges merge tightest: max ramp +
-                ###      force_center OR-merge + chi_max picks the smaller
-                ###      non-negative value (tighter clamp).
-                if r > cur['ramp']:
-                    cur['ramp'] = float(r)
-                if b_fc:
-                    cur['force_center'] = True
-                if b_chi >= 0.0:
-                    if cur['chi_max_rad'] < 0.0 or b_chi < cur['chi_max_rad']:
-                        cur['chi_max_rad'] = float(b_chi)
-        n_used += 1
-
-    if n_used > 0:
-        n_active = sum(1 for v in table if v is not None)
-        n_core   = sum(1 for v in table if v is not None and v['ramp'] >= 0.999)
-        print(f'[gen_global_racing_line] bridge constraints active on '
-              f'{n_active}/{n_grid} grid points across {n_used} bridge(s); '
-              f'core(ramp=1)={n_core}, ramp pts={n_active - n_core}; '
-              f'CLI fallbacks: pre={pre_m:.2f}m, post={post_m:.2f}m, '
-              f'force_center={force_center}, chi_max_rad={chi_max_rad:.3f}')
-    return table
-### HJ : end
-
-
 def calc_global_raceline(
         track_name: str,
         vehicle_params: dict,
@@ -377,15 +170,6 @@ def calc_global_raceline(
         ## IY : bridge mu scale (forwarded to Track3D)
         g_weight: float,
         ## IY : end
-        ### HJ : bridge centerline / heading-lock — optional, off ⇒ no-op.
-        ###      Tuning knobs are GLOBAL (applied to every bridge in yaml).
-        bridge_constraints_enable: bool,
-        bridge_yaml_dir: str,
-        bridge_pre_m: float,
-        bridge_post_m: float,
-        bridge_force_center: bool,
-        bridge_chi_max_rad: float,
-        ### HJ : end
         neglect_w_omega_x: bool,
         neglect_w_omega_y: bool,
         neglect_euler: bool,
@@ -405,24 +189,6 @@ def calc_global_raceline(
 
     ### HJ : resample to optimization grid (coarser than smooth for NLP performance)
     track_handler.resample(step_size_opt)
-    ### HJ : end
-
-    ### HJ : load optional bridge sector yaml and build a per-NLP-step bound
-    ###      override table. Yaml has positions only; tuning knobs are
-    ###      globals forwarded from rqt. Missing yaml or both knobs at "off"
-    ###      ⇒ override table stays all-None ⇒ bound expressions reduce to
-    ###      the legacy formula (no behavioral change for tracks without
-    ###      bridges).
-    bridge_state = _build_bridge_state_table(
-        track_handler=track_handler,
-        smoothed_csv_path=os.path.join(track_path, track_name),
-        bridge_yaml_dir=bridge_yaml_dir,
-        enable=bridge_constraints_enable,
-        pre_m=bridge_pre_m,
-        post_m=bridge_post_m,
-        force_center=bridge_force_center,
-        chi_max_rad=bridge_chi_max_rad,
-    )
     ### HJ : end
 
     gg_handler = GGManager(
@@ -524,80 +290,15 @@ def calc_global_raceline(
     lbg = []
     ubg = []
 
-    ### HJ : factor state-bound construction so the same logic applies at the
-    ###      initial step (k=0) and at every interior k+1 step below. Returns
-    ###      (lb_list, ub_list, w0_list) of length nx. bridge_state[idx] is
-    ###      None outside bridge zones (legacy bounds) or a dict with
-    ###      force_center/chi_max_rad/half_width inside.
-    def _state_bounds(idx):
-        n_lb = (track_handler.w_tr_right[idx]
-                + vehicle_params['total_width'] / 2.0 + safety_distance)
-        n_ub = (track_handler.w_tr_left[idx]
-                - vehicle_params['total_width'] / 2.0 - safety_distance)
-        n_init = (track_handler.w_tr_left[idx]
-                  + track_handler.w_tr_right[idx]) / 2.0
-        chi_lb, chi_ub = -np.pi / 2.0, np.pi / 2.0
-        bs = bridge_state[idx] if idx < len(bridge_state) else None
-        if bs is not None:
-            if bs.get('force_center', False):
-                ### HJ : pin n ≈ 0 (NLP reference frame center). NLP n=0 is
-                ###      the smoothed reference path, which is *very close*
-                ###      to (but not exactly) the geometric boundary midpoint
-                ###      — typical residual offset is < 1 cm. Tried option B
-                ###      (pin to (w_tr_l + w_tr_r)/2) but the moving target
-                ###      curve made the NLP stiff and hit max-iter, so we
-                ###      kept the cleaner n=0 pin. Tiny ±eps avoids solver
-                ###      discomfort with hard equality bounds. Safety
-                ###      distance is automatically satisfied — reference
-                ###      path sits strictly inside [n_lb_legacy, n_ub_legacy].
-                ###      With ramp r ∈ [0,1] the bound interpolates between
-                ###      legacy (r=0) and tight ±eps (r=1) over pre_m/post_m.
-                ### HJ : eps ≥ NLP constraint tolerance (1e-4) by a safe
-                ###      margin. With eps=1e-3 the solver hit the bound
-                ###      every step and oscillated visibly (mm-scale wobble
-                ###      consistent with the box being thinner than its
-                ###      tolerance). 5e-3 (=±5 mm) is still well within
-                ###      "centered" for a 1.8 m wide corridor (<0.3% of
-                ###      half-corridor) but gives the solver room to find a
-                ###      smooth interior path.
-                eps = 5e-3
-                r = float(bs.get('ramp', 1.0))
-                n_lb = (1.0 - r) * n_lb + r * max(n_lb, -eps)
-                n_ub = (1.0 - r) * n_ub + r * min(n_ub,  eps)
-                n_init = (1.0 - r) * n_init  # r=1 ⇒ 0
-            ### HJ : force_center implies chi=0 (physically: "pinned to
-            ###      centerline AND parallel to track"). Leaving chi free
-            ###      while n is pinned makes the solver oscillate chi to
-            ###      satisfy dynamics with bounded n — visible mm-scale
-            ###      wobble. So whenever force_center is on we tighten
-            ###      chi_max to 0 (taking the tighter of the user setting
-            ###      and 0).
-            chi_max = bs.get('chi_max_rad', -1.0)
-            if bs.get('force_center', False):
-                chi_max = 0.0 if chi_max < 0.0 else min(chi_max, 0.0)
-            if chi_max >= 0.0:
-                ### HJ : chi clamp also ramps from legacy (r=0) to tight (r=1).
-                r = float(bs.get('ramp', 1.0))
-                chi_lb_target = max(chi_lb, -chi_max)
-                chi_ub_target = min(chi_ub,  chi_max)
-                chi_lb = (1.0 - r) * chi_lb + r * chi_lb_target
-                chi_ub = (1.0 - r) * chi_ub + r * chi_ub_target
-        return (
-            [V_min,             n_lb, chi_lb, -np.inf, -np.inf],
-            [gg_handler.V_max,  n_ub, chi_ub,  np.inf,  np.inf],
-            [V_guess,           n_init, 0.0, 1e-6, 1e-6],
-        )
-    ### HJ : end
-
     # Initial conditions
     Xk = ca.MX.sym('X0', nx)
     w += [Xk]
-    ### HJ : delegate to shared _state_bounds (replaces former inline IY block)
-    _lb0, _ub0, _w0_0 = _state_bounds(0)
-    lbw += _lb0
-    ubw += _ub0
-    w0 += _w0_0
-    ### HJ : end
+    ## IY : enforce V >= V_min on velocity state (index 0) — was hardcoded 0.0
+    # lbw += [0.0, track_handler.w_tr_right[0] + vehicle_params['total_width'] / 2.0 + safety_distance, -np.pi / 2.0, -np.inf, -np.inf]
+    lbw += [V_min, track_handler.w_tr_right[0] + vehicle_params['total_width'] / 2.0 + safety_distance, -np.pi / 2.0, -np.inf, -np.inf]
+    ## IY : end
+    ubw += [gg_handler.V_max, track_handler.w_tr_left[0] - vehicle_params['total_width'] / 2.0 - safety_distance, np.pi / 2.0, np.inf, np.inf]
+    w0 += [V_guess, (track_handler.w_tr_left[0] + track_handler.w_tr_right[0]) / 2.0, 0.0, 1e-6, 1e-6]
 
     # Formulate the NLP
     for k in range(0, track_handler.s.size):
@@ -673,14 +374,12 @@ def calc_global_raceline(
         # New NLP variable for state at end of interval.
         Xk = ca.MX.sym('X_' + str(k + 1), nx)
         w += [Xk]
-        ### HJ : delegate to shared _state_bounds (replaces former inline IY
-        ###      block). Applies bridge force_center / chi_max overrides at
-        ###      grid index k+1 when bridge_state[k+1] is populated.
-        _lb, _ub, _w0_k = _state_bounds(k + 1)
-        lbw += _lb
-        ubw += _ub
-        w0 += _w0_k
-        ### HJ : end
+        ## IY : enforce V >= V_min on velocity state (index 0) — was hardcoded 0.0
+        # lbw += [0.0, track_handler.w_tr_right[k+1] + vehicle_params['total_width'] / 2.0 + safety_distance, -np.pi / 2.0, -np.inf, -np.inf]
+        lbw += [V_min, track_handler.w_tr_right[k+1] + vehicle_params['total_width'] / 2.0 + safety_distance, -np.pi / 2.0, -np.inf, -np.inf]
+        ## IY : end
+        ubw += [gg_handler.V_max, track_handler.w_tr_left[k+1] - vehicle_params['total_width'] / 2.0 - safety_distance, np.pi / 2.0, np.inf, np.inf]
+        w0 += [V_guess, (track_handler.w_tr_left[k+1] + track_handler.w_tr_right[k+1]) / 2.0, 0.0, 1e-6, 1e-6]
 
         # Add equality constraint for continuity.
         g += [Xk_end - Xk]
@@ -760,15 +459,6 @@ if __name__ == '__main__':
             ## IY : bridge mu scale baked into raceline
             g_weight=params['g_weight'],
             ## IY : end
-            ### HJ : bridge centerline / heading-lock — optional, off ⇒ no-op.
-            ###      Tuning knobs come from rqt via run_pipeline.sh args.
-            bridge_constraints_enable=params['bridge_constraints_enable'],
-            bridge_yaml_dir=params['bridge_yaml_dir'],
-            bridge_pre_m=params['bridge_pre_m'],
-            bridge_post_m=params['bridge_post_m'],
-            bridge_force_center=params['bridge_force_center'],
-            bridge_chi_max_rad=params['bridge_chi_max_rad'],
-            ### HJ : end
             neglect_w_omega_x=params['neglect_w_omega_x'],
             neglect_w_omega_y=params['neglect_w_omega_y'],
             neglect_euler=params['neglect_euler'],
