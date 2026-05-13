@@ -158,10 +158,17 @@ class GGTunerNode:
     def _map_dir(self, map_name):
         return os.path.join(self.maps_dir, map_name) if map_name else ''
 
-    def _sync_bridge_cfg_from_yaml(self, map_name):
+    def _sync_bridge_cfg_from_yaml(self, map_name, config=None):
         """Read <map>/bridge_sectors.yaml and push values into rqt cfg.
         Tuning is global per-rqt-slider; we pull from the first bridge if
-        present (all bridges share the same tuning under the current UI)."""
+        present (all bridges share the same tuning under the current UI).
+
+        ### HJ : when called from inside reconfigure_cb, pass the in-flight
+        ###      `config` so we mutate it directly. Calling
+        ###      srv.update_configuration from inside the callback re-enters
+        ###      the server's lock and deadlocks (rqt sliders freeze).
+        ###      Startup path (config=None) is safe — it's outside the lock.
+        """
         if bridge_yaml_io is None or not map_name:
             return
         map_dir = self._map_dir(map_name)
@@ -178,7 +185,11 @@ class GGTunerNode:
                 'bridge_chi_max_rad':  float(b['chi_max_rad']),
             })
         try:
-            self.srv.update_configuration(upd)
+            if config is not None:
+                for k, v in upd.items():
+                    config[k] = v
+            else:
+                self.srv.update_configuration(upd)
             rospy.loginfo(
                 f"[GGTuner] bridge cfg synced from yaml ({map_name}): "
                 f"{len(bridges)} bridge(s), enable={enable}")
@@ -1399,20 +1410,10 @@ class GGTunerNode:
         ###      this is the only callback that sees `config.map` changes.
         cur_map = str(getattr(config, 'map', '') or '')
         if cur_map and cur_map != self._last_bridge_yaml_map:
-            self._sync_bridge_cfg_from_yaml(cur_map)
-            ### HJ : update_configuration above triggers another callback —
-            ###      but the values are already aligned so it's a no-op.
-            ###      Read the (possibly updated) config back for downstream
-            ###      use so we don't dump pre-sync rqt values to yaml.
-            try:
-                synced = self.srv.config
-                for k in ('bridge_constraints_enable', 'bridge_pre_m',
-                          'bridge_post_m', 'bridge_force_center',
-                          'bridge_chi_max_rad'):
-                    if k in synced:
-                        setattr(config, k, synced[k])
-            except Exception:
-                pass
+            ### HJ : pass config= so the helper mutates it in place instead
+            ###      of calling srv.update_configuration (which would
+            ###      deadlock — we're already inside the server's lock).
+            self._sync_bridge_cfg_from_yaml(cur_map, config=config)
             if not apply_any:
                 return config
         ### HJ : end
