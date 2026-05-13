@@ -1790,14 +1790,13 @@ class StateMachine:
     #######
 
     def _pub_local_wpnts(self, wpts):
-        mrks = MarkerArray()
+        ### HJ : merge DELETEALL into the same MarkerArray to halve publish rate
+        loc_markers = MarkerArray()
         del_mrk = Marker()
         del_mrk.header.stamp = rospy.Time.now()
         del_mrk.action = Marker.DELETEALL
-        mrks.markers.append(del_mrk)
-        self.vis_loc_wpnt_pub.publish(mrks)
+        loc_markers.markers.append(del_mrk)
 
-        loc_markers = MarkerArray()
         loc_wpnts = WpntArray()
         loc_wpnts.wpnts = wpts
         loc_wpnts.header.stamp = rospy.Time.now()
