@@ -91,6 +91,15 @@ params = {
     'bridge_force_center': False,
     'bridge_chi_max_rad':  -1.0,
     ### HJ : end
+    ## IY : per-sector safety_distance — friction-pattern rosparam tree at
+    ##      /safety_sector_params/... populated by safety_sector_server.py.
+    ##      When the rosparam tree exists and n_sectors > 0, the lateral
+    ##      track-bound inflation in _state_bounds() becomes s-dependent
+    ##      (per-sector wall margin with linear pre/post blend to the
+    ##      default). Missing rosparam / n_sectors=0 ⇒ the per-point d_safe
+    ##      collapses to the scalar `safety_distance`, so legacy behavior is
+    ##      preserved bit-for-bit.
+    ## IY : end
     'w_jx': 1e-2,  # cost weight for jerk x-direction
     'w_jy': 1e-2,  # cost weight for jerk y-direction
     # min time
@@ -359,6 +368,129 @@ def _build_bridge_state_table(track_handler, smoothed_csv_path,
 ### HJ : end
 
 
+## IY : per-sector safety_distance adapter — friction_sector_server pattern.
+##      Reads the live /safety_sector_params/... rosparam tree (populated by
+##      safety_sector_server.py from <map>/safety_sectors.yaml + rqt sliders)
+##      and returns a per-grid-step numpy array d_safe[idx] of length
+##      track_handler.s.size. _state_bounds() uses d_safe[idx] verbatim in
+##      place of the scalar safety_distance.
+##
+##      Rosparam tree (set by safety_sector_server.py):
+##        /safety_sector_params/safety_distance_default  -> float
+##        /safety_sector_params/n_sectors                -> int
+##        /safety_sector_params/Sector{i}/{start,end,safety_distance,pre_m,post_m}
+##
+##      Sector start/end are smoothed-CSV row indices (closed interval). The
+##      sector partition produced by safety_sector_slicing.py covers the full
+##      track ([0, b1] [b1+1, b2] ... [b_{k-1}+1, N-1]) but this function does
+##      not depend on that — disjoint or partial sector lists also work
+##      (non-sector grid points keep the default).
+##
+##      Behavior:
+##        - rosparam tree missing / n_sectors=0  ⇒  d_safe ≡ legacy_default
+##          (= the scalar safety_distance from rqt). Legacy behavior preserved
+##          bit-for-bit when no safety server is running.
+##        - inside a sector core [s_start, s_end]: d_safe = sector value
+##        - pre/post ramps: linear blend default ↔ sector value over
+##          pre_m/post_m (in meters of s). Bridge ramp logic mirrored.
+##        - overlapping sectors take the *larger* d_safe (more conservative).
+##        - closed-loop wrap-around handled the same way as bridges.
+def _build_safety_table(track_handler, smoothed_csv_path, legacy_default):
+    n_grid = int(track_handler.s.size)
+    d_safe = np.full(n_grid, float(legacy_default), dtype=float)
+
+    ## IY : rospy.get_param works without rospy.init_node provided ROS_MASTER_URI
+    ##      is reachable (gg_tuner_node already spawned roscore for the apply
+    ##      pipeline). Any failure to reach the master ⇒ silent fallback to
+    ##      legacy scalar — gen_global_racing_line stays runnable standalone.
+    try:
+        import rospy as _rospy
+        n_sectors = int(_rospy.get_param('/safety_sector_params/n_sectors', 0))
+    except Exception as e:
+        print(f'[gen_global_racing_line] rospy.get_param unavailable '
+              f'({e}); safety sector rosparam ignored, using scalar '
+              f'safety_distance')
+        return d_safe
+    if n_sectors <= 0:
+        return d_safe
+    default_d = float(_rospy.get_param(
+        '/safety_sector_params/safety_distance_default', legacy_default))
+    d_safe[:] = default_d
+
+    if not os.path.exists(smoothed_csv_path):
+        print(f'[gen_global_racing_line] smoothed CSV not found '
+              f'({smoothed_csv_path}) — safety sectors ignored')
+        return d_safe
+    try:
+        df_smooth = pd.read_csv(smoothed_csv_path)
+        s_smooth = df_smooth['s_m'].to_numpy()
+    except Exception as e:
+        print(f'[gen_global_racing_line] failed to read s_m from '
+              f'{smoothed_csv_path}: {e} — safety sectors ignored')
+        return d_safe
+    s_total = float(s_smooth[-1] - s_smooth[0]) if len(s_smooth) > 1 else 0.0
+    closed_loop = s_total > 0.0
+    s_grid = track_handler.s
+    n_used = 0
+    for i in range(n_sectors):
+        try:
+            s_i = int(_rospy.get_param(
+                f'/safety_sector_params/Sector{i}/start'))
+            e_i = int(_rospy.get_param(
+                f'/safety_sector_params/Sector{i}/end'))
+            d_sec = float(_rospy.get_param(
+                f'/safety_sector_params/Sector{i}/safety_distance', default_d))
+            pre_m = float(_rospy.get_param(
+                f'/safety_sector_params/Sector{i}/pre_m', 0.0))
+            post_m = float(_rospy.get_param(
+                f'/safety_sector_params/Sector{i}/post_m', 0.0))
+        except Exception as e:
+            print(f'[gen_global_racing_line] safety Sector{i} missing '
+                  f'fields ({e}) — skipped')
+            continue
+        s_i = max(0, min(s_i, len(s_smooth) - 1))
+        e_i = max(0, min(e_i, len(s_smooth) - 1))
+        if e_i < s_i:
+            s_i, e_i = e_i, s_i
+        core_start = float(s_smooth[s_i])
+        core_end   = float(s_smooth[e_i])
+        ext_start  = core_start - pre_m
+        ext_end    = core_end   + post_m
+        for k in range(n_grid):
+            sk_local = float(s_grid[k])
+            in_ext = (ext_start <= sk_local <= ext_end)
+            if (not in_ext) and closed_loop:
+                if ext_start < 0.0 and sk_local >= ext_start + s_total:
+                    sk_local -= s_total
+                    in_ext = (ext_start <= sk_local <= ext_end)
+                elif ext_end > s_total and sk_local <= ext_end - s_total:
+                    sk_local += s_total
+                    in_ext = (ext_start <= sk_local <= ext_end)
+            if not in_ext:
+                continue
+            if core_start <= sk_local <= core_end:
+                r = 1.0
+            elif (core_start - pre_m) <= sk_local < core_start and pre_m > 0.0:
+                r = (sk_local - (core_start - pre_m)) / pre_m
+            elif core_end < sk_local <= (core_end + post_m) and post_m > 0.0:
+                r = 1.0 - (sk_local - core_end) / post_m
+            else:
+                r = 1.0
+            blended = (1.0 - r) * default_d + r * d_sec
+            if blended > d_safe[k]:
+                d_safe[k] = blended
+        n_used += 1
+
+    if n_used > 0:
+        n_changed = int(np.sum(np.abs(d_safe - default_d) > 1e-9))
+        print(f'[gen_global_racing_line] safety sectors active on '
+              f'{n_changed}/{n_grid} grid points across {n_used} sector(s); '
+              f'default={default_d:.3f}m, min={d_safe.min():.3f}m, '
+              f'max={d_safe.max():.3f}m')
+    return d_safe
+## IY : end
+
+
 def calc_global_raceline(
         track_name: str,
         vehicle_params: dict,
@@ -386,6 +518,10 @@ def calc_global_raceline(
         bridge_force_center: bool,
         bridge_chi_max_rad: float,
         ### HJ : end
+        ## IY : per-sector safety_distance is consumed via the live rosparam
+        ##      tree at /safety_sector_params/... (populated by
+        ##      safety_sector_server.py). No function arg needed.
+        ## IY : end
         neglect_w_omega_x: bool,
         neglect_w_omega_y: bool,
         neglect_euler: bool,
@@ -424,6 +560,17 @@ def calc_global_raceline(
         chi_max_rad=bridge_chi_max_rad,
     )
     ### HJ : end
+
+    ## IY : build per-NLP-step d_safe[idx] from /safety_sector_params/...
+    ##      rosparam tree. Tree missing / n_sectors=0 ⇒ d_safe is uniformly
+    ##      the scalar `safety_distance` so legacy behavior is preserved
+    ##      bit-for-bit when no safety server is running.
+    d_safe_table = _build_safety_table(
+        track_handler=track_handler,
+        smoothed_csv_path=os.path.join(track_path, track_name),
+        legacy_default=safety_distance,
+    )
+    ## IY : end
 
     gg_handler = GGManager(
         gg_path=gg_diagram_path,
@@ -530,10 +677,15 @@ def calc_global_raceline(
     ###      None outside bridge zones (legacy bounds) or a dict with
     ###      force_center/chi_max_rad/half_width inside.
     def _state_bounds(idx):
+        ## IY : per-sector safety_distance — d_safe_table[idx] equals the
+        ##      scalar `safety_distance` everywhere when no safety yaml is
+        ##      present (legacy behavior).
+        d_safe = (float(d_safe_table[idx])
+                  if idx < len(d_safe_table) else float(safety_distance))
         n_lb = (track_handler.w_tr_right[idx]
-                + vehicle_params['total_width'] / 2.0 + safety_distance)
+                + vehicle_params['total_width'] / 2.0 + d_safe)
         n_ub = (track_handler.w_tr_left[idx]
-                - vehicle_params['total_width'] / 2.0 - safety_distance)
+                - vehicle_params['total_width'] / 2.0 - d_safe)
         n_init = (track_handler.w_tr_left[idx]
                   + track_handler.w_tr_right[idx]) / 2.0
         chi_lb, chi_ub = -np.pi / 2.0, np.pi / 2.0
@@ -769,6 +921,8 @@ if __name__ == '__main__':
             bridge_force_center=params['bridge_force_center'],
             bridge_chi_max_rad=params['bridge_chi_max_rad'],
             ### HJ : end
+            ## IY : per-sector safety_distance is read from /safety_sector_params/...
+            ##      rosparam tree at NLP setup time — no arg here.
             neglect_w_omega_x=params['neglect_w_omega_x'],
             neglect_w_omega_y=params['neglect_w_omega_y'],
             neglect_euler=params['neglect_euler'],

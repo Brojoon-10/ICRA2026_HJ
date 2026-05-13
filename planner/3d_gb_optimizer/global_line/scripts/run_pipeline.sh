@@ -259,6 +259,10 @@ src = re.sub(r"'bridge_force_center'\s*:.*",
 src = re.sub(r"'bridge_chi_max_rad'\s*:.*",
              f"'bridge_chi_max_rad': ${BRIDGE_CHI_MAX_RAD},", src)
 ### HJ : end
+## IY : per-sector safety_distance is consumed via the live /safety_sector_params/...
+##      rosparam tree at NLP setup time (populated by safety_sector_server.py).
+##      No CLI arg / yaml path injection needed here — the rosparam tree is
+##      already populated by the time roslaunch reaches run_pipeline.sh.
 
 # Override data directories when using map-dir mode
 map_dir = '${MAP_DIR}'

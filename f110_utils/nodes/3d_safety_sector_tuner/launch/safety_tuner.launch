@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- ## IY : slicing GUI only. Opens the matplotlib 3D plot, lets the
+         user mark sector boundaries on the smoothed centerline CSV, dumps
+         <map>/safety_sectors.yaml AND <pkg>/cfg/safety_sectors.yaml, then
+         finish_sector.sh rebuilds the package so the next server restart
+         picks up the new slider set. -->
+    <arg name="map"          default="gazebo_wall_2" />
+    <arg name="map_dir"      default="$(find stack_master)/maps/$(arg map)" />
+    <arg name="smoothed_csv" default="$(arg map_dir)/$(arg map)_3d_smoothed.csv" />
+
+    <node pkg="safety_sector_tuner_3d"
+          type="safety_sector_slicing.py"
+          name="safety_sector_node_3d"
+          output="screen">
+        <param name="map"          value="$(arg map)" />
+        <param name="map_dir"      value="$(arg map_dir)" />
+        <param name="smoothed_csv" value="$(arg smoothed_csv)" />
+    </node>
+</launch>
