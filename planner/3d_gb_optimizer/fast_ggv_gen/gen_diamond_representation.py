@@ -85,7 +85,11 @@ if _active:
 ## IY : end
 
 
-def gen_diamond_representation(alpha_list, rho_list):
+## IY : x0_seed enables warm-start; also returns IPOPT success flag and final
+#       objective value f_val so the multi-start wrapper can pick the best
+#       healthy fit (default cold-start alone gets stuck in gg_exp=2 ax_max=0
+#       local optimum on some V/g cells).
+def gen_diamond_representation(alpha_list, rho_list, x0_seed=None):
     # diamond representation
     gg_exponent = MX.sym('gg_exponent')
     ax_min = MX.sym('ax_min')
@@ -143,26 +147,72 @@ def gen_diamond_representation(alpha_list, rho_list):
 
         f -= rho_diamond**2
 
-    x0 = vertcat(
-        1.0,
-        -5.1,
-        5.0,
-        5.0
-    )
+    ## IY : x0 from seed when provided, default cold-start otherwise
+    if x0_seed is None:
+        x0 = vertcat(1.0, -5.1, 5.0, 5.0)
+    else:
+        x0 = vertcat(*x0_seed)
     nlp = {"x": x, "f": f, "g": vertcat(*g_const)}
     opts = {
         "verbose": False, "ipopt.print_level": 0, "print_time": 0,
         "ipopt.hessian_approximation": 'limited-memory',
     }
     solver = nlpsol("solver", "ipopt", nlp, opts)
-    x_opt = solver(x0=x0, lbx=lbx, ubx=ubx, lbg=vertcat(*lbg), ubg=vertcat(*ubg))['x']
+    ## IY : capture full result dict so success flag + f_val are available
+    sol = solver(x0=x0, lbx=lbx, ubx=ubx,
+                 lbg=vertcat(*lbg), ubg=vertcat(*ubg))
+    x_opt = sol['x']
+    success = bool(solver.stats().get('success', False))
+    f_val = float(sol['f'])
 
     gg_exponent = float(x_opt[0])
     ax_min = float(x_opt[1])
     ax_max = float(x_opt[2])
     ay_max = float(x_opt[3])
 
-    return gg_exponent, ax_min, ax_max, ay_max
+    return gg_exponent, ax_min, ax_max, ay_max, success, f_val
+
+
+## IY : multi-start wrapper - tries warm + cold + geometric seeds and picks
+#       the best healthy fit. Healthy = IPOPT success AND not in the
+#       (gg_exp~2, ax_max << physical_bound) local-optimum signature.
+def gen_diamond_multi_start(alpha_list, rho_list, x0_warm=None):
+    # Physical bounds for the fail-signature filter (same as inner NLP's ubx).
+    ubx_ax_max = float(np.interp(np.pi / 2.0, alpha_list, rho_list))
+    lbx_ax_min = -float(np.interp(-np.pi / 2.0, alpha_list, rho_list))
+    ubx_ay_max = float(np.interp(0.0, alpha_list, rho_list, 0.0))
+
+    seeds = []
+    if x0_warm is not None:
+        seeds.append(('warm', tuple(x0_warm)))
+    seeds.append(('cold', (1.0, -5.1, 5.0, 5.0)))
+    # Geometric seed: scaled to the actual rho envelope, gg_exp away from bound.
+    seeds.append(('geom', (1.5,
+                           0.9 * lbx_ax_min,
+                           0.9 * ubx_ax_max,
+                           0.9 * ubx_ay_max)))
+
+    results = []  # list of (tag, vals_4tuple, success, f_val)
+    for tag, seed in seeds:
+        gg_e, ax_n, ax_x, ay_x, ok, f_val = gen_diamond_representation(
+            alpha_list, rho_list, x0_seed=seed)
+        results.append((tag, (gg_e, ax_n, ax_x, ay_x), ok, f_val))
+
+    def is_healthy(r):
+        _, (gg_e, _, ax_x, _), ok, _ = r
+        if not ok:
+            return False
+        # Fail signature: stuck at gg_exp upper bound with collapsed ax_max.
+        if gg_e >= 1.99 and ax_x < 0.3 * max(ubx_ax_max, 1e-6):
+            return False
+        return True
+
+    healthy_results = [r for r in results if is_healthy(r)]
+    pool = healthy_results if healthy_results else results
+    # Best = most negative f_val (objective is -sum(rho_diamond^2)).
+    best = min(pool, key=lambda r: r[3])
+    return best[1]
+## IY : end
 
 
 def gen_diamond_representation_for_V(alpha_list, rho_list):
@@ -171,6 +221,8 @@ def gen_diamond_representation_for_V(alpha_list, rho_list):
     ax_max_tmp = []
     ay_max_tmp = []
 
+    ## IY : warm-start chain along g axis at fixed V
+    x0_warm = None
     for rho in rho_list:
         # [TEMP] skip diamond fitting for all-zero rho entries
         # caused by gen_gg_diagrams solver failing at extreme V/g combos
@@ -180,15 +232,19 @@ def gen_diamond_representation_for_V(alpha_list, rho_list):
             ax_min_tmp.append(0.0)
             ax_max_tmp.append(0.0)
             ay_max_tmp.append(0.0)
+            # Do not propagate warm-start through the zero gap.
+            x0_warm = None
             continue
-        gg_exponent, ax_min, ax_max, ay_max = gen_diamond_representation(
+        gg_exponent, ax_min, ax_max, ay_max = gen_diamond_multi_start(
             alpha_list=alpha_list,
-            rho_list=rho
+            rho_list=rho,
+            x0_warm=x0_warm,
         )
         gg_exponent_tmp.append(gg_exponent)
         ax_min_tmp.append(ax_min)
         ax_max_tmp.append(ax_max)
         ay_max_tmp.append(ay_max)
+        x0_warm = (gg_exponent, ax_min, ax_max, ay_max)
 
     return gg_exponent_tmp, ax_min_tmp, ax_max_tmp, ay_max_tmp
 
@@ -214,6 +270,74 @@ for frame in ['vehicle', 'velocity']:
     ax_min_list = [tmp[1] for tmp in processed_list]
     ax_max_list = [tmp[2] for tmp in processed_list]
     ay_max_list = [tmp[3] for tmp in processed_list]
+
+    ## IY : V-axis safety net for residual bad cells
+    #       Detects fit failures that survived multi-start (gg_exp at upper
+    #       bound 2 with ax_max collapsed far below physical bound, OR the
+    #       all-zero skip path from upstream rho==0). Each flagged cell is
+    #       replaced by linear interpolation along V from the nearest
+    #       healthy V cells at the same g.
+    gg_arr     = np.asarray(gg_exponent_list, dtype=np.float64)
+    ax_min_arr = np.asarray(ax_min_list,      dtype=np.float64)
+    ax_max_arr = np.asarray(ax_max_list,      dtype=np.float64)
+    ay_max_arr = np.asarray(ay_max_list,      dtype=np.float64)
+
+    n_V, n_g = ax_max_arr.shape
+    # Per-cell physical bound on ax_max (= rho at alpha=pi/2).
+    bound_ax_max = np.zeros((n_V, n_g), dtype=np.float64)
+    for _vi in range(n_V):
+        for _gi in range(n_g):
+            bound_ax_max[_vi, _gi] = float(
+                np.interp(np.pi / 2.0, alpha_list, rho_list[_vi, _gi]))
+
+    zero_skip = ((ax_max_arr == 0.0) & (ax_min_arr == 0.0)
+                 & (ay_max_arr == 0.0) & (gg_arr == 1.0))
+    fail_sig = (gg_arr >= 1.99) & (
+        ax_max_arr < 0.3 * np.maximum(bound_ax_max, 1e-6))
+    bad = zero_skip | fail_sig
+
+    n_fixed = 0
+    for vi, gi in zip(*np.where(bad)):
+        col_bad = bad[:, gi]
+        lo = vi - 1
+        while lo >= 0 and col_bad[lo]:
+            lo -= 1
+        hi = vi + 1
+        while hi < n_V and col_bad[hi]:
+            hi += 1
+        if lo < 0 and hi >= n_V:
+            print(f'[gen_diamond] [{frame}_frame] V-axis sanitize: '
+                  f'no healthy V at g_idx={gi}, leaving v_idx={vi} as-is')
+            continue
+        if lo < 0:
+            new = (gg_arr[hi, gi], ax_min_arr[hi, gi],
+                   ax_max_arr[hi, gi], ay_max_arr[hi, gi])
+        elif hi >= n_V:
+            new = (gg_arr[lo, gi], ax_min_arr[lo, gi],
+                   ax_max_arr[lo, gi], ay_max_arr[lo, gi])
+        else:
+            t = (vi - lo) / float(hi - lo)
+            new = (
+                (1.0 - t) * gg_arr[lo, gi]     + t * gg_arr[hi, gi],
+                (1.0 - t) * ax_min_arr[lo, gi] + t * ax_min_arr[hi, gi],
+                (1.0 - t) * ax_max_arr[lo, gi] + t * ax_max_arr[hi, gi],
+                (1.0 - t) * ay_max_arr[lo, gi] + t * ay_max_arr[hi, gi],
+            )
+        old_ax = ax_max_arr[vi, gi]
+        gg_arr[vi, gi], ax_min_arr[vi, gi], ax_max_arr[vi, gi], ay_max_arr[vi, gi] = new
+        print(f'[gen_diamond] [{frame}_frame] V-axis sanitize: '
+              f'V={V_list[vi]:.2f} g={g_list[gi]:.2f} '
+              f'ax_max {old_ax:.3f} -> {new[2]:.3f}')
+        n_fixed += 1
+    if n_fixed > 0:
+        print(f'[gen_diamond] [{frame}_frame] V-axis sanitize: '
+              f'{n_fixed} cell(s) replaced')
+
+    gg_exponent_list = gg_arr.tolist()
+    ax_min_list      = ax_min_arr.tolist()
+    ax_max_list      = ax_max_arr.tolist()
+    ay_max_list      = ay_max_arr.tolist()
+    ## IY : end
 
     ## IY : apply diamond post-process scales (null = NLP fit as-is)
     #       - gg_exp_scale: multiplies fitted exponent, clipped to [1.0, 2.0].
