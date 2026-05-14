@@ -94,6 +94,10 @@
     <!-- ### HJ : bridge sector marker publisher — RViz visualisation of
          <map>/bridge_sectors.yaml. Missing yaml ⇒ no markers (silent). -->
     <node pkg="bridge_sector_tuner_3d" type="bridge_sector_server.py" name="bridge" output="screen" />
+    <!-- ## IY : safety-distance sector server is spawned on-demand by the
+         gg_tuner Safety group's `safety_sector_setting` toggle (persistent
+         on/off, not always-on). When OFF, no /dyn_sector_tuner/safety node
+         exists and gen_global_racing_line falls back to uniform margin. -->
   </group>
 
   <!-- Velocity scaler -->
