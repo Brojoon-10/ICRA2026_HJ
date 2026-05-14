@@ -395,26 +395,124 @@ def _build_bridge_state_table(track_handler, smoothed_csv_path,
 ##          pre_m/post_m (in meters of s). Bridge ramp logic mirrored.
 ##        - overlapping sectors take the *larger* d_safe (more conservative).
 ##        - closed-loop wrap-around handled the same way as bridges.
+## IY : DO NOT use 'safety_distance' as a dict key in the helpers below.
+##      run_pipeline.sh injects raceline params with an anchorless regex
+##      r"'safety_distance'\s*:.*" that would silently clobber any matching
+##      line at exec-time (params dict line 53 is the only intended target).
+##      Use 'd_safe' for the per-sector value instead.
+def _read_safety_sectors_rosparam(legacy_default):
+    """Return (default_d, [sector_dict, ...]) from /safety_sector_params/...
+    when the dyn cfg server is up. Returns (None, None) when the rosparam
+    tree is missing — caller should fall back to yaml-on-disk.
+    """
+    try:
+        import rospy as _rospy
+    except Exception:
+        return None, None
+    try:
+        n_sectors = int(_rospy.get_param(
+            '/safety_sector_params/n_sectors', -1))
+    except Exception:
+        return None, None
+    if n_sectors < 0:
+        return None, None        # rosparam tree absent
+    default_d = float(_rospy.get_param(
+        '/safety_sector_params/safety_distance_default', legacy_default))
+    sectors = []
+    for i in range(n_sectors):
+        try:
+            sectors.append({
+                'start': int(_rospy.get_param(
+                    f'/safety_sector_params/Sector{i}/start')),
+                'end': int(_rospy.get_param(
+                    f'/safety_sector_params/Sector{i}/end')),
+                'd_safe': float(_rospy.get_param(
+                    f'/safety_sector_params/Sector{i}/safety_distance',
+                    default_d)),
+                'pre_m': float(_rospy.get_param(
+                    f'/safety_sector_params/Sector{i}/pre_m', 0.0)),
+                'post_m': float(_rospy.get_param(
+                    f'/safety_sector_params/Sector{i}/post_m', 0.0)),
+            })
+        except Exception as e:
+            print(f'[gen_global_racing_line] rosparam Sector{i} '
+                  f'missing fields ({e}) — skipped')
+    return default_d, sectors
+
+
+def _read_safety_sectors_yaml(yaml_path, legacy_default):
+    """Fallback path — read <map>/safety_sectors.yaml directly when the
+    safety dyn cfg server is not running but use=True. Returns
+    (default_d, [sector_dict, ...]) or (None, None) on failure.
+    """
+    if not os.path.exists(yaml_path):
+        return None, None
+    try:
+        with open(yaml_path, 'r') as f:
+            doc = yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f'[gen_global_racing_line] yaml parse failed '
+              f'({yaml_path}): {e}')
+        return None, None
+    default_d = float(doc.get('safety_distance_default', legacy_default))
+    n_sectors = int(doc.get('n_sectors', 0))
+    sectors = []
+    for i in range(n_sectors):
+        s = doc.get(f'Sector{i}')
+        if not isinstance(s, dict):
+            continue
+        try:
+            sectors.append({
+                'start': int(s['start']),
+                'end':   int(s['end']),
+                'd_safe': float(s.get('safety_distance', default_d)),
+                'pre_m':  float(s.get('pre_m',  0.0)),
+                'post_m': float(s.get('post_m', 0.0)),
+            })
+        except Exception as e:
+            print(f'[gen_global_racing_line] yaml Sector{i} malformed '
+                  f'({e}) — skipped')
+    return default_d, sectors
+
+
 def _build_safety_table(track_handler, smoothed_csv_path, legacy_default):
     n_grid = int(track_handler.s.size)
     d_safe = np.full(n_grid, float(legacy_default), dtype=float)
 
-    ## IY : rospy.get_param works without rospy.init_node provided ROS_MASTER_URI
-    ##      is reachable (gg_tuner_node already spawned roscore for the apply
-    ##      pipeline). Any failure to reach the master ⇒ silent fallback to
-    ##      legacy scalar — gen_global_racing_line stays runnable standalone.
+    ## IY : master switch via rosparam set by gg_tuner_node right before the
+    ##      raceline launch (Safety group's `safety_sector_use` checkbox).
+    ##      False ⇒ legacy uniform margin regardless of sector data source.
     try:
         import rospy as _rospy
-        n_sectors = int(_rospy.get_param('/safety_sector_params/n_sectors', 0))
+        use = bool(_rospy.get_param('/safety_sector_params/use', False))
     except Exception as e:
         print(f'[gen_global_racing_line] rospy.get_param unavailable '
-              f'({e}); safety sector rosparam ignored, using scalar '
-              f'safety_distance')
+              f'({e}); safety sectors ignored, using scalar safety_distance')
         return d_safe
-    if n_sectors <= 0:
+    if not use:
+        print(f'[gen_global_racing_line] safety_sector_use=False '
+              f'— uniform safety_distance={legacy_default:.3f}m')
         return d_safe
-    default_d = float(_rospy.get_param(
-        '/safety_sector_params/safety_distance_default', legacy_default))
+
+    ## IY : two sources, rosparam first then yaml-on-disk.
+    ##      Setting=ON  ⇒ rosparam tree exists (live slider values, may
+    ##                    differ from yaml if save_params not clicked).
+    ##      Setting=OFF ⇒ rosparam tree wiped on server kill; fall through
+    ##                    to <map>/safety_sectors.yaml (last saved state).
+    default_d, sectors = _read_safety_sectors_rosparam(legacy_default)
+    source = 'rosparam'
+    if sectors is None:
+        yaml_path = os.path.join(
+            os.path.dirname(smoothed_csv_path), 'safety_sectors.yaml')
+        default_d, sectors = _read_safety_sectors_yaml(
+            yaml_path, legacy_default)
+        source = f'yaml({os.path.basename(yaml_path)})'
+    if not sectors:
+        print(f'[gen_global_racing_line] no safety sectors found '
+              f'(use=True but neither rosparam nor yaml has data) — '
+              f'uniform safety_distance={legacy_default:.3f}m')
+        return d_safe
+
     d_safe[:] = default_d
 
     if not os.path.exists(smoothed_csv_path):
@@ -432,26 +530,14 @@ def _build_safety_table(track_handler, smoothed_csv_path, legacy_default):
     closed_loop = s_total > 0.0
     s_grid = track_handler.s
     n_used = 0
-    for i in range(n_sectors):
-        try:
-            s_i = int(_rospy.get_param(
-                f'/safety_sector_params/Sector{i}/start'))
-            e_i = int(_rospy.get_param(
-                f'/safety_sector_params/Sector{i}/end'))
-            d_sec = float(_rospy.get_param(
-                f'/safety_sector_params/Sector{i}/safety_distance', default_d))
-            pre_m = float(_rospy.get_param(
-                f'/safety_sector_params/Sector{i}/pre_m', 0.0))
-            post_m = float(_rospy.get_param(
-                f'/safety_sector_params/Sector{i}/post_m', 0.0))
-        except Exception as e:
-            print(f'[gen_global_racing_line] safety Sector{i} missing '
-                  f'fields ({e}) — skipped')
-            continue
-        s_i = max(0, min(s_i, len(s_smooth) - 1))
-        e_i = max(0, min(e_i, len(s_smooth) - 1))
+    for s in sectors:
+        s_i = max(0, min(int(s['start']), len(s_smooth) - 1))
+        e_i = max(0, min(int(s['end']),   len(s_smooth) - 1))
         if e_i < s_i:
             s_i, e_i = e_i, s_i
+        d_sec = float(s['d_safe'])
+        pre_m = float(s['pre_m'])
+        post_m = float(s['post_m'])
         core_start = float(s_smooth[s_i])
         core_end   = float(s_smooth[e_i])
         ext_start  = core_start - pre_m
@@ -481,12 +567,11 @@ def _build_safety_table(track_handler, smoothed_csv_path, legacy_default):
                 d_safe[k] = blended
         n_used += 1
 
-    if n_used > 0:
-        n_changed = int(np.sum(np.abs(d_safe - default_d) > 1e-9))
-        print(f'[gen_global_racing_line] safety sectors active on '
-              f'{n_changed}/{n_grid} grid points across {n_used} sector(s); '
-              f'default={default_d:.3f}m, min={d_safe.min():.3f}m, '
-              f'max={d_safe.max():.3f}m')
+    n_changed = int(np.sum(np.abs(d_safe - default_d) > 1e-9))
+    print(f'[gen_global_racing_line] safety sectors active ({source}): '
+          f'{n_changed}/{n_grid} grid points across {n_used} sector(s); '
+          f'default={default_d:.3f}m, min={d_safe.min():.3f}m, '
+          f'max={d_safe.max():.3f}m')
     return d_safe
 ## IY : end
 
