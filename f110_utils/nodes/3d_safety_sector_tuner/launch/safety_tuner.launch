@@ -1,10 +1,14 @@
 <?xml version="1.0"?>
 <launch>
-    <!-- ## IY : slicing GUI only. Opens the matplotlib 3D plot, lets the
-         user mark sector boundaries on the smoothed centerline CSV, dumps
-         <map>/safety_sectors.yaml AND <pkg>/cfg/safety_sectors.yaml, then
-         finish_sector.sh rebuilds the package so the next server restart
-         picks up the new slider set. -->
+    <!-- ## IY : slicing GUI only — spawned by the gg_tuner Safety group's
+         `safety_sector_tuner` trigger (auto-clear, bridge pattern). User
+         marks sector boundaries on the smoothed centerline CSV, "Done"
+         dumps <map>/safety_sectors.yaml + <pkg>/cfg/safety_sectors.yaml,
+         finish_sector.sh rebuilds the dyn cfg.
+
+         The dyn cfg server lives in a separate launch (safety_setting.launch)
+         so the slicing GUI and the live rqt sliders can be toggled
+         independently. -->
     <arg name="map"          default="gazebo_wall_2" />
     <arg name="map_dir"      default="$(find stack_master)/maps/$(arg map)" />
     <arg name="smoothed_csv" default="$(arg map_dir)/$(arg map)_3d_smoothed.csv" />

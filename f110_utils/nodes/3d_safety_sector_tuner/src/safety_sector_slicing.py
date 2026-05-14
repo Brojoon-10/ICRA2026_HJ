@@ -190,22 +190,44 @@ class SectorSlicer:
                     prev = yaml.safe_load(f) or {}
             except Exception:
                 prev = {}
-        prev_default = float(prev.get('safety_distance_default', 0.20))
+
+        ## IY : default safety_distance comes from the rqt /gg_tuner slider
+        ##      (the same Raceline `safety_distance` knob users tune for the
+        ##      uniform legacy case). On fresh marking this seeds every
+        ##      sector's safety_distance to the rqt value so the yaml ships
+        ##      consistent with what the user has set up top. Falls back to
+        ##      previous yaml default and finally hardcoded 0.20.
+        rqt_default = rospy.get_param('/gg_tuner/safety_distance', None)
+        if rqt_default is not None:
+            default_d = float(rqt_default)
+            rospy.loginfo(
+                f'[safety_tuner] seeding safety_distance from rqt slider: '
+                f'{default_d:.3f} m')
+        else:
+            default_d = float(prev.get('safety_distance_default', 0.20))
+            rospy.logwarn(
+                f'[safety_tuner] /gg_tuner/safety_distance unavailable; '
+                f'falling back to previous yaml default {default_d:.3f} m')
 
         dict_file = {
-            'safety_distance_default': prev_default,
+            'safety_distance_default': default_d,
             'n_sectors': n_sectors,
         }
         for i in range(n_sectors):
             start = self.sector_pnts[i] if i == 0 else self.sector_pnts[i] + 1
             end = self.sector_pnts[i + 1]
+            ## IY : per-sector safety_distance is *always* seeded with the
+            ##      current rqt default on a fresh marking — the user can
+            ##      then tweak each sector individually via the live
+            ##      /dyn_sector_tuner/safety sliders. pre_m / post_m are
+            ##      preserved from the previous yaml slot if it existed so
+            ##      hand-tuned ramps survive a re-mark.
             prev_sec = prev.get(f'Sector{i}', {}) if isinstance(
                 prev.get(f'Sector{i}'), dict) else {}
             dict_file[f'Sector{i}'] = {
                 'start': int(start),
                 'end':   int(end),
-                'safety_distance': float(prev_sec.get('safety_distance',
-                                                      prev_default)),
+                'safety_distance': float(default_d),
                 'pre_m':  float(prev_sec.get('pre_m',  0.0)),
                 'post_m': float(prev_sec.get('post_m', 0.0)),
             }

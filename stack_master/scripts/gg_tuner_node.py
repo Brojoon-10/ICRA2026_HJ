@@ -130,10 +130,15 @@ class GGTunerNode:
         ###      when the user picks a different map (yaml is per-map).
         self._last_bridge_yaml_map = None
         ### HJ : end
-        ## IY : safety_sector_server.py is spawned by 3d_base_system.launch
-        ##      and owns the /safety_sector_params/... rosparam tree. The
-        ##      safety slicing GUI rides along in 3d_sector_slicing.launch
-        ##      (= run_sector_slicing trigger). Nothing to track here.
+        ## IY : safety sector — 3 independent checkboxes:
+        ##      - safety_sector_tuner   : trigger, slicing GUI only (auto-clear)
+        ##      - safety_sector_setting : persistent toggle, dyn cfg server
+        ##      - safety_sector_use     : raceline application (no spawn)
+        ##      Setting needs edge-detect so we can spawn/kill server on
+        ##      transitions; tuner is a trigger like run_bridge_tuner.
+        self.safety_tuner_proc = None
+        self.safety_setting_proc = None
+        self._last_safety_setting_state = False
         ## IY : end
 
         rospy.on_shutdown(self._shutdown_cleanup)
@@ -807,9 +812,7 @@ class GGTunerNode:
         rospy.loginfo("[GGTuner] [sectors] kill requested (checkbox off)")
         # kill the nodes in the launch
         for node in ('/sector_node_3d', '/ot_sector_node_3d',
-                     '/static_obs_sector_node_3d', '/friction_sector_node',
-                     ## IY : also clean up the safety slicing node
-                     '/safety_sector_node_3d'):
+                     '/static_obs_sector_node_3d', '/friction_sector_node'):
             try:
                 subprocess.run(['rosnode', 'kill', node],
                                capture_output=True, timeout=3, check=False)
@@ -828,15 +831,20 @@ class GGTunerNode:
     ## IY : Save/Load *all* GGTuner.cfg dynamic_reconfigure values to a
     ##   versioned yml under rqt_gg_viewer/velopt_tun/. Triggered by the
     ##   `save_params` / `load_params` bool fields rendered at the top of the
-    ##   rqt_reconfigure page. Same auto-clear pattern as `apply` / `save_now`.
+    ##   rqt_reconfigure page. Same auto-clear pattern as `apply` / `save_ggv`.
     _PARAM_SKIP_ON_LOAD = (
         # never re-apply trigger bools — would fire the pipeline as a side effect
         'apply', 'apply_ggv', 'apply_raceline', 'apply_fbga', 'apply_velopt',
-        'save_now', 'save_params', 'load_params',
+        'save_ggv', 'save_params', 'load_params',
         ### HJ : also skip our bridge trigger mirrors so reloading a saved
         ###      yml never auto-spawns the tuner GUI or fires apply_bridge.
         'apply_bridge', 'run_bridge_tuner', 'run_sector_slicing',
         ### HJ : end
+        ## IY : safety sector triggers — apply mirror, slicing trigger,
+        ##      and persistent server toggle all force-cleared on yml load
+        ##      so reopening a saved session never auto-spawns anything.
+        'apply_safety', 'safety_sector_tuner', 'safety_sector_setting',
+        ## IY : end
     )
 
     def _params_yml_dir(self):
@@ -860,9 +868,12 @@ class GGTunerNode:
                 continue
             # persist triggers as False so a yml reload never auto-fires them
             if k in ('apply', 'apply_ggv', 'apply_raceline', 'apply_fbga',
-                     'apply_velopt', 'save_now', 'save_params', 'load_params',
+                     'apply_velopt', 'save_ggv', 'save_params', 'load_params',
                      ### HJ : also force HJ-side triggers to False on save
-                     'apply_bridge', 'run_bridge_tuner', 'run_sector_slicing'):
+                     'apply_bridge', 'run_bridge_tuner', 'run_sector_slicing',
+                     ## IY : safety triggers — all saved as False on dump
+                     'apply_safety', 'safety_sector_tuner',
+                     'safety_sector_setting'):
                 params[k] = False
                 continue
             if isinstance(v, bool):
@@ -969,6 +980,84 @@ class GGTunerNode:
         self.bridge_tuner_proc = None
         rospy.loginfo("[GGTuner] [bridge] killed")
     ### HJ : end
+
+    ## IY : safety slicing GUI — auto-clear trigger (bridge_tuner pattern).
+    ##      Spawns safety_tuner.launch (slicing only). User marks sectors,
+    ##      clicks Done → yaml + pkg cfg + rebuild. GUI exits on its own.
+    def _run_safety_sector_tuner(self, map_name):
+        if self.safety_tuner_proc is not None and \
+                self.safety_tuner_proc.poll() is None:
+            rospy.loginfo("[GGTuner] [safety-tuner] already running")
+            return True
+        if map_name not in self.available_maps:
+            rospy.logerr(f"[GGTuner] [safety-tuner] invalid map '{map_name}'")
+            self.status_pub.publish(f"FAILED_SAFETY_TUNER: invalid map")
+            return False
+        cmd = [
+            'roslaunch', 'safety_sector_tuner_3d', 'safety_tuner.launch',
+            f'map:={map_name}',
+        ]
+        rospy.loginfo(f"[GGTuner] [safety-tuner] launching: {' '.join(cmd)}")
+        try:
+            self.safety_tuner_proc = subprocess.Popen(cmd)
+            self.status_pub.publish(f"SAFETY_TUNER_RUNNING: {map_name}")
+            return True
+        except OSError as e:
+            rospy.logerr(f"[GGTuner] [safety-tuner] launch failed: {e}")
+            self.status_pub.publish(f"FAILED_SAFETY_TUNER: {map_name}")
+            return False
+
+    ## IY : safety sector setting — persistent toggle, server only.
+    ##      Spawns safety_setting.launch (dyn cfg server under
+    ##      /dyn_sector_tuner/safety). Edge-detected ON/OFF.
+    def _start_safety_sector_setting(self, map_name):
+        if self.safety_setting_proc is not None and \
+                self.safety_setting_proc.poll() is None:
+            rospy.loginfo("[GGTuner] [safety-setting] already running")
+            return True
+        if map_name not in self.available_maps:
+            rospy.logerr(f"[GGTuner] [safety-setting] invalid map '{map_name}'")
+            self.status_pub.publish(f"FAILED_SAFETY_SETTING: invalid map")
+            return False
+        cmd = [
+            'roslaunch', 'safety_sector_tuner_3d', 'safety_setting.launch',
+            f'map:={map_name}',
+        ]
+        rospy.loginfo(f"[GGTuner] [safety-setting] launching: {' '.join(cmd)}")
+        try:
+            self.safety_setting_proc = subprocess.Popen(cmd)
+            self.status_pub.publish(f"SAFETY_SETTING_ON: {map_name}")
+            return True
+        except OSError as e:
+            rospy.logerr(f"[GGTuner] [safety-setting] launch failed: {e}")
+            self.status_pub.publish(f"FAILED_SAFETY_SETTING: {map_name}")
+            return False
+
+    def _stop_safety_sector_setting(self):
+        rospy.loginfo("[GGTuner] [safety-setting] stop requested (toggle off)")
+        try:
+            subprocess.run(['rosnode', 'kill', '/dyn_sector_tuner/safety'],
+                           capture_output=True, timeout=3, check=False)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        if self.safety_setting_proc is not None and \
+                self.safety_setting_proc.poll() is None:
+            try:
+                self.safety_setting_proc.terminate()
+                self.safety_setting_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.safety_setting_proc.kill()
+        self.safety_setting_proc = None
+        ## IY : also wipe the rosparam tree so a later safety_sector_use=ON
+        ##      with setting=OFF cleanly falls through to the yaml-on-disk
+        ##      path (instead of seeing stale rosparam from this session).
+        try:
+            rospy.delete_param('/safety_sector_params')
+        except KeyError:
+            pass
+        self.status_pub.publish("SAFETY_SETTING_OFF")
+        rospy.loginfo("[GGTuner] [safety-setting] stopped")
+    ## IY : end
 
     ## IY : persist velopt tuning to a single overwritten yaml so the latest
     ##   slider state survives session restarts. Path is fixed under
@@ -1237,6 +1326,14 @@ class GGTunerNode:
                     ## IY : overlay rqt RACELINE_KEYS onto latest yml (idempotent)
                     self._update_raceline_keys_in_yml(vehicle_name, tuning)
                     ## IY : end
+                    ## IY : safety sector master switch — surfaced as a
+                    ##      rosparam so gen_global_racing_line._build_safety_table
+                    ##      can short-circuit to legacy uniform safety_distance
+                    ##      when False. Set right before the launch so
+                    ##      gen_global_racing_line sees the current rqt value.
+                    rospy.set_param('/safety_sector_params/use',
+                                    bool(run_opts['safety_sector_use']))
+                    ## IY : end
                     ## IY : raceline keeps the old g_weight signature; map from bridge_effect
                     ### HJ : also thread bridge constraints + tuning from rqt
                     ###      so gen_global_racing_line.py can read both yaml
@@ -1354,22 +1451,25 @@ class GGTunerNode:
         APPLY_KEYS = ('apply', 'apply_ggv', 'apply_raceline',
                       'apply_fbga', 'apply_velopt',
                       ### HJ : Bridge group apply mirror
-                      'apply_bridge')
+                      'apply_bridge',
+                      ## IY : Safety group apply mirror
+                      'apply_safety')
         apply_any = any(bool(config.get(k, False)) for k in APPLY_KEYS)
         ## IY : end
 
-        if getattr(config, 'save_now', False):
+        ## IY : save_ggv (renamed from save_now) — snapshots latest GGV to v<N+1>.
+        if getattr(config, 'save_ggv', False):
             if self.pipeline_thread is not None and self.pipeline_thread.is_alive():
                 rospy.logwarn(
-                    "[GGTuner] SAVE ignored: pipeline running "
-                    " ")
+                    "[GGTuner] SAVE_GGV ignored: pipeline running")
             else:
                 try:
                     self._snapshot_latest_to_version()
                 except Exception as e:
-                    rospy.logerr(f"[GGTuner] SAVE exception: {e}")
-                    self.status_pub.publish(f"SAVE_EXCEPTION: {str(e)[:80]}")
-            config.save_now = False
+                    rospy.logerr(f"[GGTuner] SAVE_GGV exception: {e}")
+                    self.status_pub.publish(
+                        f"SAVE_GGV_EXCEPTION: {str(e)[:80]}")
+            config.save_ggv = False
             if not apply_any:
                 return config
         ## IY : end
@@ -1401,7 +1501,7 @@ class GGTunerNode:
         ## IY : end
 
         ### HJ : sector_slicing / bridge_tuner are now *trigger* checkboxes
-        ###      (mirroring apply/save_now): clicking True spawns the GUI and
+        ###      (mirroring apply/save_ggv): clicking True spawns the GUI and
         ###      the box auto-returns to False. The matplotlib GUIs own their
         ###      own lifecycle — user clicks Done or closes the window to
         ###      terminate, no separate "uncheck to kill" step. This avoids
@@ -1421,10 +1521,31 @@ class GGTunerNode:
             if not apply_any:
                 return config
         ### HJ : end
-        ## IY : safety slicing GUI is spawned via the shared
-        ##      run_sector_slicing trigger (3d_sector_slicing.launch now
-        ##      includes safety_sector_slicing.py alongside the other
-        ##      slicers). No separate trigger needed.
+        ## IY : safety sector tuner — auto-clear trigger (bridge_tuner pattern).
+        ##      Spawns slicing GUI only; the dyn cfg server lives on a
+        ##      separate toggle (safety_sector_setting). Checkbox returns to
+        ##      False right after spawn.
+        if bool(getattr(config, 'safety_sector_tuner', False)):
+            self._run_safety_sector_tuner(str(config.map))
+            config.safety_sector_tuner = False
+            if not apply_any:
+                return config
+        ## IY : safety sector setting — persistent toggle, edge-detected.
+        ##      ON edge ⇒ safety_setting.launch (server only — slicing GUI
+        ##      is on a separate trigger above). OFF edge ⇒ kill server and
+        ##      wipe rosparam tree so use=ON without setting falls through
+        ##      to yaml-on-disk.
+        cur_safety_setting = bool(getattr(config, 'safety_sector_setting',
+                                          False))
+        if cur_safety_setting != self._last_safety_setting_state:
+            if cur_safety_setting:
+                self._start_safety_sector_setting(str(config.map))
+            else:
+                self._stop_safety_sector_setting()
+            self._last_safety_setting_state = cur_safety_setting
+            if not apply_any:
+                return config
+        ## IY : end
 
         ### HJ : if the user switched maps in rqt, re-sync bridge sliders from
         ###      the new map's yaml. Done here (in reconfigure_cb) because
@@ -1523,9 +1644,12 @@ class GGTunerNode:
             'bridge_force_center':       bool(config.bridge_force_center),
             'bridge_chi_max_rad':        float(config.bridge_chi_max_rad),
             ### HJ : end
-            ## IY : safety sector params (per-sector wall margin + default)
-            ##      live in /safety_sector_params/... rosparam tree, owned by
-            ##      safety_sector_server.py. Nothing to collect here.
+            ## IY : safety sector master switch (bridge_constraints_enable
+            ##      analogue). Per-sector values live in /safety_sector_params/...
+            ##      rosparam tree (owned by safety_sector_server.py); this flag
+            ##      gates whether gen_global_racing_line reads them at all.
+            'safety_sector_use': bool(config.safety_sector_use),
+            ## IY : end
         }
         ## IY : end
 
@@ -1596,6 +1720,26 @@ class GGTunerNode:
             except subprocess.TimeoutExpired:
                 self.bridge_tuner_proc.kill()
         ### HJ : end
+        ## IY : safety slicing GUI cleanup (auto-clear trigger may still
+        ##      have a live subprocess if user hasn't clicked Done yet).
+        if self.safety_tuner_proc is not None and \
+                self.safety_tuner_proc.poll() is None:
+            rospy.loginfo("[GGTuner] Terminating safety_tuner roslaunch...")
+            try:
+                self.safety_tuner_proc.terminate()
+                self.safety_tuner_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.safety_tuner_proc.kill()
+        ## IY : safety sector setting (dyn cfg server) cleanup.
+        if self.safety_setting_proc is not None and \
+                self.safety_setting_proc.poll() is None:
+            rospy.loginfo("[GGTuner] Terminating safety_setting roslaunch...")
+            try:
+                self.safety_setting_proc.terminate()
+                self.safety_setting_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.safety_setting_proc.kill()
+        ## IY : end
 
 
 if __name__ == '__main__':
