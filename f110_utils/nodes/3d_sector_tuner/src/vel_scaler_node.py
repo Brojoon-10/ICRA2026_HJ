@@ -1,5 +1,6 @@
 #! /usr/bin/env python3
 
+import copy
 import rospy
 import rospkg
 import numpy as np
@@ -145,16 +146,26 @@ class VelocityScaler:
         """
         scaling = []
 
-        if self.glb_wpnts_scaled is None or self.update_map:
-            self.glb_wpnts_scaled = self.glb_wpnts_og
-            self.glb_wpnts_sp_scaled = self.glb_wpnts_sp_og
+        if self.glb_wpnts_og is None:
+            return
+
+        ### HJ : keep og/scaled in separate memory so og stays raw.
+        need_resync = (
+            self.glb_wpnts_scaled is None
+            or self.update_map
+            or len(self.glb_wpnts_scaled.wpnts) != len(self.glb_wpnts_og.wpnts)
+        )
+        if need_resync:
+            self.glb_wpnts_scaled = copy.deepcopy(self.glb_wpnts_og)
+            if self.glb_wpnts_sp_og is not None:
+                self.glb_wpnts_sp_scaled = copy.deepcopy(self.glb_wpnts_sp_og)
             self.update_map = False
 
         for i, wpnt  in enumerate(self.glb_wpnts_og.wpnts):
             vel_scaling = self.get_vel_scaling(i)
             new_vel = wpnt.vx_mps*vel_scaling
             self.glb_wpnts_scaled.wpnts[i].vx_mps = new_vel
-            scaling.append(self.get_vel_scaling(i))
+            scaling.append(vel_scaling)
 
         if self.debug_plot:
             plt.clf()
