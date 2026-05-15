@@ -140,6 +140,11 @@ class GGTunerNode:
         self.safety_setting_proc = None
         self._last_safety_setting_state = False
         ## IY : end
+        ## IY : friction sector — clone of safety pattern (3 checkboxes).
+        self.friction_tuner_proc = None
+        self.friction_setting_proc = None
+        self._last_friction_setting_state = False
+        ## IY : end
 
         rospy.on_shutdown(self._shutdown_cleanup)
 
@@ -844,6 +849,7 @@ class GGTunerNode:
         ##      and persistent server toggle all force-cleared on yml load
         ##      so reopening a saved session never auto-spawns anything.
         'apply_safety', 'safety_sector_tuner', 'safety_sector_setting',
+        'apply_friction', 'friction_sector_tuner', 'friction_sector_setting',
         ## IY : end
     )
 
@@ -873,7 +879,9 @@ class GGTunerNode:
                      'apply_bridge', 'run_bridge_tuner', 'run_sector_slicing',
                      ## IY : safety triggers — all saved as False on dump
                      'apply_safety', 'safety_sector_tuner',
-                     'safety_sector_setting'):
+                     'safety_sector_setting',
+                     'apply_friction', 'friction_sector_tuner',
+                     'friction_sector_setting'):
                 params[k] = False
                 continue
             if isinstance(v, bool):
@@ -1057,6 +1065,77 @@ class GGTunerNode:
             pass
         self.status_pub.publish("SAFETY_SETTING_OFF")
         rospy.loginfo("[GGTuner] [safety-setting] stopped")
+    ## IY : end
+
+    ## IY : friction sector — clone of safety pattern.
+    def _run_friction_sector_tuner(self, map_name):
+        if self.friction_tuner_proc is not None and \
+                self.friction_tuner_proc.poll() is None:
+            rospy.loginfo("[GGTuner] [friction-tuner] already running")
+            return True
+        if map_name not in self.available_maps:
+            rospy.logerr(f"[GGTuner] [friction-tuner] invalid map '{map_name}'")
+            self.status_pub.publish(f"FAILED_FRICTION_TUNER: invalid map")
+            return False
+        cmd = [
+            'roslaunch', 'friction_sector_tuner', 'friction_tuner.launch',
+            f'map:={map_name}',
+        ]
+        rospy.loginfo(f"[GGTuner] [friction-tuner] launching: {' '.join(cmd)}")
+        try:
+            self.friction_tuner_proc = subprocess.Popen(cmd)
+            self.status_pub.publish(f"FRICTION_TUNER_RUNNING: {map_name}")
+            return True
+        except OSError as e:
+            rospy.logerr(f"[GGTuner] [friction-tuner] launch failed: {e}")
+            self.status_pub.publish(f"FAILED_FRICTION_TUNER: {map_name}")
+            return False
+
+    def _start_friction_sector_setting(self, map_name):
+        if self.friction_setting_proc is not None and \
+                self.friction_setting_proc.poll() is None:
+            rospy.loginfo("[GGTuner] [friction-setting] already running")
+            return True
+        if map_name not in self.available_maps:
+            rospy.logerr(f"[GGTuner] [friction-setting] invalid map '{map_name}'")
+            self.status_pub.publish(f"FAILED_FRICTION_SETTING: invalid map")
+            return False
+        cmd = [
+            'roslaunch', 'friction_sector_tuner', 'friction_setting.launch',
+            f'map:={map_name}',
+        ]
+        rospy.loginfo(f"[GGTuner] [friction-setting] launching: {' '.join(cmd)}")
+        try:
+            self.friction_setting_proc = subprocess.Popen(cmd)
+            self.status_pub.publish(f"FRICTION_SETTING_ON: {map_name}")
+            return True
+        except OSError as e:
+            rospy.logerr(f"[GGTuner] [friction-setting] launch failed: {e}")
+            self.status_pub.publish(f"FAILED_FRICTION_SETTING: {map_name}")
+            return False
+
+    def _stop_friction_sector_setting(self):
+        rospy.loginfo("[GGTuner] [friction-setting] stop requested (toggle off)")
+        try:
+            subprocess.run(['rosnode', 'kill', '/dyn_sector_tuner/friction'],
+                           capture_output=True, timeout=3, check=False)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        if self.friction_setting_proc is not None and \
+                self.friction_setting_proc.poll() is None:
+            try:
+                self.friction_setting_proc.terminate()
+                self.friction_setting_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.friction_setting_proc.kill()
+        self.friction_setting_proc = None
+        ## IY : wipe rosparam so use=ON without setting falls through to yaml.
+        try:
+            rospy.delete_param('/friction_map_params')
+        except KeyError:
+            pass
+        self.status_pub.publish("FRICTION_SETTING_OFF")
+        rospy.loginfo("[GGTuner] [friction-setting] stopped")
     ## IY : end
 
     ## IY : persist velopt tuning to a single overwritten yaml so the latest
@@ -1453,7 +1532,9 @@ class GGTunerNode:
                       ### HJ : Bridge group apply mirror
                       'apply_bridge',
                       ## IY : Safety group apply mirror
-                      'apply_safety')
+                      'apply_safety',
+                      ## IY : Friction group apply mirror
+                      'apply_friction')
         apply_any = any(bool(config.get(k, False)) for k in APPLY_KEYS)
         ## IY : end
 
@@ -1543,6 +1624,24 @@ class GGTunerNode:
             else:
                 self._stop_safety_sector_setting()
             self._last_safety_setting_state = cur_safety_setting
+            if not apply_any:
+                return config
+        ## IY : end
+
+        ## IY : friction sector tuner / setting — clone of safety pattern.
+        if bool(getattr(config, 'friction_sector_tuner', False)):
+            self._run_friction_sector_tuner(str(config.map))
+            config.friction_sector_tuner = False
+            if not apply_any:
+                return config
+        cur_friction_setting = bool(getattr(config, 'friction_sector_setting',
+                                            False))
+        if cur_friction_setting != self._last_friction_setting_state:
+            if cur_friction_setting:
+                self._start_friction_sector_setting(str(config.map))
+            else:
+                self._stop_friction_sector_setting()
+            self._last_friction_setting_state = cur_friction_setting
             if not apply_any:
                 return config
         ## IY : end
