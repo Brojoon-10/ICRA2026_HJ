@@ -1,0 +1,124 @@
+<!-- 3D headtohead with real C++ FBGA state_machine
+     IY 2026-05-17 : RECOVERY + SMART_STATIC local_waypoints vx_mps via libs/FBGA.
+     OT keeps fast_sqp_planner's velocity_mode setting (use '3d' for real FBGA on OT too).
+     Identical to 3d_headtohead.launch except the state_machine node. -->
+<launch>
+  <arg name="racecar_version" default="$(env CAR_NAME)" />
+  <arg name="ctrl_algo" default="PP" />
+  <arg name="LU_table" default="SRX1-0427" />
+  <arg name="MAP_mode" default="safe" />
+  <arg name="perception" default="False" />
+  <arg name="enable_planners" default="True" />
+  <arg name="enable_prediction" default="True" />
+  <arg name="dynamic_avoidance_mode" default="SQP" />
+  <arg name="use_vd_prediction" default="False" />
+  <arg name="sampling_planner_enable" default="False" />
+  <arg name="map_name" default="$(optenv MAP_NAME '')" />
+  <arg name="vehicle_name" default="rc_car_10th" />
+
+  <!-- IY 2026-05-17 : FBGA-specific args -->
+  <arg name="fbga_states"     default="['RECOVERY', 'OVERTAKE', 'START']"
+       doc="StateType names that use real C++ FBGA velocity profile." />
+  <arg name="fbga_bin"        default=""
+       doc="abs path to libs/FBGA/bin/GIGI_test_unicorn.exe (empty = node default)." />
+  <arg name="fbga_gg_bin"     default=""
+       doc="abs path to gg.bin (empty = rc_car_10th_latest default)." />
+  <arg name="fbga_params_yml" default=""
+       doc="abs path to params_&lt;vehicle&gt;.yml (empty = rc_car_10th_latest default)." />
+  <arg name="bridge_effect"   default="1.0" />
+  <arg name="fbga_v_scale"    default="1.0"
+       doc="state_machine publish-time uniform vx_mps scale." />
+  <arg name="fbga_max_iter"   default="5"
+       doc="fixed-point iteration cap for local cycle." />
+
+  <param name="measure" value="False" />
+
+  <!-- ══════════════════ PERCEPTION (disabled until 3D ready) ══════════════════ -->
+  <!--
+  <group if="$(arg perception)">
+    <include file="$(find stack_master)/launch/perception.launch"/>
+  </group>
+  -->
+
+  <!-- ══════════════════ CONTROLLER ══════════════════ -->
+  <rosparam ns="L1_controller" command="load"
+    file="$(find stack_master)/config/$(arg racecar_version)/controller.yaml" />
+  <node pkg="controller" name="dyn_controller" type="l1_params_server.py" output="screen" />
+  <node pkg="controller" name="controller_manager" type="controller_manager.py" output="screen">
+    <param name="LU_table" value="$(arg LU_table)" />
+    <param name="ctrl_algo" value="$(arg ctrl_algo)" />
+  </node>
+
+  <!-- ══════════════════ STATE MACHINE (FBGA-enabled, IY 2026-05-17) ══════════════════ -->
+  <node pkg="state_machine" type="dynamic_statemachine_server.py" name="dyn_statemachine" output="screen" />
+  <node pkg="state_machine" type="fbga_state_machine_node.py" name="state_machine" output="screen">
+    <rosparam file="$(find stack_master)/config/state_machine_params.yaml" />
+    <!-- FBGA wiring -->
+    <rosparam param="fbga_states" subst_value="True">$(arg fbga_states)</rosparam>
+    <param name="fbga_bin"        value="$(arg fbga_bin)" />
+    <param name="fbga_gg_bin"     value="$(arg fbga_gg_bin)" />
+    <param name="fbga_params_yml" value="$(arg fbga_params_yml)" />
+    <param name="bridge_effect"   value="$(arg bridge_effect)" />
+    <param name="v_scale"         value="$(arg fbga_v_scale)" />
+    <param name="fbga_max_iter"   value="$(arg fbga_max_iter)" />
+  </node>
+
+  <!-- ══════════════════ STATE MACHINE PLANNER PARAMS ══════════════════ -->
+  <group ns="dyn_planners_statemachine">
+    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="global_tracking" /></include>
+    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="recovery_planner" /></include>
+    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="start_planner" /></include>
+    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="static_avoidance_planner" /></include>
+    <include file="$(find stack_master)/launch/planners.launch"><arg name="planners" value="dynamic_avoidance_planner" /></include>
+  </group>
+
+  <!-- ══════════════════ 3D PLANNERS (enable_planners:=True) ══════════════════ -->
+  <group if="$(arg enable_planners)">
+    <group ns="dyn_planner_tuner">
+      <node pkg="recovery_spliner" type="dynamic_recovery_spline_server.py" name="recovery" output="screen" />
+      <node pkg="spliner" type="dynamic_spline_server.py" name="static_avoidance" output="screen" />
+    </group>
+
+    <!-- Recovery (3D) -->
+    <node pkg="recovery_spliner" type="3d_recovery_spliner_node.py" name="recovery_planner_spline"
+          output="screen" />
+
+    <!-- Start planner -->
+    <node pkg="spliner" type="start_spline_node_v2.py" name="start_planner" output="screen"/>
+
+    <!-- Static Avoidance (3D) — feeds /planner/avoidance/static_otwpnts (SMART_STATIC state) -->
+    <node pkg="spliner" type="3d_static_avoidance_node.py" name="planner_spline" output="screen">
+      <remap from="/planner/avoidance/otwpnts" to="/planner/avoidance/static_otwpnts"/>
+    </node>
+  </group>
+
+  <!-- ══════════════════ DYNAMIC AVOIDANCE (3D SQP) ══════════════════ -->
+  <group if="$(arg enable_planners)">
+    <group if="$(eval dynamic_avoidance_mode == 'SQP')">
+      <node pkg="sqp_planner" type="dynamic_sqp_server.py" name="dynamic_sqp_tuner_node" output="screen"/>
+      <node pkg="sqp_planner" type="3d_sqp_avoidance_node.py" name="planner_sqp" output="screen"/>
+      <node pkg="sqp_planner" type="update_waypoints.py" name="waypoint_updater" output="screen"/>
+    </group>
+  </group>
+
+  <!-- ══════════════════ SAMPLING-BASED PLANNER 3D (observation-only) ══════════════════ -->
+  <group if="$(arg sampling_planner_enable)">
+    <include file="$(find sampling_based_planner_3d)/launch/sampling_planner_multi.launch">
+      <arg name="map_name"     value="$(arg map_name)"/>
+      <arg name="vehicle_name" value="$(arg vehicle_name)"/>
+    </include>
+  </group>
+
+  <!-- ══════════════════ GP PREDICTION ══════════════════ -->
+  <group if="$(arg enable_prediction)">
+    <node pkg="gp_traj_predictor" type="dynamic_prediction_server.py" name="dynamic_prediction_tuner_node" output="screen"/>
+    <node pkg="gp_traj_predictor" type="3d_opp_prediction.py" name="opponent_propagation_predictor" output="screen">
+      <param name="use_vd_prediction" value="$(arg use_vd_prediction)" />
+      <param name="obstacle_half_width" value="0.3" />
+    </node>
+    <node pkg="gp_traj_predictor" type="3d_opponent_trajectory.py" name="OpponentHalflap" output="screen"/>
+    <node pkg="gp_traj_predictor" type="gaussian_process_opp_traj.py" name="GP_trajectory" output="screen" launch-prefix="taskset -c 1"/>
+    <node pkg="gp_traj_predictor" type="predictor_opponent_trajectory.py" name="Predictor_Opp" output="screen"/>
+  </group>
+
+</launch>
