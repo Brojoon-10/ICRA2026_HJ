@@ -410,23 +410,13 @@ def build_and_solve(track, gg, vehicle_params,
         ###      from the LUT, so we scale by mu directly (|ax_min|·mu is the
         ###      reduced brake force at that point). gg_exp untouched —
         ###      friction changes envelope size, not envelope shape.
-        if mu_scale_k is not None:
-            mu_k = float(mu_scale_k[k])
-            ### HJ : per-direction split — defaults 1.0 reduce to isotropic
-            ###      (ax_max *= mu_k; ay_max *= mu_k; ax_min *= mu_k) which is
-            ###      the original behavior. mu_scale_x/y act *on top of* the
-            ###      friction sector mu so per-sector tuning is preserved.
-            # ax_max = ax_max * mu_k * mu_scale_x   ### IY : superseded by per-sector mu_scale_x_k
-            # ay_max = ay_max * mu_k * mu_scale_y   ### IY : superseded by per-sector mu_scale_y_k
-            # ax_min = ax_min * mu_k * mu_scale_x   ### IY : superseded by per-sector mu_scale_x_k
-            ### IY : per-sector mu_scale_x / mu_scale_y from friction yaml.
-            ###      Each sector can independently scale longitudinal (ax) and
-            ###      lateral (ay) grip on top of its sector mu.
+        ### IY : sx_k / sy_k = final long/lat envelope scale (mu_k drop)
+        if mu_scale_x_k is not None or mu_scale_y_k is not None:
             sx_k = float(mu_scale_x_k[k]) if mu_scale_x_k is not None else 1.0
             sy_k = float(mu_scale_y_k[k]) if mu_scale_y_k is not None else 1.0
-            ax_max = ax_max * mu_k * sx_k
-            ay_max = ay_max * mu_k * sy_k
-            ax_min = ax_min * mu_k * sx_k
+            ax_max = ax_max * sx_k
+            ay_max = ay_max * sy_k
+            ax_min = ax_min * sx_k
         ### HJ : end
         g += [ay_max - ca.fabs(ayt_k)]
         lbg += [0.0]; ubg += [np.inf]

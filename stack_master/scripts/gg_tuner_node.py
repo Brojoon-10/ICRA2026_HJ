@@ -841,6 +841,8 @@ class GGTunerNode:
         # never re-apply trigger bools — would fire the pipeline as a side effect
         'apply', 'apply_ggv', 'apply_raceline', 'apply_fbga', 'apply_velopt',
         'save_ggv', 'save_params', 'load_params',
+        ## IY : velopt-only save/load triggers — same skip rule
+        'save_velopt_params', 'load_velopt_params',
         ### HJ : also skip our bridge trigger mirrors so reloading a saved
         ###      yml never auto-spawns the tuner GUI or fires apply_bridge.
         'apply_bridge', 'run_bridge_tuner', 'run_sector_slicing',
@@ -875,6 +877,8 @@ class GGTunerNode:
             # persist triggers as False so a yml reload never auto-fires them
             if k in ('apply', 'apply_ggv', 'apply_raceline', 'apply_fbga',
                      'apply_velopt', 'save_ggv', 'save_params', 'load_params',
+                     ## IY : velopt-only save/load triggers force-False on dump
+                     'save_velopt_params', 'load_velopt_params',
                      ### HJ : also force HJ-side triggers to False on save
                      'apply_bridge', 'run_bridge_tuner', 'run_sector_slicing',
                      ## IY : safety triggers — all saved as False on dump
@@ -939,6 +943,102 @@ class GGTunerNode:
             f"applied={applied} skipped={skipped}")
         self.status_pub.publish(f"PARAMS_LOADED_v{n}_n{applied}")
         return n
+    ## IY : end
+
+    ## IY : VelOpt-only save/load — scoped to vo_* keys only AND per-map.
+    ##   Single file at stack_master/maps/<map>/velopt_params.yml, overwritten
+    ##   on each save (no version history). Map is read from the D_Raceline
+    ##   `map` slider (config.map). Independent of the global save_params /
+    ##   load_params (which dump everything to velopt_tun/gg_params_v*.yml).
+    def _velopt_params_path(self, map_name):
+        if not map_name:
+            return None
+        d = os.path.join(self.maps_dir, map_name)
+        if not os.path.isdir(d):
+            return None
+        return os.path.join(d, 'velopt_params.yml')
+
+    def _save_velopt_params_yaml(self, config):
+        map_name = str(getattr(config, 'map', '') or '')
+        fpath = self._velopt_params_path(map_name)
+        if fpath is None:
+            rospy.logwarn(
+                f"[GGTuner] save_velopt_params: invalid map '{map_name}' "
+                f"(maps/{map_name} not found)")
+            self.status_pub.publish(
+                f"VELOPT_PARAMS_SAVE_BAD_MAP: {map_name}")
+            return None
+        params = {}
+        for k, v in dict(config).items():
+            if not k.startswith('vo_'):
+                continue
+            if isinstance(v, bool):
+                params[k] = bool(v)
+            elif isinstance(v, (int, float)):
+                params[k] = float(v) if isinstance(v, float) else int(v)
+            else:
+                params[k] = v
+        if not params:
+            rospy.logwarn("[GGTuner] save_velopt_params: no vo_* keys in cfg")
+            self.status_pub.publish("VELOPT_PARAMS_SAVE_EMPTY")
+            return None
+        payload = {
+            'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'map': map_name,
+            'source': '/gg_tuner dynamic_reconfigure (velopt-only)',
+            'params': params,
+        }
+        with open(fpath, 'w') as f:
+            yaml.dump(payload, f, default_flow_style=False, sort_keys=True)
+        rospy.loginfo(
+            f"[GGTuner] save_velopt_params: {len(params)} keys → {fpath}")
+        self.status_pub.publish(f"VELOPT_PARAMS_SAVED_{map_name}")
+        return fpath
+
+    def _load_velopt_params_yaml_into(self, config):
+        map_name = str(getattr(config, 'map', '') or '')
+        fpath = self._velopt_params_path(map_name)
+        if fpath is None:
+            rospy.logwarn(
+                f"[GGTuner] load_velopt_params: invalid map '{map_name}' "
+                f"(maps/{map_name} not found)")
+            self.status_pub.publish(
+                f"VELOPT_PARAMS_LOAD_BAD_MAP: {map_name}")
+            return None
+        if not os.path.isfile(fpath):
+            rospy.logwarn(
+                f"[GGTuner] load_velopt_params: {fpath} not found")
+            self.status_pub.publish(
+                f"VELOPT_PARAMS_LOAD_NONE: {map_name}")
+            return None
+        with open(fpath) as f:
+            payload = yaml.safe_load(f) or {}
+        params = payload.get('params') if isinstance(payload, dict) else None
+        if not isinstance(params, dict) or not params:
+            rospy.logwarn(
+                f"[GGTuner] load_velopt_params: no params field in {fpath}")
+            self.status_pub.publish(
+                f"VELOPT_PARAMS_LOAD_EMPTY: {map_name}")
+            return fpath
+        applied = 0
+        skipped = 0
+        for k, v in params.items():
+            if not k.startswith('vo_'):
+                continue
+            try:
+                config[k] = v
+                applied += 1
+            except (KeyError, TypeError) as e:
+                rospy.logwarn(
+                    f"[GGTuner] load_velopt_params: skip {k} "
+                    f"({type(v).__name__}): {e}")
+                skipped += 1
+        rospy.loginfo(
+            f"[GGTuner] load_velopt_params: {fpath} → "
+            f"applied={applied} skipped={skipped}")
+        self.status_pub.publish(
+            f"VELOPT_PARAMS_LOADED_{map_name}_n{applied}")
+        return fpath
     ## IY : end
 
     ### HJ : bridge_tuner spawn/kill — mirrors _run_sector_slicing pattern.
@@ -1577,6 +1677,34 @@ class GGTunerNode:
                 self.status_pub.publish(
                     f"LOAD_PARAMS_EXCEPTION: {str(e)[:80]}")
             config.load_params = False
+            if not apply_any:
+                return config
+        ## IY : end
+
+        ## IY : VelOpt-only save/load triggers — scoped to vo_* sliders so
+        ##   velopt presets are decoupled from ggv/raceline/fbga/bridge.
+        ##   Same auto-clear + early-return-when-no-apply pattern.
+        if getattr(config, 'save_velopt_params', False):
+            try:
+                self._save_velopt_params_yaml(config)
+            except Exception as e:
+                rospy.logerr(
+                    f"[GGTuner] save_velopt_params exception: {e}")
+                self.status_pub.publish(
+                    f"SAVE_VELOPT_PARAMS_EXCEPTION: {str(e)[:80]}")
+            config.save_velopt_params = False
+            if not apply_any:
+                return config
+
+        if getattr(config, 'load_velopt_params', False):
+            try:
+                self._load_velopt_params_yaml_into(config)
+            except Exception as e:
+                rospy.logerr(
+                    f"[GGTuner] load_velopt_params exception: {e}")
+                self.status_pub.publish(
+                    f"LOAD_VELOPT_PARAMS_EXCEPTION: {str(e)[:80]}")
+            config.load_velopt_params = False
             if not apply_any:
                 return config
         ## IY : end

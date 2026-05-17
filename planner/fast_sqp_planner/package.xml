@@ -24,6 +24,8 @@
   <exec_depend>f110_msgs</exec_depend>
   <exec_depend>frenet_conversion</exec_depend>
   <exec_depend>vel_planner</exec_depend>
+  <!-- IY 2026-05-17 : real C++ FBGA wrapper for velocity_mode='3d' -->
+  <exec_depend>fbga_runner</exec_depend>
 
   <export/>
 </package>

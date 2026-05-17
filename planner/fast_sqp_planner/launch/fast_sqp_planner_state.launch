@@ -11,9 +11,22 @@
   <arg name="output_topic"           default=""
        doc="Non-empty overrides role remap entirely."/>
 
+  <!-- IY 2026-05-17 : optional real C++ FBGA (velocity_mode='3d') -->
+  <arg name="fbga_enable"     default="false"/>
+  <arg name="fbga_bin"        default=""/>
+  <arg name="fbga_gg_bin"     default=""/>
+  <arg name="fbga_params_yml" default=""/>
+  <arg name="bridge_effect"   default="1.0"/>
+
   <node pkg="fast_sqp_planner" type="fast_sqp_planner_node.py"
         name="$(arg instance_name)" output="screen">
     <rosparam command="load" file="$(arg config_file)"/>
+    <!-- IY 2026-05-17 : FBGA params -->
+    <param name="fbga_enable"     value="$(arg fbga_enable)"/>
+    <param name="fbga_bin"        value="$(arg fbga_bin)"/>
+    <param name="fbga_gg_bin"     value="$(arg fbga_gg_bin)"/>
+    <param name="fbga_params_yml" value="$(arg fbga_params_yml)"/>
+    <param name="bridge_effect"   value="$(arg bridge_effect)"/>
 
     <!-- Priority: explicit output_topic > attach_to_statemachine > observation. -->
     <remap from="/planner/fast_sqp_planner/otwpnts" to="$(arg output_topic)"

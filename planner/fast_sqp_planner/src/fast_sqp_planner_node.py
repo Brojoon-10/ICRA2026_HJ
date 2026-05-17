@@ -95,6 +95,19 @@ class OvertakingIYNode:
         # GGV data for velocity optimization
         self.ggv_data = None  # loaded in _load_ggv()
 
+        ## IY 2026-05-17 : real C++ FBGA params (velocity_mode='3d')
+        self.fbga_enable        = bool(pp('~fbga_enable', False))
+        self.fbga_bin           = pp('~fbga_bin', '')
+        self.fbga_gg_bin        = pp('~fbga_gg_bin', '')
+        self.fbga_params_yml    = pp('~fbga_params_yml', '')
+        self.fbga_bridge_effect = float(pp('~bridge_effect', 1.0))
+        self.fbga_enable_mu     = bool(pp('~fbga_enable_mu', True))
+        self.fbga_max_iter      = int(pp('~fbga_max_iter', 5))   # local cycle → small
+        self.fbga_tol           = float(pp('~fbga_tol', 0.05))
+        self.fbga_alpha         = float(pp('~fbga_alpha', 0.5))
+        self._fbga_runner       = None  # built lazily in _init_fbga_runner()
+        ## IY 2026-05-17 : end
+
         # Abort
         self.abort = AbortChecker(AbortConfig(
             performance_margin_s=pp('~abort/performance_margin_s', 0.1),
@@ -196,6 +209,9 @@ class OvertakingIYNode:
 
         self.converter = self._init_converter()
         self._load_ggv()  # GGV for FBGA velocity profiling
+        ## IY 2026-05-17 : real C++ FBGA runner (only if fbga_enable=true)
+        self._init_fbga_runner()
+        ## IY 2026-05-17 : end
 
         ## IY : final velocity profile uniform scale (rqt-tunable, applied at publish only)
         self.v_scale = float(pp('~v_scale', 1.0))
@@ -426,6 +442,46 @@ class OvertakingIYNode:
         except Exception as exc:
             rospy.logwarn('[OvertakingIY] GGManager load failed: %s', exc)
         ## IY : end
+
+    ## IY 2026-05-17 : real C++ FBGA runner init (only when fbga_enable=true)
+    def _init_fbga_runner(self) -> None:
+        if not self.fbga_enable:
+            return
+        _this_dir = os.path.dirname(os.path.abspath(__file__))
+        # default paths (mirror fbga_velocity_planner.py: rc_car_10th_latest)
+        race_stack = os.path.abspath(os.path.join(_this_dir, '..', '..', '..'))
+        if not self.fbga_bin:
+            self.fbga_bin = os.path.join(
+                race_stack, 'f110_utils', 'libs', 'FBGA', 'bin',
+                'GIGI_test_unicorn.exe')
+        if not self.fbga_gg_bin:
+            self.fbga_gg_bin = os.path.join(
+                race_stack, 'planner', '3d_gb_optimizer', 'global_line', 'data',
+                'gg_diagrams', 'rc_car_10th_latest', 'velocity_frame', 'gg.bin')
+        if not self.fbga_params_yml:
+            self.fbga_params_yml = os.path.join(
+                race_stack, 'planner', '3d_gb_optimizer', 'global_line', 'data',
+                'vehicle_params', 'params_rc_car_10th_latest.yml')
+        try:
+            from fbga_runner import FBGARunner
+            self._fbga_runner = FBGARunner(
+                fbga_bin=self.fbga_bin,
+                gg_bin=self.fbga_gg_bin,
+                params_yml=self.fbga_params_yml,
+                bridge_effect=self.fbga_bridge_effect,
+                enable_mu=self.fbga_enable_mu,
+                alpha=self.fbga_alpha,
+                max_iter=self.fbga_max_iter,
+                tol=self.fbga_tol,
+                logger=rospy.loginfo,
+            )
+            rospy.loginfo('[OvertakingIY] FBGA runner ready')
+        except Exception as exc:
+            rospy.logwarn(
+                '[OvertakingIY] FBGA runner init failed; velocity_mode=3d will fallback: %s',
+                exc)
+            self._fbga_runner = None
+    ## IY 2026-05-17 : end
 
     ## IY : add optional g_values override for 3d mode g_tilde iteration
     def _ggv_lookup(self, v_arr: np.ndarray, mu_arr: np.ndarray,
@@ -1307,7 +1363,7 @@ class OvertakingIYNode:
                 v_at_path = np.interp(s_wrap, s_ref, v_ref)
                 mu_at_path = np.interp(s_wrap, s_ref, mu_ref)
 
-                ## IY : velocity_mode dispatch (2_5d / nlp)
+                ## IY 2026-05-17 : velocity_mode dispatch (2_5d / nlp / 3d)
                 if self.velocity_mode == '2_5d':
                     # vel_planner_25d: ggv + slope(elevation angle) mode
                     # slope=mu_at_path (track pitch angle rad)
@@ -1359,6 +1415,33 @@ class OvertakingIYNode:
                             loc_gg=loc_gg,
                         )
                     ## IY : end
+                elif self.velocity_mode == '3d':
+                    ## IY 2026-05-17 : real C++ FBGA (libs/FBGA/GIGI_test_unicorn.exe)
+                    used_fbga = False
+                    if self._fbga_runner is not None:
+                        s_path = np.cumsum(np.concatenate([[0.0], el_lengths]))
+                        res = self._fbga_runner.solve_open(
+                            s_path, kappa_path, mu_at_path, v_seed=v_at_path)
+                        if res is not None:
+                            v_profile = res[0]
+                            used_fbga = True
+                        else:
+                            rospy.logwarn_throttle(1.0,
+                                '[OvertakingIY] FBGA solve failed; fallback to loc_gg')
+                    else:
+                        rospy.logwarn_throttle(5.0,
+                            '[OvertakingIY] velocity_mode=3d but FBGA runner unavailable; fallback')
+                    if not used_fbga:
+                        ax_max, ay_max = self._ggv_lookup(v_at_path, mu_at_path)
+                        loc_gg = np.column_stack([ax_max, ay_max])
+                        v_profile = self.vp.profile(
+                            kappa=kappa_path,
+                            el_lengths=el_lengths,
+                            v_start=max(self.cur_v, 0.1),
+                            v_max=self.scaled_vmax,
+                            loc_gg=loc_gg,
+                        )
+                    ## IY 2026-05-17 : end
                 else:
                     # fallback: legacy loc_gg mode
                     ax_max, ay_max = self._ggv_lookup(v_at_path, mu_at_path)
