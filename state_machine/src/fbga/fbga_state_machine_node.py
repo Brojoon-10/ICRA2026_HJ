@@ -86,6 +86,7 @@ class FBGAStateMachine(sm3d.StateMachine):
                 alpha=float(rospy.get_param('~fbga_alpha', 0.5)),
                 max_iter=int(rospy.get_param('~fbga_max_iter', 5)),
                 tol=float(rospy.get_param('~fbga_tol', 0.05)),
+                gg_scale=float(rospy.get_param('~gg_scale', 1.0)),
                 logger=rospy.loginfo,
             )
             rospy.loginfo(f'[FBGAStateMachine] FBGA runner ready '
@@ -123,7 +124,10 @@ class FBGAStateMachine(sm3d.StateMachine):
             for w in wpnts_msg.wpnts:
                 w.vx_mps = float(w.vx_mps) * self.v_scale_sm
 
-    def _update_velocity_fbga(self, wpnts_msg, sf, st) -> bool:
+    def _update_velocity_fbga(self, wpnts_msg, _sf, st) -> bool:
+        # _sf (safety_factor) intentionally ignored: FBGA already produces a
+        # physics-consistent profile via gg_scale-applied GGV. gg_scale and
+        # v_scale are the only knobs that should affect FBGA output.
         # logwarn (not loginfo) is used everywhere so messages survive
         # log_level=WARN set in rospy.init_node.
         wpnts = wpnts_msg.wpnts
@@ -192,8 +196,11 @@ class FBGAStateMachine(sm3d.StateMachine):
                 f'v={v_new.shape[0]} ax={ax_new.shape[0]} expected={n}')
             return False
 
-        # v_max clamp (safety_factor applied).
-        v_max = self.pars["veh_params"]["v_max"] * float(sf)
+        # v_max clamp. FBGA already produces a physics-consistent profile
+        # via the (gg_scale-applied) GGV; we ignore safety_factor here so
+        # gg_scale / v_scale stay the only knobs. RECOVERY's hardcoded 0.5
+        # in 3d_state_machine_node.py only affects the legacy 2.5d path.
+        v_max = self.pars["veh_params"]["v_max"]
         v_new = np.minimum(v_new, v_max)
 
         # v_end clamp at the global-waypoint join (mirrors legacy L1537).
@@ -213,6 +220,30 @@ class FBGAStateMachine(sm3d.StateMachine):
             f'v=[{v_new.min():.2f},{v_new.max():.2f}] '
             f'ax=[{ax_new.min():.2f},{ax_new.max():.2f}]')
         return True
+
+    # IY 2026-05-17 : override callbacks to immediately mirror the
+    # FBGA-updated wpnts into cur_*_wpnts. The parent only refreshes
+    # cur_*_wpnts inside _check_latest_wpnts which RecoveryTransition /
+    # static_avoidance path do not call every cycle when the stamp is
+    # fresh -- that left cur_*_wpnts.list with stale velocities and the
+    # publish stage was reading those stale values, not our FBGA result.
+    # (OVERTAKE works in the parent because OvertakingTransition does
+    # call _check_latest_wpnts every cycle via _check_overtaking_mode.
+    # START already calls initialize_traj inside save_start_traj_cb.)
+    def recovery_wpnts_cb(self, data):
+        super().recovery_wpnts_cb(data)
+        if len(data.wpnts) != 0:
+            self.cur_recovery_wpnts.initialize_traj(data)
+
+    def avoidance_cb(self, data):
+        super().avoidance_cb(data)
+        if len(data.wpnts) != 0:
+            self.cur_avoidance_wpnts.initialize_traj(data)
+
+    def static_avoidance_cb(self, data):
+        super().static_avoidance_cb(data)
+        if len(data.wpnts) != 0:
+            self.cur_static_avoidance_wpnts.initialize_traj(data)
 
 
 if __name__ == "__main__":
