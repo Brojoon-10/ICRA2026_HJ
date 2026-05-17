@@ -6,7 +6,9 @@ Overtaking_sector0:
   start: 0
   end: 328
   ot_flag: false
+  disable_static_avoidance: false   ### HJ : true = forbid static avoidance in this sector (bridge protection)
 Overtaking_sector1:
   start: 329
   end: 856
   ot_flag: false
+  disable_static_avoidance: false   ### HJ : true = forbid static avoidance in this sector (bridge protection)
