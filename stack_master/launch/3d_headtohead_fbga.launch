@@ -28,6 +28,8 @@
   <arg name="bridge_effect"   default="1.0" />
   <arg name="fbga_v_scale"    default="1.0"
        doc="state_machine publish-time uniform vx_mps scale." />
+  <arg name="fbga_gg_scale"   default="1.0"
+       doc="ax_max/ay_max multiplier applied to a scaled copy of the GGV (written under &lt;vehicle&gt;_fbga_latest/)." />
   <arg name="fbga_max_iter"   default="5"
        doc="fixed-point iteration cap for local cycle." />
 
@@ -60,6 +62,7 @@
     <param name="fbga_params_yml" value="$(arg fbga_params_yml)" />
     <param name="bridge_effect"   value="$(arg bridge_effect)" />
     <param name="v_scale"         value="$(arg fbga_v_scale)" />
+    <param name="gg_scale"        value="$(arg fbga_gg_scale)" />
     <param name="fbga_max_iter"   value="$(arg fbga_max_iter)" />
   </node>
 
