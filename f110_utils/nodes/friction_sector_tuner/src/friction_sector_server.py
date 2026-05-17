@@ -15,6 +15,9 @@ class FrictionSectorPublisher:
     def __init__(self):
         self.sectors = None
         self.glb_waypoints = None
+        ### IY : one-way sync Sector -> mu_scale_x/y
+        self._prev_sector_vals = {}
+        self._init_done = False
         pkg_path = rospkg.RosPack().get_path("stack_master")
         map_name = rospy.get_param('/map')
         self.yaml_file_path = pkg_path + "/maps/" + map_name + "/friction_scaling.yaml"
@@ -33,8 +36,31 @@ class FrictionSectorPublisher:
         if config.load_yaml:
             self._reload_yaml(config)
             config.load_yaml = False
+        else:
+            ### IY : detect Sector slider moves, mirror to mu_scale_x/y of the
+            ###      same sector. Skipped on the first callback (seed only)
+            ###      and on yaml reload (handled in _reload_yaml).
+            self._sync_sector_to_xy(config)
         self.update_friction_params(config)
         return config
+
+    def _sync_sector_to_xy(self, config):
+        if self.yaml_data is None:
+            return
+        n_sectors = self.yaml_data.get('n_sectors', 0)
+        for i in range(n_sectors):
+            key = f"Sector{i}"
+            cur = float(getattr(config, key, 1.0))
+            if not self._init_done:
+                self._prev_sector_vals[key] = cur
+                continue
+            prev = self._prev_sector_vals.get(key, cur)
+            if cur != prev:
+                setattr(config, f"{key}_mu_scale_x", cur)
+                setattr(config, f"{key}_mu_scale_y", cur)
+            self._prev_sector_vals[key] = cur
+        if not self._init_done:
+            self._init_done = True
 
     def _reload_yaml(self, config):
         """Reload friction params from yaml and update rqt sliders"""
@@ -42,6 +68,11 @@ class FrictionSectorPublisher:
         self.default_config = self.decode_yaml(self.yaml_data)
         for key, val in self.default_config.items():
             setattr(config, key, val)
+        ### IY : reseed prev Sector values so reload does not trigger sync
+        n_sectors = self.yaml_data.get('n_sectors', 0)
+        for i in range(n_sectors):
+            k = f"Sector{i}"
+            self._prev_sector_vals[k] = float(getattr(config, k, 1.0))
         rospy.loginfo(f"[FrictionSector] Reloaded from {self.yaml_file_path}")
 
     def update_friction_params(self, config):
