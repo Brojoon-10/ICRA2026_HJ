@@ -31,20 +31,27 @@ class FBGARunner:
                  smooth_kappa=True, kappa_window=21, kappa_polyorder=3,
                  alpha=0.5, max_iter=50, tol=0.05,
                  slope_brake_margin=0.0, slope_brake_vmax=5.0,
+                 gg_scale=1.0,
                  logger=None):
         self._log = logger if logger is not None else (lambda *a, **k: None)
 
-        self.fbga_bin   = fbga_bin
-        self.gg_bin     = gg_bin
-        self.params_yml = params_yml
+        self.fbga_bin       = fbga_bin
+        self.gg_bin_source  = gg_bin          # original (untouched)
+        self.params_yml     = params_yml
+        self.gg_scale       = float(gg_scale)
 
         for name, path in [('fbga_bin', self.fbga_bin),
                            ('params_yml', self.params_yml)]:
             if not os.path.exists(path):
                 raise FileNotFoundError(f"FBGA {name} not found: {path}")
 
-        if not os.path.exists(self.gg_bin):
-            self._generate_gg_bin(self.gg_bin)
+        if not os.path.exists(self.gg_bin_source):
+            self._generate_gg_bin(self.gg_bin_source)
+
+        # Materialise a scaled copy (ax_max, ay_max scaled by gg_scale)
+        # under <vehicle>_fbga_latest/ alongside the source vehicle folder.
+        # When gg_scale == 1.0 we reuse the source path directly.
+        self.gg_bin = self._materialize_scaled_gg(self.gg_bin_source, self.gg_scale)
 
         self.params_txt = os.path.join(tempfile.gettempdir(), 'fbga_params.txt')
         self.v_max = 12.0
@@ -84,6 +91,55 @@ class FBGARunner:
             for arr in [v_list, g_list, ax_max, ax_min, ay_max, gg_exp]:
                 arr.tofile(f)
         self._log(f"[FBGARunner] gg.bin generated nv={nv} ng={ng}")
+
+    # IY 2026-05-17 : write a scaled copy of the GGV into
+    # <vehicle>_fbga_latest/velocity_frame/ (always overwrite). ax_max/ay_max
+    # are multiplied by gg_scale; everything else is copied unchanged. The
+    # source folder is never modified.
+    def _materialize_scaled_gg(self, source_gg_bin, scale):
+        if abs(scale - 1.0) < 1e-9:
+            return source_gg_bin  # default path: reuse source as-is
+
+        src_velocity = os.path.dirname(source_gg_bin)        # .../<vehicle>/velocity_frame
+        src_vehicle  = os.path.dirname(src_velocity)         # .../<vehicle>
+        gg_diagrams  = os.path.dirname(src_vehicle)          # .../gg_diagrams
+        src_name     = os.path.basename(src_vehicle)         # rc_car_10th_latest
+
+        dst_name     = f"{src_name}_fbga_latest"             # rc_car_10th_latest_fbga_latest
+        dst_velocity = os.path.join(gg_diagrams, dst_name, 'velocity_frame')
+        os.makedirs(dst_velocity, exist_ok=True)
+
+        # Load full npy set from source.
+        v_list = np.load(os.path.join(src_velocity, 'v_list.npy')).astype(np.float64)
+        g_list = np.load(os.path.join(src_velocity, 'g_list.npy')).astype(np.float64)
+        ax_max = np.load(os.path.join(src_velocity, 'ax_max.npy')).astype(np.float64)
+        ax_min = np.load(os.path.join(src_velocity, 'ax_min.npy')).astype(np.float64)
+        ay_max = np.load(os.path.join(src_velocity, 'ay_max.npy')).astype(np.float64)
+        gg_exp = np.load(os.path.join(src_velocity, 'gg_exponent.npy')).astype(np.float64)
+
+        # Apply gg_scale to ax_max and ay_max only (per IY spec).
+        ax_max_s = ax_max * scale
+        ay_max_s = ay_max * scale
+
+        # Overwrite full set in dst (so the folder is self-contained).
+        np.save(os.path.join(dst_velocity, 'v_list.npy'),      v_list)
+        np.save(os.path.join(dst_velocity, 'g_list.npy'),      g_list)
+        np.save(os.path.join(dst_velocity, 'ax_max.npy'),      ax_max_s)
+        np.save(os.path.join(dst_velocity, 'ax_min.npy'),      ax_min)
+        np.save(os.path.join(dst_velocity, 'ay_max.npy'),      ay_max_s)
+        np.save(os.path.join(dst_velocity, 'gg_exponent.npy'), gg_exp)
+
+        # Rebuild gg.bin from the scaled npy.
+        nv, ng = len(v_list), len(g_list)
+        dst_bin = os.path.join(dst_velocity, 'gg.bin')
+        with open(dst_bin, 'wb') as f:
+            f.write(struct.pack('II', nv, ng))
+            for arr in [v_list, g_list, ax_max_s, ax_min, ay_max_s, gg_exp]:
+                arr.tofile(f)
+
+        self._log(f"[FBGARunner] scaled gg materialised at {dst_velocity} "
+                  f"(gg_scale={scale:.3f})")
+        return dst_bin
 
     def _convert_params_yml(self, yml_path):
         with open(yml_path) as f:
