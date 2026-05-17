@@ -83,6 +83,11 @@ class Controller_manager:
         self.waypoint_list_in_map = [] # waypoints starting at car's position in map frame
         self.speed_now = 0 # current speed
         self.acc_now = np.zeros(10) # last 5 accleration values
+        ### HJ : rslidar IMU ax buffer — m/s^2, longitudinal (forward+ when sign correct).
+        # Populated by rslidar_imu_cb (currently commented out). Keep buffer always so
+        # downstream code can read it safely (stays 0 → decel_gate=0 → no effect).
+        self.acc_now_rslidar = np.zeros(10)
+        ### HJ : end
         self.speed_now_y =0 
         self.yaw_rate = 0 
         self.waypoint_safety_counter = 0
@@ -259,6 +264,13 @@ class Controller_manager:
         rospy.Subscriber('/car_state/odom', Odometry, self.odom_cb) # car speed
         rospy.Subscriber('/car_state/pose', PoseStamped, self.car_state_cb) # car position (x, y, theta)
         rospy.Subscriber('/imu/data', Imu, self.imu_cb) # acceleration subscriber for steer change
+        ### HJ : rslidar IMU (alive when /imu/data is dead). Bag 2026-05-16-09-41-42
+        # confirms axes: gravity along -z, longitudinal motion along +x,
+        # lateral/cornering along y. Sign of x vs car forward not yet validated —
+        # if forward acceleration shows up as negative ax, flip sign in rslidar_imu_cb.
+        # Uncomment when ready to use for decel-gated curvature_factor boost.
+        # rospy.Subscriber('/rslidar_imu_data', Imu, self.rslidar_imu_cb)
+        ### HJ : end
         # ===== HJ MODIFIED: Dual Frenet odom subscribers =====
         rospy.Subscriber('/car_state/odom_frenet', Odometry, self.car_state_frenet_gb_cb) # GB frenet coordinates
         rospy.Subscriber('/car_state/odom_frenet_fixed', Odometry, self.car_state_frenet_fixed_cb) # Fixed frenet coordinates
@@ -411,6 +423,11 @@ class Controller_manager:
         self.brake_speed_diff_thres = rospy.get_param('dyn_controller/brake_speed_diff_thres', 0.5)
         self.brake_current = rospy.get_param('dyn_controller/brake_current', 15.0)
         self.brake_current_min = rospy.get_param('dyn_controller/brake_current_min', 3.0)
+        ### HJ : end
+
+        ### HJ : raceline-deceleration curvature boost params from dyn_reconfigure
+        self.controller.enable_straight_deceleration = rospy.get_param('dyn_controller/enable_straight_deceleration', False)
+        self.controller.decel_curvature_factor = rospy.get_param('dyn_controller/decel_curvature_factor', 2.5)
         ### HJ : end
 
         ## Trailing Control Parameters
@@ -613,6 +630,19 @@ class Controller_manager:
 
         self.yaw_rate = -data.angular_velocity.z # vesc is rotated 90 deg, so (-acc_y) == (long_acc)
         self.controller.yaw_rate = self.yaw_rate
+
+    ### HJ : rslidar IMU callback — fills self.acc_now_rslidar (m/s^2, +forward).
+    # /rslidar_imu_data publishes in "g" units (az ≈ -1.0 g at rest). On this sensor,
+    # longitudinal motion is along x (verified with bag 2026-05-16-09-41-42),
+    # lateral along y, gravity along -z. Multiply by g to get m/s^2.
+    # Sign: tentatively +ax_raw → +forward; flip if needed after live verification.
+    # The buffer is read by Controller.calc_future_L1_point's decel_gate.
+    # def rslidar_imu_cb(self, data):
+    #     G = 9.81
+    #     self.acc_now_rslidar[1:] = self.acc_now_rslidar[:-1]
+    #     self.acc_now_rslidar[0] = data.linear_acceleration.x * G  # flip sign here if forward is -x
+    #     self.controller.acc_now_rslidar = self.acc_now_rslidar
+    ### HJ : end
 
     ############################################MAIN LOOP############################################
 
