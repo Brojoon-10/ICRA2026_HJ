@@ -202,6 +202,65 @@ VESC Tool RT Data로 명령 publish 시 phase current, ERPM, duty 실시간 그�
 3. **byte offset misalignment 정확한 위치** — `current_motor` 만으로 calib 가능하므로 production에 영향 없음. 단 `fault_code` 모니터링 못 하는 상태이므로, **production deploy 전엔** vesc_driver를 새 펌웨어 호환 버전으로 교체 검토 (fork: f1tenth/vesc 새 버전).
 4. **VESC 펌웨어 버전** — VESC Tool 한 번 연결로 즉시 해결.
 
+## 10b. v2 곡선형 프로파일 + rqt 시각화 (2026-05-19 추가)
+
+simple_mux.py + SimpleMux.cfg 안에 4-phase exp 프로파일을 직접 박았다. 새 패키지 만들지 않음.
+
+### 모드 전환
+
+`rqt_reconfigure` → `/simple_mux` → `launch_profile_mode`:
+
+- `CONSTANT (0)` : v1 단일노브 (`launch_current_A` 그대로)
+- `CURVE (1)` : v2 곡선 (default). 5개 노브로 형상 튜닝
+
+### CURVE 모드 파라미터 (rqt_reconfigure에서 라이브 조정)
+
+| 노브 | 기본 | 의미 |
+|---|---|---|
+| `launch_I_back` | 30.0 A | phase 1 끝점 (백래시 흡수 목표) |
+| `launch_I_peak` | 75.0 A | phase 2/3 peak |
+| `launch_t_back` | 0.05 s | phase 1 종료시각 |
+| `launch_t_rise_end` | 0.30 s | phase 2 종료시각 (exp rise 끝) |
+| `launch_tau` | 0.08 s | exp rise 시정수 (chassis pitch τ) |
+| `launch_t_total` | 1.00 s | 전체 launch 윈도우 |
+
+### rqt에서 슬라이더 + 곡선 한 창으로 (실차/풀스택)
+
+`test_launch_control.launch`가 [launch_preview_plot.py](../stack_master/scripts/launch_preview_plot.py)도 같이 띄운다. 이 노드가 `/vesc/simple_mux`의 dyn_reconfigure 값을 mirror해서 슬라이더 변경 시마다 곡선 PNG를 그려 `sensor_msgs/CompressedImage`로 latched 발행. rqt 안에서 두 패널을 dock하면 한 창에서 슬라이더+곡선 동시.
+
+```bash
+roslaunch stack_master test_launch_control.launch
+# 다른 터미널
+rqt
+```
+
+rqt 안:
+1. **Plugins → Configuration → Dynamic Reconfigure** 추가 → 좌측에 `/vesc/simple_mux` 선택
+2. **Plugins → Visualization → Image View** 추가 → topic `/launch_controller/preview_image/compressed`
+3. 두 패널을 좌/우로 dock — 슬라이더 움직이면 우측 그래프 ≤0.5초 안에 갱신
+
+PNG에는 phase 색깔 fill (P1 blue / P2 orange / P3 green), `t_back`/`t_rise_end`/`t_total` 수직 가이드, `I_peak` 수평 가이드, 슬라이더 값 타이틀 등이 다 들어감.
+
+`render_hz` 파라미터로 갱신율 조정 (default 2 Hz). 슬라이더 드래그 중 자주 갱신 원하면 5 Hz까지 올려도 부하 작음.
+
+**한 번만 셋업 필요**: 컨테이너에 `ros-noetic-image-transport-plugins` 패키지 필요 (compressed transport 디코더). 없으면 rqt Image View가 `image_transport/compressed_sub does not exist` 경고 뜸. 이미 설치됨 (2026-05-19).
+
+### 실측 모니터 (rqt_plot)
+
+ACTIVE 중에 실제 흐른 motor current 비교는 별도 패널로:
+```bash
+rqt_plot /vesc/sensors/core/state/current_motor
+```
+
+### 디버그 토픽
+
+`/launch_controller/debug` (std_msgs/String, JSON) — 매 50Hz. 필드: `profile`(0=CONSTANT,1=CURVE), `phase`(0~3), `t`, `armed`, `active`, `target_I_A`, `measured_v`.
+
+### 백업
+
+- [SimpleMux_backup_20260519.cfg](../stack_master/cfg/SimpleMux_backup_20260519.cfg)
+- [simple_mux_backup_20260519.py](../stack_master/scripts/backup/simple_mux_backup_20260519.py)
+
 ## 11. 참고 파일 / 위치
 
 - 본 인수인계: `HJ_docs/launch_control.md` (이 파일)
