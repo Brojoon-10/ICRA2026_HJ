@@ -72,9 +72,7 @@ def find_matching_pcd(csv_path):
             stripped = stripped[: -len(suf)]
             break
 
-    ### HJ : for_editor.pcd takes precedence — it's the curated subset
-    ### prepared specifically for boundary editing (wall + ground filter).
-    for name in ('for_editor', stem, stripped, 'wall'):
+    for name in (stem, stripped, 'wall'):
         cand = os.path.join(map_dir, name + '.pcd')
         if os.path.exists(cand):
             return cand
@@ -416,9 +414,6 @@ class EditorPlot(pg.PlotWidget):
         elif ev.button() == QtCore.Qt.RightButton:
             scene_pos = self.mapToScene(ev.pos())
             idx = self.hit_test(scene_pos, self.PICK_R_PIX) if self.hit_test else None
-            ### HJ : remember right-click data position so context menu
-            ### actions (e.g. "Insert point here") can read it.
-            self._last_rmb_data = self._scene_to_data(scene_pos)
             self.sigContextMenu.emit(idx, ev.globalPos())
             ev.accept()
             return
@@ -775,16 +770,9 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         self.scatter_preview_pivot = pg.ScatterPlotItem(
             pen=pg.mkPen((200, 30, 200), width=2.0),
             brush=None, size=18, symbol='+')
-        ### HJ : adjacent-rib X-crossings — red X markers at intersections.
-        ### Always visible so the user can see where the boundary is tangled.
-        self.scatter_cross = pg.ScatterPlotItem(
-            pen=pg.mkPen((255, 30, 30), width=2.5),
-            brush=pg.mkBrush(255, 30, 30, 80),
-            size=20, symbol='x', pxMode=True)
         for it in (self.scatter_left, self.scatter_right, self.scatter_center,
                    self.scatter_err_heat, self.scatter_err_top,
-                   self.scatter_sel, self.scatter_preview, self.scatter_preview_pivot,
-                   self.scatter_cross):
+                   self.scatter_sel, self.scatter_preview, self.scatter_preview_pivot):
             self.plot.addItem(it)
 
         # Plot signals
@@ -832,21 +820,16 @@ class BoundaryEditor(QtWidgets.QMainWindow):
     def _detect_closed_loop(self):
         """Return (wrap_enabled, n_effective).
 
-        A CSV is treated as a closed loop when the head and tail are
-        close enough — within `thr_factor × median_segment`. We use a
-        generous threshold (1.5× median segment) so that previous edits
-        which left a small gap don't downgrade the track to open.
-        When closed, n_effective = n - 1 (tail duplicates head; wrap math
-        treats it as a modular ring of n-1 unique points).
+        A CSV is treated as a closed loop when, for every layer, the first and
+        last XY point are within 1/10 of the median segment length. When the
+        last point is essentially a duplicate of the first we drop it from the
+        modular index (n_effective = n - 1) so wrap math doesn't divide by zero.
         """
         n = self.state['n']
         if n < 4:
             return False, n
-        ### HJ : 0.1 was too strict — prior session edits could leave a
-        ### sub-segment gap and the track would silently become open,
-        ### then smooth_track downstream rejects it. 1.5x median is still
-        ### a clear closure cue (tail explicitly returns to head).
-        thr_factor = 1.5
+        thr_factor = 0.1  # gap must be < 10% of median step to count as duplicate
+        n_eff = n
         for layer in ('left', 'right', 'center'):
             P = self.state[layer]
             seg = np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1)
@@ -855,7 +838,9 @@ class BoundaryEditor(QtWidgets.QMainWindow):
                 return False, n
             gap = np.linalg.norm(P[0, :2] - P[-1, :2])
             if gap > thr_factor * med:
+                # Layers disagree on closure → safer not to wrap.
                 return False, n
+        # All layers close — assume last point duplicates the first.
         return True, n - 1
 
     def _wrap_idx(self, i):
@@ -915,10 +900,8 @@ class BoundaryEditor(QtWidgets.QMainWindow):
 
     def _status_text(self):
         s = self.state
-        cx = self._count_rib_crossings()
-        cx_str = f'  cross=0' if cx == 0 else f'  cross={cx} (red X)'
         return (f'{s["fmt"]}  N={s["n"]}  active={self.active}  '
-                f'selected={len(self.selected)}{cx_str}  '
+                f'selected={len(self.selected)}  '
                 f'file={os.path.basename(self.csv_path)}')
 
     def _compute_perp_err_deg(self):
@@ -1015,15 +998,6 @@ class BoundaryEditor(QtWidgets.QMainWindow):
 
         # ⊥err heat overlay + permanent label.
         self._refresh_perp_err_overlay()
-
-        ### HJ : adjacent-rib crossing overlay
-        crosses = self._find_rib_crossings()
-        if crosses:
-            cx_x = [c[2] for c in crosses]
-            cx_y = [c[3] for c in crosses]
-            self.scatter_cross.setData(cx_x, cx_y)
-        else:
-            self.scatter_cross.setData([], [])
 
         self.sel_label.setText(str(len(self.selected)))
         self.statusBar().showMessage(self._status_text())
@@ -1155,18 +1129,6 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         if idx is not None:
             act_del = menu.addAction(f'Delete point {idx}')
             act_del.triggered.connect(lambda _=False, i=idx: self._on_point_right_click(i))
-            menu.addSeparator()
-
-        ### HJ : Insert new point at the right-click position. Always shown
-        ### (whether clicking a point or empty space) — uses the right-click
-        ### data coordinate captured by EditorPlot._last_rmb_data.
-        rmb_pos = getattr(self.plot, '_last_rmb_data', None)
-        if rmb_pos is not None:
-            data_xy = (float(rmb_pos.x()), float(rmb_pos.y()))
-            act_ins = menu.addAction(
-                f'Insert point here  ({data_xy[0]:.2f}, {data_xy[1]:.2f})')
-            act_ins.triggered.connect(
-                lambda _=False, xy=data_xy: self._insert_point_at(xy))
             menu.addSeparator()
 
         # Pivot header
@@ -1891,92 +1853,15 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         else:
             self._n_effective = n_new
 
-    # ---------- Full Realign (v6): cubic spline + ray-cast redistribution ----
-    ### HJ : count adjacent-rib X-crossings (i.e. rib_i ∩ rib_{i+1})
-    def _count_rib_crossings(self):
-        return len(self._find_rib_crossings())
-
-    ### HJ : find adjacent-rib X-crossings. Returns list of (i, j, xy) where
-    ### rib(i) and rib(j=i+1) segments cross at xy. Used by GUI overlay
-    ### and by Newton cross-aware tracking.
-    def _find_rib_crossings(self):
-        L = self.state['left']; R = self.state['right']
-        N = self.state['n']
-        wrap = bool(self.wrap_around)
-        n_eff = self._n_effective if wrap else N
-        out = []
-        for i in range(n_eff if wrap else n_eff - 1):
-            j = (i + 1) % n_eff
-            p1 = L[i, :2]; p2 = R[i, :2]
-            p3 = L[j, :2]; p4 = R[j, :2]
-            d1 = p4 - p3; d2 = p2 - p1
-            denom = d1[0] * d2[1] - d1[1] * d2[0]
-            if abs(denom) < 1e-12:
-                continue
-            r0 = p1 - p3
-            s = (r0[0] * d2[1] - r0[1] * d2[0]) / denom
-            t = (r0[0] * d1[1] - r0[1] * d1[0]) / denom
-            if 1e-6 < s < 1.0 - 1e-6 and 1e-6 < t < 1.0 - 1e-6:
-                xy = p3 + s * d1
-                out.append((int(i), int(j), float(xy[0]), float(xy[1])))
-        return out
-
-    ### HJ : full state snapshot / restore (used by v6 candidate selection)
-    def _snapshot_state(self):
-        return {
-            'left':     self.state['left'].copy(),
-            'right':    self.state['right'].copy(),
-            'center':   self.state['center'].copy(),
-            'raw_data': self.state['raw_data'].copy(),
-            'dirty':    self.state['dirty'].copy(),
-            'n':        self.state['n'],
-            'n_eff':    self._n_effective,
-        }
-
-    def _restore_state(self, snap):
-        self.state['left']     = snap['left'].copy()
-        self.state['right']    = snap['right'].copy()
-        self.state['center']   = snap['center'].copy()
-        self.state['raw_data'] = snap['raw_data'].copy()
-        self.state['dirty']    = snap['dirty'].copy()
-        self.state['n']        = snap['n']
-        self._n_effective      = snap['n_eff']
-
-    ### HJ : enforce closure for closed-loop tracks (head == tail).
-    def _enforce_closure(self):
-        """Force state['left'/'right'/'center'][-1] = [0] exactly, so
-        downstream smooth_track (which checks |head-tail| < 1e-3 strictly)
-        accepts the track. Only applied when wrap_around is True and
-        n_effective < n (tail is a duplicate of head)."""
-        if not self.wrap_around:
-            return
-        n = self.state['n']
-        if n < 2:
-            return
-        if self._n_effective >= n:
-            return
-        self.state['left'][n - 1]   = self.state['left'][0]
-        self.state['right'][n - 1]  = self.state['right'][0]
-        self.state['center'][n - 1] = self.state['center'][0]
-
-    ### HJ : v9 Full Realign — Newton-direct + per-index width shrink
+    # ---------- Full Realign: global rib⊥tangent fixup ----------
     def _full_realign(self):
-        """v9: Newton-direct → width-only shrink to remove cross.
+        """Globally resample one boundary along the other's normals so that
+        rib⊥tangent holds everywhere — not only near the edited region.
 
-        Per user direction: "Newton으로 max를 일단 direct로 줄이고, 그 상태를
-        유지하며 boundary poly만 cross 안생기게 센터까지 거리를 조절".
-
-        Phase 1 — Newton-direct:
-          Rotate each rib about its midpoint so rib ⊥ centerline tangent.
-          Width preserved per index. Iterate to max < 0.01°. Cross may
-          appear in hairpins.
-
-        Phase 2 — width shrink:
-          Keep centerline C and per-index normal (perpendicularity preserved).
-          For each cross pair (i, i+1), multiply both indices' half-widths
-          by shrink_ratio. Repeat until cross = 0.
-          Result: rib ⊥ tangent (max = 0°), boundary curves squeezed inward
-          at cross-causing indices only.
+        Monotone in max(⊥err): tries both source candidates (L→paired and
+        R→paired), keeps the result that reduces max the most, and rejects
+        both if they would increase max (state stays untouched). Repeated
+        clicks therefore never grow max.
         """
         self._push_history()
         err = self._compute_perp_err_deg()
@@ -1985,264 +1870,135 @@ class BoundaryEditor(QtWidgets.QMainWindow):
             return
         before_max = float(err.max())
         before_mean = float(err.mean())
-        before_cross = self._count_rib_crossings()
-        base_snap = self._snapshot_state()
 
-        wrap = bool(self.wrap_around)
-        N = self.state['n']
-        n_eff = self._n_effective if wrap else N
+        # Snapshot once so we can try each candidate from the same starting state.
+        snap = {
+            'left':     self.state['left'].copy(),
+            'right':    self.state['right'].copy(),
+            'center':   self.state['center'].copy(),
+            'raw_data': self.state['raw_data'].copy(),
+            'dirty':    self.state['dirty'].copy(),
+            'n':        self.state['n'],
+            'n_eff':    self._n_effective,
+        }
+        n_base = snap['n']
 
-        # === Phase 1: Newton-direct to perpendicular convergence ===
-        step = 0.5
-        max_iter = 30
-        L = self.state['left'].copy()
-        R = self.state['right'].copy()
-        C = self.state['center'].copy()
-        for _it in range(max_iter):
-            if wrap:
-                base = C[:n_eff, :2]
-                tang = np.roll(base, -1, axis=0) - np.roll(base, 1, axis=0)
-            else:
-                base = C[:, :2]
-                tang = np.empty_like(base)
-                tang[1:-1] = base[2:] - base[:-2]
-                tang[0] = base[1] - base[0]
-                tang[-1] = base[-1] - base[-2]
-            tn = np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
-            tang = tang / tn
-            normal = np.column_stack([-tang[:, 1], tang[:, 0]])
-            rib = R[:n_eff, :2] - L[:n_eff, :2]
-            width = np.linalg.norm(rib, axis=1, keepdims=True) + 1e-9
-            sign = np.sign((rib * normal).sum(axis=1, keepdims=True))
-            sign[sign == 0] = 1.0
-            rib_target = normal * sign * width
-            mid = 0.5 * (L[:n_eff, :2] + R[:n_eff, :2])
-            L_target = mid - 0.5 * rib_target
-            R_target = mid + 0.5 * rib_target
-            L_new = L.copy(); R_new = R.copy(); C_new = C.copy()
-            L_new[:n_eff, :2] = (1 - step) * L[:n_eff, :2] + step * L_target
-            R_new[:n_eff, :2] = (1 - step) * R[:n_eff, :2] + step * R_target
-            C_new[:n_eff, :2] = 0.5 * (L_new[:n_eff, :2] + R_new[:n_eff, :2])
-            if wrap and n_eff < N:
-                L_new[n_eff:] = L_new[0]
-                R_new[n_eff:] = R_new[0]
-                C_new[n_eff:] = C_new[0]
-            L = L_new; R = R_new; C = C_new
-            self.state['left'] = L; self.state['right'] = R; self.state['center'] = C
-            e_check = self._compute_perp_err_deg()
-            if e_check is not None and e_check.max() < 0.001:
-                break
+        def restore_snap():
+            self.state['left']     = snap['left'].copy()
+            self.state['right']    = snap['right'].copy()
+            self.state['center']   = snap['center'].copy()
+            self.state['raw_data'] = snap['raw_data'].copy()
+            self.state['dirty']    = snap['dirty'].copy()
+            self.state['n']        = snap['n']
+            self._n_effective      = snap['n_eff']
 
-        # === Phase 2: Width-only shrink to eliminate cross ===
-        # Decompose L, R into (center, normal, signed half-widths).
-        # Shrinking signed half-widths preserves rib direction → perp stays.
-        if wrap:
-            base = C[:n_eff, :2]
-            tang_p2 = np.roll(base, -1, axis=0) - np.roll(base, 1, axis=0)
-        else:
-            base = C[:, :2]
-            tang_p2 = np.empty_like(base)
-            tang_p2[1:-1] = base[2:] - base[:-2]
-            tang_p2[0] = base[1] - base[0]
-            tang_p2[-1] = base[-1] - base[-2]
-        tn_p2 = np.linalg.norm(tang_p2, axis=1, keepdims=True) + 1e-9
-        tang_p2 = tang_p2 / tn_p2
-        normals_p2 = np.column_stack([-tang_p2[:, 1], tang_p2[:, 0]])  # (n_eff, 2)
-        # signed half-widths along normal
-        hL = ((L[:n_eff, :2] - C[:n_eff, :2]) * normals_p2).sum(axis=1)
-        hR = ((R[:n_eff, :2] - C[:n_eff, :2]) * normals_p2).sum(axis=1)
-        z_C = C[:n_eff, 2].copy()  # preserve z
+        # Staged candidate search. We minimise max(⊥err) but want to keep the
+        # user's boundary shape close to what they laid out, so width changes
+        # are bounded (`width_ratio_limit`) and the local pairing search is
+        # capped (`search_radius`). Stages share state via snapshot rewinds and
+        # accumulate the best candidate so far.
+        #
+        # Density factor (`dens`) lets us resample L/R at a higher point count
+        # before aligning — curves are preserved (linear interpolation between
+        # existing vertices) but the extra resolution often unlocks a lower
+        # max(⊥err). Downstream smooth_track resamples uniformly anyway, so
+        # variable N here is fine.
+        def try_one(source, smooth_r, search_r, width_lim, dens, label):
+            restore_snap()
+            if dens != 1.0:
+                self._densify_all(int(round(n_base * dens)))
+            total_moved = 0
+            prev = None
+            for _ in range(4):
+                m = self._align_paired_to_active(
+                    source_layer=source, smooth_radius=smooth_r,
+                    search_radius=search_r, width_ratio_limit=width_lim)
+                total_moved += m
+                err_now = self._compute_perp_err_deg()
+                if err_now is None:
+                    break
+                sig = (round(float(err_now.mean()), 4),
+                       round(float(err_now.max()), 4))
+                if sig == prev:
+                    break
+                prev = sig
+            err_now = self._compute_perp_err_deg()
+            if err_now is None:
+                return None
+            return (
+                float(err_now.max()), float(err_now.mean()), total_moved, label,
+                {
+                    'left':     self.state['left'].copy(),
+                    'right':    self.state['right'].copy(),
+                    'center':   self.state['center'].copy(),
+                    'raw_data': self.state['raw_data'].copy(),
+                    'dirty':    self.state['dirty'].copy(),
+                    'n':        self.state['n'],
+                    'n_eff':    self._n_effective,
+                },
+            )
 
-        ### HJ : per-index inner/outer detection via curvature direction.
-        ### dt = d(tangent)/ds. dt · normal > 0 means curvature center is
-        ### on +normal side (R side, assuming standard L,R layout).
-        ### Earlier rib_LR formulation gave wrong polarity for this track —
-        ### user reported "이전이 낫다". Reverted to normal-based decision.
-        dt_p2 = np.roll(tang_p2, -1, axis=0) - np.roll(tang_p2, 1, axis=0)
-        inner_is_R = (dt_p2 * normals_p2).sum(axis=1)  # > 0 → R inner
+        candidates = []
+        # Stage 1: (source) × (smoothing radius) at native density.
+        for source in ('left', 'right'):
+            for r in (1, 2, 4, 8, 16):
+                c = try_one(source, r, search_r=20, width_lim=1.3,
+                            dens=1.0, label=f'{source}/r{r}')
+                if c is not None:
+                    candidates.append(c)
 
-        def _rebuild_LR():
-            L_b = self.state['left'].copy(); R_b = self.state['right'].copy()
-            L_b[:n_eff, :2] = C[:n_eff, :2] + hL[:, None] * normals_p2
-            R_b[:n_eff, :2] = C[:n_eff, :2] + hR[:, None] * normals_p2
-            # keep z continuous from centerline
-            L_b[:n_eff, 2] = z_C
-            R_b[:n_eff, 2] = z_C
-            if wrap and n_eff < N:
-                L_b[n_eff:] = L_b[0]; R_b[n_eff:] = R_b[0]
-            return L_b, R_b
+        # Stage 2: refine around the best stage-1 source — tighter / wider
+        # search window and a relaxed width limit.
+        if candidates:
+            best_so_far = min(candidates, key=lambda c: (c[0], c[1]))
+            best_src = best_so_far[3].split('/')[0]
+            best_r = int(best_so_far[3].split('/')[1][1:])
+            for sw in (10, 40):
+                c = try_one(best_src, best_r, search_r=sw, width_lim=1.3,
+                            dens=1.0,
+                            label=f'{best_src}/r{best_r}/sw{sw}')
+                if c is not None:
+                    candidates.append(c)
+            for wl in (1.6, 2.5):
+                c = try_one(best_src, best_r, search_r=20, width_lim=wl,
+                            dens=1.0,
+                            label=f'{best_src}/r{best_r}/w{wl}')
+                if c is not None:
+                    candidates.append(c)
 
-        shrink_ratio_outer = 0.55   # outer side: shrink more
-        shrink_ratio_inner = 0.92   # inner side (high curvature): nearly preserve
-        max_passes = 50
-        # Arc-length based smoothing window (not index-based) — so a hairpin
-        # with densely-spaced points doesn't get the whole cluster shrunk;
-        # only points within `taper_radius_m` of a cross point get affected.
-        # Precompute centerline arc-length and forward distances.
-        c_xy = C[:n_eff, :2]
-        seg_lens_c = np.linalg.norm(
-            np.roll(c_xy, -1, axis=0) - c_xy, axis=1)
-        s_cum_c = np.concatenate([[0.0], np.cumsum(seg_lens_c)])
-        total_arc = float(s_cum_c[-1])
-        # arc position of each index
-        s_idx = s_cum_c[:-1]  # length n_eff
+        # (A density-sweep stage was tried here but per-curve uniform resampling
+        # scrambles rib pairing when L and R have different arc-lengths, so it
+        # consistently regressed max(⊥err). Removed.)
 
-        taper_radius_m = 0.8  # ±0.8m along arc-length around each cross
-
-        def _arc_dist(s1, s2):
-            d = abs(s1 - s2)
-            return min(d, total_arc - d)
-
-        for _pass in range(max_passes):
-            self.state['left'], self.state['right'] = _rebuild_LR()
-            crosses = self._find_rib_crossings()
-            if not crosses:
-                break
-            scale_L = np.ones(n_eff)
-            scale_R = np.ones(n_eff)
-            for c in crosses:
-                for cidx in (c[0], c[1]):
-                    s_center = s_idx[cidx]
-                    for idx in range(n_eff):
-                        d = _arc_dist(s_idx[idx], s_center)
-                        if d > taper_radius_m:
-                            continue
-                        # cosine taper based on arc-length distance
-                        w = 0.5 * (1.0 + np.cos(np.pi * d / taper_radius_m))
-                        if inner_is_R[idx] > 0:
-                            eff_L = 1.0 - w * (1.0 - shrink_ratio_outer)
-                            eff_R = 1.0 - w * (1.0 - shrink_ratio_inner)
-                        else:
-                            eff_L = 1.0 - w * (1.0 - shrink_ratio_inner)
-                            eff_R = 1.0 - w * (1.0 - shrink_ratio_outer)
-                        if eff_L < scale_L[idx]:
-                            scale_L[idx] = eff_L
-                        if eff_R < scale_R[idx]:
-                            scale_R[idx] = eff_R
-            hL *= scale_L
-            hR *= scale_R
-        # Final rebuild
-        self.state['left'], self.state['right'] = _rebuild_LR()
-        self.state['center'] = C
-        self.state['dirty'][:] = True
-
-        e_final = self._compute_perp_err_deg()
-        cx_final = self._count_rib_crossings()
-        if e_final is None:
-            self._restore_state(base_snap)
-            self._refresh()
-            self.statusBar().showMessage('Full Realign: failed.')
-            return
-        bmax = float(e_final.max())
-        bmean = float(e_final.mean())
-
-        # If somehow the result is worse than baseline, restore baseline.
-        if bmax > before_max + 1e-3 or cx_final > before_cross:
-            self._restore_state(base_snap)
+        # Pick the candidate with the smallest max (tiebreak: smaller mean).
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        best = candidates[0] if candidates else None
+        tol = 1e-3  # accept neutral / improving but reject growth
+        if best is None or best[0] > before_max + tol:
+            # No improvement — leave the state as it was.
+            restore_snap()
             self._refresh()
             self.statusBar().showMessage(
-                f'Full Realign: no improvement. '
-                f'⊥err mean={before_mean:.2f}° max={before_max:.2f}° '
-                f'cross={before_cross}.')
+                f'Full Realign: no improvement available. '
+                f'⊥err mean={before_mean:.2f}° max={before_max:.2f}°.')
             return
 
-        ### HJ : enforce exact closure for closed-loop tracks. Downstream
-        ### smooth_track (track3D.py) requires |head - tail| < 1e-3 strictly.
-        ### Floating-point updates during Newton/shrink can leave a tiny
-        ### residual, which the closure check then rejects. Snap tail = head.
-        self._enforce_closure()
-
+        # Apply the winning candidate.
+        max_after, mean_after, total_moved, label, st = best
+        self.state['left']     = st['left']
+        self.state['right']    = st['right']
+        self.state['center']   = st['center']
+        self.state['raw_data'] = st['raw_data']
+        self.state['dirty']    = st['dirty']
+        self.state['n']        = st['n']
+        self._n_effective      = st['n_eff']
+        # drop selection that's now out of range (density may have changed N)
+        self.selected = {i for i in self.selected if 0 <= i < st['n']}
         self._refresh()
         self.statusBar().showMessage(
-            f'Full Realign (Newton+shrink): '
+            f'Full Realign [{label}]: {total_moved} updates.  '
             f'⊥err {before_mean:.2f}°/{before_max:.2f}° → '
-            f'{bmean:.4f}°/{bmax:.4f}° (mean/max), '
-            f'cross {before_cross}→{cx_final}')
-
-    ### HJ : insert a new point at the current mouse cursor (called from
-    ### 'I' key shortcut). Looks up where the mouse currently hovers inside
-    ### the plot and forwards to _insert_point_at.
-    def _insert_at_cursor(self):
-        vb = self.plot.getPlotItem().getViewBox()
-        cursor_scene = self.plot.mapToScene(
-            self.plot.mapFromGlobal(QtGui.QCursor.pos()))
-        data_pt = vb.mapSceneToView(cursor_scene)
-        # Bounds check: ignore if cursor is outside the view area.
-        view_rect = vb.viewRect()
-        if not view_rect.contains(data_pt):
-            self.statusBar().showMessage(
-                'Insert: move the mouse over the track view first.')
-            return
-        self._insert_point_at((float(data_pt.x()), float(data_pt.y())))
-
-    ### HJ : insert a new point at click position (xy is (x, y) in data coords).
-    ### The new point becomes part of the ACTIVE layer at exactly the click
-    ### location. Paired layers are linearly interpolated from neighbors so
-    ### each row remains a 1-to-1 (L, C, R) triple.
-    def _insert_point_at(self, xy):
-        x_click, y_click = xy
-        N = self.state['n']
-        if N < 2:
-            self.statusBar().showMessage('Insert: need at least 2 existing points.')
-            return
-
-        active_arr = self._layer_arr()
-        wrap = bool(self.wrap_around)
-        n_eff = self._n_effective if wrap else N
-
-        # Find closest segment on the active layer.
-        best = (float('inf'), 0, 0.0)  # (dist, seg_i, t01)
-        for i in range(n_eff if wrap else N - 1):
-            j = (i + 1) % n_eff if wrap else i + 1
-            A = active_arr[i, :2]; B = active_arr[j, :2]
-            seg = B - A
-            L2 = float(seg @ seg)
-            if L2 < 1e-12:
-                continue
-            t = float(np.clip(((np.array(xy) - A) @ seg) / L2, 0.0, 1.0))
-            proj = A + t * seg
-            d = float(np.linalg.norm(np.array(xy) - proj))
-            if d < best[0]:
-                best = (d, i, t)
-        _, seg_i, t01 = best
-        ins_idx = seg_i + 1  # insert AFTER seg_i (between seg_i and seg_i+1)
-
-        self._push_history()
-
-        # Build new point for each layer:
-        #   active layer: use the click position (so it lands exactly where user clicked)
-        #   other layers: linear interp between neighbors at the same t01
-        j = (seg_i + 1) % n_eff if wrap else seg_i + 1
-        new_pt = {}
-        for layer in ('left', 'right', 'center'):
-            P = self.state[layer]
-            if layer == self.active:
-                # active: click xy + interpolated z
-                z_new = (1 - t01) * P[seg_i, 2] + t01 * P[j, 2]
-                new_pt[layer] = np.array([x_click, y_click, z_new])
-            else:
-                new_pt[layer] = (1 - t01) * P[seg_i] + t01 * P[j]
-
-        # Insert at ins_idx in all layers + book-keeping arrays.
-        for layer in ('left', 'right', 'center'):
-            self.state[layer] = np.insert(
-                self.state[layer], ins_idx, new_pt[layer], axis=0)
-        raw = self.state['raw_data']
-        new_raw = np.zeros(raw.shape[1]) if raw.ndim == 2 else np.zeros(9)
-        self.state['raw_data'] = np.insert(raw, ins_idx, new_raw, axis=0)
-        self.state['dirty'] = np.insert(self.state['dirty'], ins_idx, True)
-        self.state['n'] = N + 1
-
-        # Re-index selection.
-        self.selected = {(i if i < ins_idx else i + 1) for i in self.selected}
-        self.selected.add(ins_idx)
-
-        # closed-loop state may flip; recompute.
-        self.wrap_around, self._n_effective = self._detect_closed_loop()
-        self._refresh()
-        self.statusBar().showMessage(
-            f'Inserted point at idx {ins_idx} '
-            f'({x_click:.2f}, {y_click:.2f}) on {self.active}. N={self.state["n"]}')
+            f'{mean_after:.2f}°/{max_after:.2f}° (mean/max)')
 
     def _on_drag_end(self):
         # In raw-boundary format, keep center = midpoint after a drag *unless*
@@ -2286,11 +2042,6 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         old_to_new = -np.ones(len(keep), dtype=int)
         old_to_new[keep] = np.arange(self.state['n'])
         self.selected = {int(old_to_new[i]) for i in self.selected if old_to_new[i] >= 0}
-        ### HJ : deletion can change whether the polyline is still closed,
-        ### and n_effective always needs to be refreshed (it was N-1 or N
-        ### depending on whether the tail point duplicates the head).
-        ### Without this refresh, Full Realign reads stale n_effective.
-        self.wrap_around, self._n_effective = self._detect_closed_loop()
         self._refresh()
 
     def _downsample_selection(self):
@@ -2546,9 +2297,6 @@ class BoundaryEditor(QtWidgets.QMainWindow):
             self._undo()
         elif k == QtCore.Qt.Key_D:
             self._downsample_selection()
-        elif k == QtCore.Qt.Key_I:
-            ### HJ : insert point at current mouse position
-            self._insert_at_cursor()
         elif k == QtCore.Qt.Key_Backspace:
             self._delete_selection()
         elif k == QtCore.Qt.Key_Escape:
@@ -2609,39 +2357,23 @@ def _resolve_csv_from_args():
             continue
         leftover.append(tok)
 
-    ### HJ : fallback to argparse for non-ROS CLI usage. Accepts:
-    ###        --map <name>   resolves $(stack_master)/maps/<name>/<name>_bounds_3d.csv
-    ###        -m <name>      same, short form
-    ###        <csv path>     positional, legacy
+    ### HJ : fallback to positional argparse only when neither _csv nor _map
+    ###      is given (preserves the original CLI for legacy non-ROS use).
     if csv_path is None and map_name is None:
         parser = argparse.ArgumentParser(
             description='Multi-select boundary editor (PyQt5 + pyqtgraph).')
-        parser.add_argument('--map', '-m', dest='map_name', default=None,
-                            help='Map name (resolves to <stack_master>/maps/<name>/<name>_bounds_3d.csv)')
-        parser.add_argument('csv', nargs='?', default=None,
-                            help='Track CSV path (alternative to --map).')
+        parser.add_argument(
+            'csv', help='Track CSV (raw boundary or 3D track format).')
         args = parser.parse_args(leftover)
         csv_path = args.csv
-        if args.map_name is not None:
-            map_name = args.map_name
 
     ### HJ : resolve via map name → $(stack_master)/maps/<map>/<map>_bounds_3d.csv
-    ### Try rospack first (ROS-sourced environments). Fall back to the
-    ### script's own location for non-ROS CLI use.
     if csv_path is None and map_name is not None:
-        stack_master_path = None
         try:
             import rospkg
             stack_master_path = rospkg.RosPack().get_path('stack_master')
-        except Exception:
-            # Fallback: this script lives at <stack_master>/scripts/.
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            candidate = os.path.dirname(script_dir)
-            if os.path.isdir(os.path.join(candidate, 'maps')):
-                stack_master_path = candidate
-        if stack_master_path is None:
-            print('Could not resolve stack_master path (no ROS, no fallback).',
-                  file=sys.stderr)
+        except Exception as e:
+            print(f'rospack stack_master lookup failed: {e}', file=sys.stderr)
             sys.exit(1)
         csv_path = os.path.join(
             stack_master_path, 'maps', map_name, f'{map_name}_bounds_3d.csv')

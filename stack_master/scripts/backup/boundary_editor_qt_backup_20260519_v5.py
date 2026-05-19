@@ -72,9 +72,7 @@ def find_matching_pcd(csv_path):
             stripped = stripped[: -len(suf)]
             break
 
-    ### HJ : for_editor.pcd takes precedence — it's the curated subset
-    ### prepared specifically for boundary editing (wall + ground filter).
-    for name in ('for_editor', stem, stripped, 'wall'):
+    for name in (stem, stripped, 'wall'):
         cand = os.path.join(map_dir, name + '.pcd')
         if os.path.exists(cand):
             return cand
@@ -416,9 +414,6 @@ class EditorPlot(pg.PlotWidget):
         elif ev.button() == QtCore.Qt.RightButton:
             scene_pos = self.mapToScene(ev.pos())
             idx = self.hit_test(scene_pos, self.PICK_R_PIX) if self.hit_test else None
-            ### HJ : remember right-click data position so context menu
-            ### actions (e.g. "Insert point here") can read it.
-            self._last_rmb_data = self._scene_to_data(scene_pos)
             self.sigContextMenu.emit(idx, ev.globalPos())
             ev.accept()
             return
@@ -775,16 +770,9 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         self.scatter_preview_pivot = pg.ScatterPlotItem(
             pen=pg.mkPen((200, 30, 200), width=2.0),
             brush=None, size=18, symbol='+')
-        ### HJ : adjacent-rib X-crossings — red X markers at intersections.
-        ### Always visible so the user can see where the boundary is tangled.
-        self.scatter_cross = pg.ScatterPlotItem(
-            pen=pg.mkPen((255, 30, 30), width=2.5),
-            brush=pg.mkBrush(255, 30, 30, 80),
-            size=20, symbol='x', pxMode=True)
         for it in (self.scatter_left, self.scatter_right, self.scatter_center,
                    self.scatter_err_heat, self.scatter_err_top,
-                   self.scatter_sel, self.scatter_preview, self.scatter_preview_pivot,
-                   self.scatter_cross):
+                   self.scatter_sel, self.scatter_preview, self.scatter_preview_pivot):
             self.plot.addItem(it)
 
         # Plot signals
@@ -832,21 +820,16 @@ class BoundaryEditor(QtWidgets.QMainWindow):
     def _detect_closed_loop(self):
         """Return (wrap_enabled, n_effective).
 
-        A CSV is treated as a closed loop when the head and tail are
-        close enough — within `thr_factor × median_segment`. We use a
-        generous threshold (1.5× median segment) so that previous edits
-        which left a small gap don't downgrade the track to open.
-        When closed, n_effective = n - 1 (tail duplicates head; wrap math
-        treats it as a modular ring of n-1 unique points).
+        A CSV is treated as a closed loop when, for every layer, the first and
+        last XY point are within 1/10 of the median segment length. When the
+        last point is essentially a duplicate of the first we drop it from the
+        modular index (n_effective = n - 1) so wrap math doesn't divide by zero.
         """
         n = self.state['n']
         if n < 4:
             return False, n
-        ### HJ : 0.1 was too strict — prior session edits could leave a
-        ### sub-segment gap and the track would silently become open,
-        ### then smooth_track downstream rejects it. 1.5x median is still
-        ### a clear closure cue (tail explicitly returns to head).
-        thr_factor = 1.5
+        thr_factor = 0.1  # gap must be < 10% of median step to count as duplicate
+        n_eff = n
         for layer in ('left', 'right', 'center'):
             P = self.state[layer]
             seg = np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1)
@@ -855,7 +838,9 @@ class BoundaryEditor(QtWidgets.QMainWindow):
                 return False, n
             gap = np.linalg.norm(P[0, :2] - P[-1, :2])
             if gap > thr_factor * med:
+                # Layers disagree on closure → safer not to wrap.
                 return False, n
+        # All layers close — assume last point duplicates the first.
         return True, n - 1
 
     def _wrap_idx(self, i):
@@ -915,10 +900,8 @@ class BoundaryEditor(QtWidgets.QMainWindow):
 
     def _status_text(self):
         s = self.state
-        cx = self._count_rib_crossings()
-        cx_str = f'  cross=0' if cx == 0 else f'  cross={cx} (red X)'
         return (f'{s["fmt"]}  N={s["n"]}  active={self.active}  '
-                f'selected={len(self.selected)}{cx_str}  '
+                f'selected={len(self.selected)}  '
                 f'file={os.path.basename(self.csv_path)}')
 
     def _compute_perp_err_deg(self):
@@ -1015,15 +998,6 @@ class BoundaryEditor(QtWidgets.QMainWindow):
 
         # ⊥err heat overlay + permanent label.
         self._refresh_perp_err_overlay()
-
-        ### HJ : adjacent-rib crossing overlay
-        crosses = self._find_rib_crossings()
-        if crosses:
-            cx_x = [c[2] for c in crosses]
-            cx_y = [c[3] for c in crosses]
-            self.scatter_cross.setData(cx_x, cx_y)
-        else:
-            self.scatter_cross.setData([], [])
 
         self.sel_label.setText(str(len(self.selected)))
         self.statusBar().showMessage(self._status_text())
@@ -1155,18 +1129,6 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         if idx is not None:
             act_del = menu.addAction(f'Delete point {idx}')
             act_del.triggered.connect(lambda _=False, i=idx: self._on_point_right_click(i))
-            menu.addSeparator()
-
-        ### HJ : Insert new point at the right-click position. Always shown
-        ### (whether clicking a point or empty space) — uses the right-click
-        ### data coordinate captured by EditorPlot._last_rmb_data.
-        rmb_pos = getattr(self.plot, '_last_rmb_data', None)
-        if rmb_pos is not None:
-            data_xy = (float(rmb_pos.x()), float(rmb_pos.y()))
-            act_ins = menu.addAction(
-                f'Insert point here  ({data_xy[0]:.2f}, {data_xy[1]:.2f})')
-            act_ins.triggered.connect(
-                lambda _=False, xy=data_xy: self._insert_point_at(xy))
             menu.addSeparator()
 
         # Pivot header
@@ -1891,14 +1853,351 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         else:
             self._n_effective = n_new
 
-    # ---------- Full Realign (v6): cubic spline + ray-cast redistribution ----
-    ### HJ : count adjacent-rib X-crossings (i.e. rib_i ∩ rib_{i+1})
-    def _count_rib_crossings(self):
-        return len(self._find_rib_crossings())
+    # ---------- helpers: damping + Newton + polyline snap ----------
+    ### HJ : added for v5 Full Realign (center source + Newton + snap)
+    def _align_polyline_damped(self, src, dst, smooth_radius=2,
+                               search_radius=20, width_ratio_limit=2.0,
+                               damp=1.0):
+        """Like _align_polyline_along_normals but with linear damping toward
+        the ray-polyline intersection. Returns moved count.
 
-    ### HJ : find adjacent-rib X-crossings. Returns list of (i, j, xy) where
-    ### rib(i) and rib(j=i+1) segments cross at xy. Used by GUI overlay
-    ### and by Newton cross-aware tracking.
+        damp=1.0 → identical to base behaviour. damp<1.0 blends old/new and
+        re-projects onto the same polyline segment so the result stays on the
+        polyline. Used to suppress oscillation in tight curves.
+        """
+        if damp >= 1.0:
+            return self._align_polyline_along_normals(
+                src, dst, smooth_radius=smooth_radius,
+                search_radius=search_radius,
+                width_ratio_limit=width_ratio_limit)
+        S = self.state[src]
+        D_old = self.state[dst].copy()
+        N = len(S)
+        if N < 2 or len(D_old) < 2:
+            return 0
+        wrap = bool(self.wrap_around)
+        n_eff = self._n_effective if wrap else N
+        n_src = self._unit_normals_of(S, smooth_radius=smooth_radius,
+                                      wrap=wrap, n_eff=n_eff)
+        if wrap and n_eff < N:
+            pts = D_old[:n_eff + 1, :2]
+        elif wrap:
+            pts = np.vstack([D_old[:, :2], D_old[0:1, :2]])
+        else:
+            pts = D_old[:, :2]
+        seg_vecs = np.diff(pts, axis=0)
+        seg_lens = np.linalg.norm(seg_vecs, axis=1)
+        s_cum = np.concatenate([[0.0], np.cumsum(seg_lens)])
+        new_dst = D_old.copy()
+        moved = 0
+        prev_seg = 0
+        N_iter = n_eff if wrap else N
+        for i in range(N_iter):
+            origin = S[i, :2]
+            direction = n_src[i]
+            hit = self._intersect_ray_polyline(
+                origin, direction, pts, s_cum, seg_lens,
+                hint_seg=prev_seg, max_search=2 * search_radius + 1,
+                window_only=True, wrap=wrap)
+            if hit is None:
+                continue
+            pt_xy, seg_idx = hit
+            old_width = np.linalg.norm(D_old[i, :2] - S[i, :2])
+            new_width = np.linalg.norm(pt_xy - origin)
+            if old_width > 1e-6 and (
+                    new_width > old_width * width_ratio_limit
+                    or new_width < old_width / width_ratio_limit):
+                continue
+            target_xy = (1 - damp) * D_old[i, :2] + damp * pt_xy
+            A = pts[seg_idx]; B = pts[seg_idx + 1]
+            seg = B - A
+            t = float(np.clip(((target_xy - A) @ seg)
+                              / max((seg @ seg), 1e-12), 0.0, 1.0))
+            pt_xy = A + t * seg
+            j0 = seg_idx
+            j1 = (seg_idx + 1)
+            if wrap and j1 >= n_eff:
+                j1 = 0
+            t01 = (np.linalg.norm(pt_xy - D_old[j0, :2])
+                   / max(seg_lens[seg_idx], 1e-9))
+            z_new = D_old[j0, 2] + t01 * (D_old[j1, 2] - D_old[j0, 2])
+            if np.linalg.norm(pt_xy - new_dst[i, :2]) > 1e-9:
+                moved += 1
+            new_dst[i, 0] = pt_xy[0]
+            new_dst[i, 1] = pt_xy[1]
+            new_dst[i, 2] = z_new
+            prev_seg = seg_idx
+        if wrap and n_eff < N:
+            new_dst[n_eff:] = new_dst[0]
+        self.state[dst] = new_dst
+        if moved:
+            self.state['dirty'][:] = True
+        return moved
+
+    ### HJ : Newton perpendicularize step (preserves width, rotates rib)
+    def _newton_perp_step(self, step=0.5):
+        """Rotate ribs about midpoint to be perpendicular to centerline tangent.
+        Width per index is preserved. L/R may leave the original polyline —
+        callers must snap them back.
+        """
+        L = self.state['left']
+        R = self.state['right']
+        C = self.state['center']
+        N = self.state['n']
+        wrap = bool(self.wrap_around)
+        if wrap:
+            n_eff = max(2, min(self._n_effective, N))
+            base = C[:n_eff, :2]
+            tang = np.roll(base, -1, axis=0) - np.roll(base, 1, axis=0)
+        else:
+            base = C[:, :2]
+            tang = np.empty_like(base)
+            tang[1:-1] = base[2:] - base[:-2]
+            tang[0] = base[1] - base[0]
+            tang[-1] = base[-1] - base[-2]
+            n_eff = N
+        tn = np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
+        tang = tang / tn
+        normal = np.column_stack([-tang[:, 1], tang[:, 0]])
+        rib = R[:n_eff, :2] - L[:n_eff, :2]
+        width = np.linalg.norm(rib, axis=1, keepdims=True) + 1e-9
+        sign = np.sign((rib * normal).sum(axis=1, keepdims=True))
+        sign[sign == 0] = 1.0
+        rib_target = normal * sign * width
+        mid = 0.5 * (L[:n_eff, :2] + R[:n_eff, :2])
+        L_target = mid - 0.5 * rib_target
+        R_target = mid + 0.5 * rib_target
+        L_new = L.copy(); R_new = R.copy(); C_new = C.copy()
+        L_new[:n_eff, :2] = (1 - step) * L[:n_eff, :2] + step * L_target
+        R_new[:n_eff, :2] = (1 - step) * R[:n_eff, :2] + step * R_target
+        C_new[:n_eff, :2] = 0.5 * (L_new[:n_eff, :2] + R_new[:n_eff, :2])
+        if wrap and n_eff < N:
+            L_new[n_eff:] = L_new[0]; R_new[n_eff:] = R_new[0]
+            C_new[n_eff:] = C_new[0]
+        self.state['left'] = L_new
+        self.state['right'] = R_new
+        self.state['center'] = C_new
+
+    ### HJ : snap each index to nearest point on the saved original polyline
+    @staticmethod
+    def _snap_to_polyline(target_xy, polyline_xyz, hint, max_window=10, wrap=True):
+        """Return (xy, z, seg_idx) — nearest point on polyline within ±window
+        segments around `hint`.
+        """
+        N = len(polyline_xyz)
+        best = (np.inf, target_xy, 0.0, int(hint))
+        if wrap:
+            offsets = range(-max_window, max_window + 1)
+        else:
+            offsets = range(-min(max_window, int(hint)),
+                            min(max_window, N - 1 - int(hint)) + 1)
+        for off in offsets:
+            j = (int(hint) + off) % N if wrap else int(hint) + off
+            if not wrap and (j < 0 or j >= N - 1):
+                continue
+            j1 = (j + 1) % N
+            A = polyline_xyz[j, :2]
+            B = polyline_xyz[j1, :2]
+            seg = B - A
+            L2 = float(seg @ seg)
+            if L2 < 1e-12:
+                continue
+            t = float(np.clip(((target_xy - A) @ seg) / L2, 0.0, 1.0))
+            p = A + t * seg
+            d = float(np.linalg.norm(p - target_xy))
+            if d < best[0]:
+                z = (1 - t) * polyline_xyz[j, 2] + t * polyline_xyz[j1, 2]
+                best = (d, p, z, j)
+        return best[1], best[2], best[3]
+
+    ### HJ : per-index snap pass with cross-aware revert
+    def _snap_pass(self, L_orig, R_orig, hints_L, hints_R, max_crossings=None):
+        """In-place snap state['left'/'right'] back to L_orig / R_orig
+        polylines, applied per-index. If snapping index i increases the
+        adjacent-rib cross count beyond max_crossings, that index's snap is
+        reverted (kept at the Newton-step position).
+        """
+        N = self.state['n']
+        wrap = bool(self.wrap_around)
+        n_eff = self._n_effective if wrap else N
+        # work directly on self.state so cross check uses the latest state
+        L = self.state['left']
+        R = self.state['right']
+        C = self.state['center']
+        new_hL = hints_L.copy(); new_hR = hints_R.copy()
+        for i in range(n_eff):
+            pt_l, z_l, seg_l = self._snap_to_polyline(
+                L[i, :2], L_orig, hints_L[i], max_window=10, wrap=wrap)
+            pt_r, z_r, seg_r = self._snap_to_polyline(
+                R[i, :2], R_orig, hints_R[i], max_window=10, wrap=wrap)
+            if max_crossings is None:
+                L[i, :2] = pt_l; L[i, 2] = z_l
+                R[i, :2] = pt_r; R[i, 2] = z_r
+                C[i, :2] = 0.5 * (L[i, :2] + R[i, :2])
+                C[i, 2]  = 0.5 * (L[i, 2]  + R[i, 2])
+                new_hL[i] = seg_l; new_hR[i] = seg_r
+            else:
+                # tentative apply, check cross only on (i-1, i) and (i, i+1)
+                Ls = L[i].copy(); Rs = R[i].copy(); Cs = C[i].copy()
+                L[i, :2] = pt_l; L[i, 2] = z_l
+                R[i, :2] = pt_r; R[i, 2] = z_r
+                C[i, :2] = 0.5 * (L[i, :2] + R[i, :2])
+                C[i, 2]  = 0.5 * (L[i, 2]  + R[i, 2])
+                # local cross count
+                local_cx = 0
+                for k in (-1, 0):
+                    a = (i + k) % n_eff
+                    b = (a + 1) % n_eff
+                    p1 = L[a, :2]; p2 = R[a, :2]
+                    p3 = L[b, :2]; p4 = R[b, :2]
+                    d1 = p4 - p3; d2 = p2 - p1
+                    denom = d1[0] * d2[1] - d1[1] * d2[0]
+                    if abs(denom) < 1e-12:
+                        continue
+                    r0 = p1 - p3
+                    s = (r0[0] * d2[1] - r0[1] * d2[0]) / denom
+                    t = (r0[0] * d1[1] - r0[1] * d1[0]) / denom
+                    if 1e-6 < s < 1.0 - 1e-6 and 1e-6 < t < 1.0 - 1e-6:
+                        local_cx += 1
+                # If local cross > 0 globally was 0 → cross grew; revert.
+                # Use total cross as the test only if budget allows local.
+                if local_cx > 0 and max_crossings <= 0:
+                    L[i] = Ls; R[i] = Rs; C[i] = Cs
+                else:
+                    new_hL[i] = seg_l; new_hR[i] = seg_r
+        if wrap and n_eff < N:
+            L[n_eff:] = L[0]; R[n_eff:] = R[0]; C[n_eff:] = C[0]
+        return new_hL, new_hR
+
+    ### HJ : Gauss-Seidel local polish on bad indices (cross-aware)
+    def _local_polish_gs(self, max_iter=30, err_threshold=1.0,
+                         search_radius=30, width_ratio_limit=3.0,
+                         max_crossings=None):
+        """For each index with err > threshold (worst-first), shoot the
+        centerline normal into the L and R polylines. Apply the move if it
+        reduces the local 3-point window error. Updates apply in place so
+        each subsequent index sees the new state (Gauss-Seidel).
+        """
+        wrap = bool(self.wrap_around)
+        for _sweep in range(max_iter):
+            e = self._compute_perp_err_deg()
+            if e is None:
+                return
+            N = self.state['n']
+            n_eff = self._n_effective if wrap else N
+            order = [int(i) for i in np.argsort(e[:n_eff])[::-1]
+                     if e[i] > err_threshold]
+            if not order:
+                break
+            L = self.state['left']; R = self.state['right']; C = self.state['center']
+            # Build polyline arrays (closed-loop)
+            if wrap:
+                Lpts = np.vstack([L[:n_eff, :2], L[0:1, :2]])
+                Rpts = np.vstack([R[:n_eff, :2], R[0:1, :2]])
+            else:
+                Lpts = L[:, :2]; Rpts = R[:, :2]
+            Lseg = np.diff(Lpts, axis=0); Lseg_lens = np.linalg.norm(Lseg, axis=1)
+            Rseg = np.diff(Rpts, axis=0); Rseg_lens = np.linalg.norm(Rseg, axis=1)
+            Ls_cum = np.concatenate([[0.0], np.cumsum(Lseg_lens)])
+            Rs_cum = np.concatenate([[0.0], np.cumsum(Rseg_lens)])
+            any_moved = False
+            for i in order:
+                cp = C[(i + 1) % n_eff, :2]
+                cm = C[(i - 1) % n_eff, :2]
+                tang = cp - cm
+                tn = np.linalg.norm(tang) + 1e-9
+                tang = tang / tn
+                normal = np.array([-tang[1], tang[0]])
+                origin = C[i, :2]
+                hitL = self._intersect_ray_polyline(
+                    origin, normal, Lpts, Ls_cum, Lseg_lens,
+                    hint_seg=(i - 1) % n_eff,
+                    max_search=2 * search_radius + 1,
+                    window_only=True, wrap=wrap)
+                hitR = self._intersect_ray_polyline(
+                    origin, normal, Rpts, Rs_cum, Rseg_lens,
+                    hint_seg=(i - 1) % n_eff,
+                    max_search=2 * search_radius + 1,
+                    window_only=True, wrap=wrap)
+                if hitL is None or hitR is None:
+                    continue
+                ptL, segL = hitL; ptR, segR = hitR
+                old_w = np.linalg.norm(R[i, :2] - L[i, :2])
+                new_w = np.linalg.norm(ptR - ptL)
+                if old_w > 1e-6 and (new_w > old_w * width_ratio_limit
+                                      or new_w < old_w / width_ratio_limit):
+                    continue
+                # z interp
+                def _z(P, segs, seg_lens, j0, pt):
+                    j1 = (j0 + 1) % n_eff
+                    t01 = np.linalg.norm(pt - P[j0, :2]) / max(seg_lens[j0], 1e-9)
+                    return P[j0, 2] + t01 * (P[j1, 2] - P[j0, 2])
+                # tentative move: capture pre-move local err FIRST (with
+                # latest state — previous iterations in this sweep may have
+                # already moved neighboring indices)
+                e_pre = self._compute_perp_err_deg()
+                e_old_local = max(e_pre[(i + k) % n_eff] for k in (-1, 0, 1))
+                L_save = L[i].copy(); R_save = R[i].copy(); C_save = C[i].copy()
+                L[i, :2] = ptL; L[i, 2] = _z(L, Lseg, Lseg_lens, segL, ptL)
+                R[i, :2] = ptR; R[i, 2] = _z(R, Rseg, Rseg_lens, segR, ptR)
+                C[i, :2] = 0.5 * (L[i, :2] + R[i, :2])
+                C[i, 2]  = 0.5 * (L[i, 2]  + R[i, 2])
+                e_now = self._compute_perp_err_deg()
+                e_new_local = max(e_now[(i + k) % n_eff] for k in (-1, 0, 1))
+                # cross check on the affected 3-rib window
+                if max_crossings is not None:
+                    cx_now = self._count_rib_crossings()
+                    if cx_now > max_crossings:
+                        L[i] = L_save; R[i] = R_save; C[i] = C_save
+                        continue
+                if e_new_local >= e_old_local - 1e-3:
+                    # revert
+                    L[i] = L_save; R[i] = R_save; C[i] = C_save
+                    continue
+                any_moved = True
+                # refresh polyline arrays for moved index
+                Lpts[i, :] = L[i, :2]
+                Rpts[i, :] = R[i, :2]
+                if wrap and i == 0:
+                    Lpts[-1, :] = L[0, :2]
+                    Rpts[-1, :] = R[0, :2]
+            if not any_moved:
+                break
+        # ensure wrap tail mirror
+        if wrap and n_eff < self.state['n']:
+            self.state['left'][n_eff:]   = self.state['left'][0]
+            self.state['right'][n_eff:]  = self.state['right'][0]
+            self.state['center'][n_eff:] = self.state['center'][0]
+
+    ### HJ : Newton+snap loop with best-by-(crossings, max) tracking
+    def _newton_snap_loop(self, L_orig, R_orig, n_outer=30,
+                         newton_iters=8, step=0.5, baseline_crossings=0):
+        """Returns (best_score, best_state_dict) where score is
+        (crossings, max, mean). Each outer iteration: newton_iters Newton
+        steps → one snap pass. Tracks the best-by-score intermediate state.
+        Crossings above baseline are forbidden — those iters are skipped.
+        """
+        N = self.state['n']
+        hints_L = np.arange(N); hints_R = np.arange(N)
+        best = None
+        for _ in range(n_outer):
+            for _ in range(newton_iters):
+                self._newton_perp_step(step=step)
+            hints_L, hints_R = self._snap_pass(
+                L_orig, R_orig, hints_L, hints_R,
+                max_crossings=baseline_crossings)
+            err = self._compute_perp_err_deg()
+            if err is None:
+                break
+            cx = self._count_rib_crossings()
+            if cx > baseline_crossings:
+                continue  # this iter introduced crossings, skip it
+            score = (cx, float(err.max()), float(err.mean()))
+            if best is None or score < best[0]:
+                best = (score, self._snapshot_state())
+        return best
+
+    ### HJ : find indices i where rib(i) and rib(i+1) cross. Returns list of i.
     def _find_rib_crossings(self):
         L = self.state['left']; R = self.state['right']
         N = self.state['n']
@@ -1917,11 +2216,331 @@ class BoundaryEditor(QtWidgets.QMainWindow):
             s = (r0[0] * d2[1] - r0[1] * d2[0]) / denom
             t = (r0[0] * d1[1] - r0[1] * d1[0]) / denom
             if 1e-6 < s < 1.0 - 1e-6 and 1e-6 < t < 1.0 - 1e-6:
-                xy = p3 + s * d1
-                out.append((int(i), int(j), float(xy[0]), float(xy[1])))
+                out.append(i)
         return out
 
-    ### HJ : full state snapshot / restore (used by v6 candidate selection)
+    ### HJ : cubic-spline based resample — preserves curve shape, freely
+    ### redistributes N (or 1.5N) points on the spline-interpolated curve.
+    ### Per user: "boundary 선 내에서는 움직여도 돼. 형상만 유지되면."
+    def _spline_resample(self, n_out=None, dense_count=4000, n_iter=12,
+                         smooth_radius=2):
+        """Replace state['left'/'right'/'center'] with a spline-resample
+        of the current curves. The L and R curves are fit by closed-periodic
+        cubic splines through their current vertices (shape preserved), then
+        dense-sampled. New L[i], R[i] are picked on the dense curves by
+        ray-casting the centerline normal. Best-by-(cross, max, mean) state
+        seen across iters is returned.
+        """
+        try:
+            from scipy.interpolate import CubicSpline
+        except ImportError:
+            return None
+        if n_out is None:
+            n_out = self.state['n']
+        L_v = self.state['left']; R_v = self.state['right']
+
+        def _dense(P):
+            # dedupe consecutive
+            keep = [0]
+            for i in range(1, len(P)):
+                if np.linalg.norm(P[i, :2] - P[keep[-1], :2]) > 1e-6:
+                    keep.append(i)
+            P = P[keep]
+            P_closed = np.vstack([P, P[0:1]])
+            d = np.linalg.norm(np.diff(P_closed, axis=0), axis=1)
+            d = np.where(d < 1e-9, 1e-9, d)
+            t = np.concatenate([[0.0], np.cumsum(d)])
+            cx = CubicSpline(t, P_closed[:, 0], bc_type='periodic')
+            cy = CubicSpline(t, P_closed[:, 1], bc_type='periodic')
+            cz = CubicSpline(t, P_closed[:, 2], bc_type='periodic')
+            ts = np.linspace(0, t[-1], dense_count, endpoint=False)
+            return np.column_stack([cx(ts), cy(ts), cz(ts)])
+
+        Ld = _dense(L_v); Rd = _dense(R_v)
+        # initial centerline: arc-length-uniform midpoint
+        Cd = 0.5 * (Ld[:, :2] + Rd[:, :2])
+        # arc-length resample helper
+        def _arc_resample(P_xy, n):
+            pts = np.vstack([P_xy, P_xy[0:1]])
+            seg = np.diff(pts, axis=0)
+            sl = np.linalg.norm(seg, axis=1)
+            sc = np.concatenate([[0.0], np.cumsum(sl)])
+            total = sc[-1]
+            ts = np.linspace(0, total, n, endpoint=False)
+            out = np.empty((n, 2))
+            j = 0
+            for k, s in enumerate(ts):
+                while j + 1 < len(sc) and sc[j+1] < s:
+                    j += 1
+                if j + 1 >= len(sc):
+                    out[k] = pts[-1]; continue
+                tt = (s - sc[j]) / max(sl[j], 1e-12)
+                out[k] = pts[j] + tt * seg[j]
+            return out
+
+        C_xy = _arc_resample(Cd, n_out)
+        L_new = np.empty((n_out, 3)); R_new = np.empty((n_out, 3))
+
+        # ray-cast helper using existing intersector
+        def _shoot(P_xy, origin, normal, hint, ms):
+            pts_c = np.vstack([P_xy, P_xy[0:1]])
+            sl = np.linalg.norm(np.diff(pts_c, axis=0), axis=1)
+            sc = np.concatenate([[0.0], np.cumsum(sl)])
+            return self._intersect_ray_polyline(
+                origin, normal, pts_c, sc, sl, hint_seg=hint,
+                max_search=ms, window_only=True, wrap=True)
+
+        def _zlerp(D, j0, pt):
+            j1 = (j0 + 1) % len(D)
+            d = np.linalg.norm(D[j1, :2] - D[j0, :2])
+            t = np.linalg.norm(pt - D[j0, :2]) / max(d, 1e-9)
+            return D[j0, 2] + t * (D[j1, 2] - D[j0, 2])
+
+        best = None
+        ms = 2 * 10 * (dense_count // n_out) + 1
+        for it in range(n_iter):
+            normals = self._unit_normals_of(C_xy, smooth_radius=smooth_radius,
+                                             wrap=True, n_eff=len(C_xy))
+            hL = 0; hR = 0
+            for i in range(n_out):
+                hitL = _shoot(Ld[:, :2], C_xy[i], normals[i], hL, ms)
+                hitR = _shoot(Rd[:, :2], C_xy[i], normals[i], hR, ms)
+                if hitL is None or hitR is None:
+                    if it == 0:
+                        L_new[i, :2] = Ld[hL, :2]; L_new[i, 2] = Ld[hL, 2]
+                        R_new[i, :2] = Rd[hR, :2]; R_new[i, 2] = Rd[hR, 2]
+                    continue
+                ptL, sL_idx = hitL; ptR, sR_idx = hitR
+                L_new[i, :2] = ptL; L_new[i, 2] = _zlerp(Ld, sL_idx, ptL)
+                R_new[i, :2] = ptR; R_new[i, 2] = _zlerp(Rd, sR_idx, ptR)
+                hL = sL_idx; hR = sR_idx
+            C_new = 0.5 * (L_new + R_new)
+            # apply to state temporarily so the editor's metric/cross funcs work
+            # (we may need to resize state for n_out != original)
+            n_orig = self.state['n']
+            self.state['left'] = L_new.copy()
+            self.state['right'] = R_new.copy()
+            self.state['center'] = C_new.copy()
+            self.state['n'] = n_out
+            self._n_effective = n_out
+            self.state['dirty'] = np.ones(n_out, dtype=bool)
+            self.state['raw_data'] = np.zeros((n_out,
+                                                self.state['raw_data'].shape[1]
+                                                if self.state['raw_data'].ndim == 2
+                                                else 9))
+            e = self._compute_perp_err_deg()
+            cx = self._count_rib_crossings()
+            if e is not None:
+                score = (cx, float(e.max()), float(e.mean()))
+                if best is None or score < best[0]:
+                    best = (score, self._snapshot_state(), it + 1)
+            # next iter: re-arc-resample centerline for tangent stability
+            C_xy = _arc_resample(C_new[:, :2], n_out)
+        return best
+    ### manual dragging: takes a bad L[i] / R[i] and snaps it to the line
+    ### between L[i-1] and L[i+1] — same logical move a user makes when
+    ### they see a kinked rib in the GUI).
+    def _relocate_bad_points(self, max_iter=10, err_threshold=4.0,
+                              max_crossings=0, blend_steps=(0.5, 1.0),
+                              allowed_indices=None):
+        """Worst-first sweep. For each bad index, try linear interp from
+        neighbors at a few blend ratios. Apply the move if it reduces local
+        max err and doesn't add crossings.
+
+        If allowed_indices is given, only those indices may be relocated.
+        Used to restrict boundary modification to specific regions
+        (e.g. neighborhoods around baseline crossings).
+
+        Side effect: boundary points may move (this is exactly what a user
+        does manually when they see a kink — and is the only way to fix
+        polyline self-intersections in hairpins).
+        """
+        wrap = bool(self.wrap_around)
+        N = self.state['n']
+        n_eff = self._n_effective if wrap else N
+        for _sweep in range(max_iter):
+            e = self._compute_perp_err_deg()
+            if e is None:
+                return
+            bad = [int(i) for i in np.argsort(e[:n_eff])[::-1]
+                   if e[i] > err_threshold]
+            if allowed_indices is not None:
+                bad = [i for i in bad if i in allowed_indices]
+            if not bad:
+                break
+            any_moved = False
+            L = self.state['left']; R = self.state['right']; C = self.state['center']
+            for i in bad:
+                im = (i - 1) % n_eff
+                ip = (i + 1) % n_eff
+                # current local window err (i-1, i, i+1)
+                e_pre = self._compute_perp_err_deg()
+                e_old = max(e_pre[(i + k) % n_eff] for k in (-1, 0, 1))
+                cx_pre = self._count_rib_crossings()
+                # try each blend; pick best by local max err
+                # blend = how far to drag L[i] toward the (im, ip) chord
+                # midpoint. We blend L[i] (not im/ip) so small steps stay
+                # near the user's original boundary.
+                best_try = None
+                target_L = 0.5 * (L[im, :2] + L[ip, :2])
+                target_L_z = 0.5 * (L[im, 2] + L[ip, 2])
+                target_R = 0.5 * (R[im, :2] + R[ip, :2])
+                target_R_z = 0.5 * (R[im, 2] + R[ip, 2])
+                orig_L = L[i, :2].copy(); orig_R = R[i, :2].copy()
+                for alpha in blend_steps:
+                    Lt = (1 - alpha) * orig_L + alpha * target_L
+                    Lt_z = (1 - alpha) * L[i, 2] + alpha * target_L_z
+                    Rt = (1 - alpha) * orig_R + alpha * target_R
+                    Rt_z = (1 - alpha) * R[i, 2] + alpha * target_R_z
+                    # save
+                    Ls, Rs, Cs = L[i].copy(), R[i].copy(), C[i].copy()
+                    L[i, :2] = Lt; L[i, 2] = Lt_z
+                    R[i, :2] = Rt; R[i, 2] = Rt_z
+                    C[i, :2] = 0.5 * (L[i, :2] + R[i, :2])
+                    C[i, 2]  = 0.5 * (L[i, 2]  + R[i, 2])
+                    e_now = self._compute_perp_err_deg()
+                    e_new = max(e_now[(i + k) % n_eff] for k in (-1, 0, 1))
+                    cx_now = self._count_rib_crossings()
+                    ok = (e_new < e_old - 1e-3) and (cx_now <= max_crossings)
+                    if ok and (best_try is None or e_new < best_try[0]):
+                        best_try = (e_new, Lt.copy(), Lt_z, Rt.copy(), Rt_z)
+                    # revert for next try
+                    L[i] = Ls; R[i] = Rs; C[i] = Cs
+                if best_try is not None:
+                    _, Lt, Lt_z, Rt, Rt_z = best_try
+                    L[i, :2] = Lt; L[i, 2] = Lt_z
+                    R[i, :2] = Rt; R[i, 2] = Rt_z
+                    C[i, :2] = 0.5 * (L[i, :2] + R[i, :2])
+                    C[i, 2]  = 0.5 * (L[i, 2]  + R[i, 2])
+                    any_moved = True
+            if not any_moved:
+                break
+        if wrap and n_eff < N:
+            self.state['left'][n_eff:]   = self.state['left'][0]
+            self.state['right'][n_eff:]  = self.state['right'][0]
+            self.state['center'][n_eff:] = self.state['center'][0]
+
+    ### HJ : smooth a small index range by linear interp from outside neighbors
+    def _flatten_range(self, i_lo, i_hi):
+        """Replace state['left'/'right'/'center'] in [i_lo..i_hi] with a
+        linear interpolation from i_lo-1 to i_hi+1 (wrap-aware). Used after
+        a swap to remove the kink the swap leaves behind.
+        """
+        L = self.state['left']; R = self.state['right']; C = self.state['center']
+        N = self.state['n']
+        wrap = bool(self.wrap_around)
+        n_eff = self._n_effective if wrap else N
+        i0 = (i_lo - 1) % n_eff
+        i1 = (i_hi + 1) % n_eff
+        # Build linear interp indices i_lo..i_hi
+        if wrap:
+            count = (i_hi - i_lo) % n_eff + 1
+            if count + 2 >= n_eff:
+                return  # range too large, refuse
+        else:
+            count = i_hi - i_lo + 1
+        for k in range(count):
+            t = (k + 1) / (count + 1)
+            idx = (i_lo + k) % n_eff
+            L[idx, :2] = (1 - t) * L[i0, :2] + t * L[i1, :2]
+            R[idx, :2] = (1 - t) * R[i0, :2] + t * R[i1, :2]
+            L[idx, 2]  = (1 - t) * L[i0, 2]  + t * L[i1, 2]
+            R[idx, 2]  = (1 - t) * R[i0, 2]  + t * R[i1, 2]
+        C[:n_eff] = 0.5 * (L[:n_eff] + R[:n_eff])
+        if wrap and n_eff < N:
+            L[n_eff:] = L[0]; R[n_eff:] = R[0]; C[n_eff:] = C[0]
+
+    ### HJ : resolve adjacent-rib crossings by swapping L or R between (i, i+1)
+    def _resolve_crossings(self, max_passes=5):
+        """For each crossing pair (i, i+1), try swapping L[i]<->L[i+1] or
+        R[i]<->R[i+1] (or both). Pick the swap that reduces total crossings.
+        Repeat until no crossings or no progress.
+
+        After swap, the two indices are usually in awkward positions — we
+        flatten that ±1-index range with linear interp from neighbors so
+        the alignment stages have a clean starting point.
+
+        Returns number of crossings remaining.
+        """
+        for _pass in range(max_passes):
+            cx0 = self._count_rib_crossings()
+            if cx0 == 0:
+                return 0
+            crosses = self._find_rib_crossings()
+            if not crosses:
+                return 0
+            any_fix = False
+            n_eff = self._n_effective if self.wrap_around else self.state['n']
+            for i in crosses:
+                j = (i + 1) % n_eff
+                # Try four swap options + no-op
+                options = []
+                snap = self._snapshot_state()
+                L = self.state['left']; R = self.state['right']
+                C = self.state['center']
+                for tag, op in [
+                    ('swap_L', lambda: (L[[i, j]].copy(),  R[[i, j]].copy())),
+                    ('swap_R', lambda: (L[[i, j]].copy(),  R[[i, j]].copy())),
+                    ('swap_LR', lambda: (L[[i, j]].copy(), R[[i, j]].copy())),
+                ]:
+                    self._restore_state(snap)
+                    if tag == 'swap_L':
+                        self.state['left'][i], self.state['left'][j] = \
+                            self.state['left'][j].copy(), self.state['left'][i].copy()
+                    elif tag == 'swap_R':
+                        self.state['right'][i], self.state['right'][j] = \
+                            self.state['right'][j].copy(), self.state['right'][i].copy()
+                    elif tag == 'swap_LR':
+                        self.state['left'][i], self.state['left'][j] = \
+                            self.state['left'][j].copy(), self.state['left'][i].copy()
+                        self.state['right'][i], self.state['right'][j] = \
+                            self.state['right'][j].copy(), self.state['right'][i].copy()
+                    self.state['center'] = (self.state['left']
+                                            + self.state['right']) / 2.0
+                    cx_now = self._count_rib_crossings()
+                    options.append((cx_now, tag, self._snapshot_state()))
+                # Compare to no-op
+                self._restore_state(snap)
+                # Pick best
+                options.sort(key=lambda o: o[0])
+                if options[0][0] < cx0:
+                    self._restore_state(options[0][2])
+                    # Flatten just the two swapped indices using their
+                    # immediate neighbors as endpoints. Smaller range
+                    # keeps boundary deviation under control.
+                    self._flatten_range(i, j)
+                    cx0 = self._count_rib_crossings()
+                    any_fix = True
+            if not any_fix:
+                break
+        return self._count_rib_crossings()
+
+    ### HJ : count adjacent-rib crossings (X-shape between ribs i and i+1)
+    def _count_rib_crossings(self):
+        """Return integer count of indices i where rib(i) and rib(i+1)
+        segments cross. Wrap-aware.
+        """
+        L = self.state['left']; R = self.state['right']
+        N = self.state['n']
+        wrap = bool(self.wrap_around)
+        n_eff = self._n_effective if wrap else N
+        cnt = 0
+        for i in range(n_eff if wrap else n_eff - 1):
+            j = (i + 1) % n_eff
+            p1 = L[i, :2]; p2 = R[i, :2]
+            p3 = L[j, :2]; p4 = R[j, :2]
+            d1 = p4 - p3; d2 = p2 - p1
+            denom = d1[0] * d2[1] - d1[1] * d2[0]
+            if abs(denom) < 1e-12:
+                continue
+            r0 = p1 - p3
+            s = (r0[0] * d2[1] - r0[1] * d2[0]) / denom
+            t = (r0[0] * d1[1] - r0[1] * d1[0]) / denom
+            if 1e-6 < s < 1.0 - 1e-6 and 1e-6 < t < 1.0 - 1e-6:
+                cnt += 1
+        return cnt
+
+    ### HJ : snapshot / restore helpers (used by stage candidate search)
     def _snapshot_state(self):
         return {
             'left':     self.state['left'].copy(),
@@ -1942,41 +2561,22 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         self.state['n']        = snap['n']
         self._n_effective      = snap['n_eff']
 
-    ### HJ : enforce closure for closed-loop tracks (head == tail).
-    def _enforce_closure(self):
-        """Force state['left'/'right'/'center'][-1] = [0] exactly, so
-        downstream smooth_track (which checks |head-tail| < 1e-3 strictly)
-        accepts the track. Only applied when wrap_around is True and
-        n_effective < n (tail is a duplicate of head)."""
-        if not self.wrap_around:
-            return
-        n = self.state['n']
-        if n < 2:
-            return
-        if self._n_effective >= n:
-            return
-        self.state['left'][n - 1]   = self.state['left'][0]
-        self.state['right'][n - 1]  = self.state['right'][0]
-        self.state['center'][n - 1] = self.state['center'][0]
-
-    ### HJ : v9 Full Realign — Newton-direct + per-index width shrink
+    # ---------- Full Realign: global rib⊥tangent fixup (v5) ----------
     def _full_realign(self):
-        """v9: Newton-direct → width-only shrink to remove cross.
+        """v5 composite algorithm targeting max(⊥err) < 2°.
 
-        Per user direction: "Newton으로 max를 일단 direct로 줄이고, 그 상태를
-        유지하며 boundary poly만 cross 안생기게 센터까지 거리를 조절".
+        Stage 1 — grid search with best-by-max iteration:
+          (source ∈ {left, right, center}) × (smooth_r) × (damp) × (wlim)
+          For each combo, iterate alignment 10× and keep the best intermediate
+          state by max(⊥err).
+        Stage 2 — Newton + snap-to-polyline polish on best stage-1 result:
+          Newton step rotates ribs ⊥ to tangent (preserves width). Snap each
+          L[i], R[i] back to the original L, R polyline. Repeat 30×, track
+          best-by-max.
+        Stage 3 — repeat Newton+snap from {baseline, stage1} as alt starts.
 
-        Phase 1 — Newton-direct:
-          Rotate each rib about its midpoint so rib ⊥ centerline tangent.
-          Width preserved per index. Iterate to max < 0.01°. Cross may
-          appear in hairpins.
-
-        Phase 2 — width shrink:
-          Keep centerline C and per-index normal (perpendicularity preserved).
-          For each cross pair (i, i+1), multiply both indices' half-widths
-          by shrink_ratio. Repeat until cross = 0.
-          Result: rib ⊥ tangent (max = 0°), boundary curves squeezed inward
-          at cross-causing indices only.
+        Monotone in max: rejects all candidates and keeps current state if
+        none reduces max. Repeated clicks never grow max.
         """
         self._push_history()
         err = self._compute_perp_err_deg()
@@ -1985,264 +2585,247 @@ class BoundaryEditor(QtWidgets.QMainWindow):
             return
         before_max = float(err.max())
         before_mean = float(err.mean())
-        before_cross = self._count_rib_crossings()
+        before_crossings = self._count_rib_crossings()
+        # Preserve original (pre-swap) state for safe restore on reject.
+        pre_swap_snap = self._snapshot_state()
+
+        # === Stage 0: resolve pre-existing rib crossings via index swap ===
+        # Per user: editor must fix crossings, not preserve them. Try swapping
+        # adjacent L or R indices; only commit if total crossings drop.
+        if before_crossings > 0:
+            self._resolve_crossings(max_passes=5)
+        post_resolve_cx = self._count_rib_crossings()
+
         base_snap = self._snapshot_state()
+        # L, R polylines for snap-back: the swapped boundary, so snap can't
+        # undo a swap by pulling back to the old position. This is critical
+        # for the algorithm to converge after cross-resolution.
+        L_orig = base_snap['left'].copy()
+        R_orig = base_snap['right'].copy()
+        cross_budget = post_resolve_cx
 
-        wrap = bool(self.wrap_around)
-        N = self.state['n']
-        n_eff = self._n_effective if wrap else N
+        # Track swap effect for user feedback.
+        e_post_swap = self._compute_perp_err_deg()
+        post_swap_max = float(e_post_swap.max()) if e_post_swap is not None else before_max
 
-        # === Phase 1: Newton-direct to perpendicular convergence ===
-        step = 0.5
-        max_iter = 30
-        L = self.state['left'].copy()
-        R = self.state['right'].copy()
-        C = self.state['center'].copy()
-        for _it in range(max_iter):
-            if wrap:
-                base = C[:n_eff, :2]
-                tang = np.roll(base, -1, axis=0) - np.roll(base, 1, axis=0)
-            else:
-                base = C[:, :2]
-                tang = np.empty_like(base)
-                tang[1:-1] = base[2:] - base[:-2]
-                tang[0] = base[1] - base[0]
-                tang[-1] = base[-1] - base[-2]
-            tn = np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
-            tang = tang / tn
-            normal = np.column_stack([-tang[:, 1], tang[:, 0]])
-            rib = R[:n_eff, :2] - L[:n_eff, :2]
-            width = np.linalg.norm(rib, axis=1, keepdims=True) + 1e-9
-            sign = np.sign((rib * normal).sum(axis=1, keepdims=True))
-            sign[sign == 0] = 1.0
-            rib_target = normal * sign * width
-            mid = 0.5 * (L[:n_eff, :2] + R[:n_eff, :2])
-            L_target = mid - 0.5 * rib_target
-            R_target = mid + 0.5 * rib_target
-            L_new = L.copy(); R_new = R.copy(); C_new = C.copy()
-            L_new[:n_eff, :2] = (1 - step) * L[:n_eff, :2] + step * L_target
-            R_new[:n_eff, :2] = (1 - step) * R[:n_eff, :2] + step * R_target
-            C_new[:n_eff, :2] = 0.5 * (L_new[:n_eff, :2] + R_new[:n_eff, :2])
-            if wrap and n_eff < N:
-                L_new[n_eff:] = L_new[0]
-                R_new[n_eff:] = R_new[0]
-                C_new[n_eff:] = C_new[0]
-            L = L_new; R = R_new; C = C_new
-            self.state['left'] = L; self.state['right'] = R; self.state['center'] = C
-            e_check = self._compute_perp_err_deg()
-            if e_check is not None and e_check.max() < 0.001:
-                break
+        # candidates list of (score=(cross, max, mean), label, state)
+        # score sorts crossings first — never accept candidates that
+        # introduce new rib crossings.
+        candidates = []
 
-        # === Phase 2: Width-only shrink to eliminate cross ===
-        # Decompose L, R into (center, normal, signed half-widths).
-        # Shrinking signed half-widths preserves rib direction → perp stays.
-        if wrap:
-            base = C[:n_eff, :2]
-            tang_p2 = np.roll(base, -1, axis=0) - np.roll(base, 1, axis=0)
-        else:
-            base = C[:, :2]
-            tang_p2 = np.empty_like(base)
-            tang_p2[1:-1] = base[2:] - base[:-2]
-            tang_p2[0] = base[1] - base[0]
-            tang_p2[-1] = base[-1] - base[-2]
-        tn_p2 = np.linalg.norm(tang_p2, axis=1, keepdims=True) + 1e-9
-        tang_p2 = tang_p2 / tn_p2
-        normals_p2 = np.column_stack([-tang_p2[:, 1], tang_p2[:, 0]])  # (n_eff, 2)
-        # signed half-widths along normal
-        hL = ((L[:n_eff, :2] - C[:n_eff, :2]) * normals_p2).sum(axis=1)
-        hR = ((R[:n_eff, :2] - C[:n_eff, :2]) * normals_p2).sum(axis=1)
-        z_C = C[:n_eff, 2].copy()  # preserve z
-
-        ### HJ : per-index inner/outer detection via curvature direction.
-        ### dt = d(tangent)/ds. dt · normal > 0 means curvature center is
-        ### on +normal side (R side, assuming standard L,R layout).
-        ### Earlier rib_LR formulation gave wrong polarity for this track —
-        ### user reported "이전이 낫다". Reverted to normal-based decision.
-        dt_p2 = np.roll(tang_p2, -1, axis=0) - np.roll(tang_p2, 1, axis=0)
-        inner_is_R = (dt_p2 * normals_p2).sum(axis=1)  # > 0 → R inner
-
-        def _rebuild_LR():
-            L_b = self.state['left'].copy(); R_b = self.state['right'].copy()
-            L_b[:n_eff, :2] = C[:n_eff, :2] + hL[:, None] * normals_p2
-            R_b[:n_eff, :2] = C[:n_eff, :2] + hR[:, None] * normals_p2
-            # keep z continuous from centerline
-            L_b[:n_eff, 2] = z_C
-            R_b[:n_eff, 2] = z_C
-            if wrap and n_eff < N:
-                L_b[n_eff:] = L_b[0]; R_b[n_eff:] = R_b[0]
-            return L_b, R_b
-
-        shrink_ratio_outer = 0.55   # outer side: shrink more
-        shrink_ratio_inner = 0.92   # inner side (high curvature): nearly preserve
-        max_passes = 50
-        # Arc-length based smoothing window (not index-based) — so a hairpin
-        # with densely-spaced points doesn't get the whole cluster shrunk;
-        # only points within `taper_radius_m` of a cross point get affected.
-        # Precompute centerline arc-length and forward distances.
-        c_xy = C[:n_eff, :2]
-        seg_lens_c = np.linalg.norm(
-            np.roll(c_xy, -1, axis=0) - c_xy, axis=1)
-        s_cum_c = np.concatenate([[0.0], np.cumsum(seg_lens_c)])
-        total_arc = float(s_cum_c[-1])
-        # arc position of each index
-        s_idx = s_cum_c[:-1]  # length n_eff
-
-        taper_radius_m = 0.8  # ±0.8m along arc-length around each cross
-
-        def _arc_dist(s1, s2):
-            d = abs(s1 - s2)
-            return min(d, total_arc - d)
-
-        for _pass in range(max_passes):
-            self.state['left'], self.state['right'] = _rebuild_LR()
-            crosses = self._find_rib_crossings()
-            if not crosses:
-                break
-            scale_L = np.ones(n_eff)
-            scale_R = np.ones(n_eff)
-            for c in crosses:
-                for cidx in (c[0], c[1]):
-                    s_center = s_idx[cidx]
-                    for idx in range(n_eff):
-                        d = _arc_dist(s_idx[idx], s_center)
-                        if d > taper_radius_m:
-                            continue
-                        # cosine taper based on arc-length distance
-                        w = 0.5 * (1.0 + np.cos(np.pi * d / taper_radius_m))
-                        if inner_is_R[idx] > 0:
-                            eff_L = 1.0 - w * (1.0 - shrink_ratio_outer)
-                            eff_R = 1.0 - w * (1.0 - shrink_ratio_inner)
-                        else:
-                            eff_L = 1.0 - w * (1.0 - shrink_ratio_inner)
-                            eff_R = 1.0 - w * (1.0 - shrink_ratio_outer)
-                        if eff_L < scale_L[idx]:
-                            scale_L[idx] = eff_L
-                        if eff_R < scale_R[idx]:
-                            scale_R[idx] = eff_R
-            hL *= scale_L
-            hR *= scale_R
-        # Final rebuild
-        self.state['left'], self.state['right'] = _rebuild_LR()
-        self.state['center'] = C
-        self.state['dirty'][:] = True
-
-        e_final = self._compute_perp_err_deg()
-        cx_final = self._count_rib_crossings()
-        if e_final is None:
+        def try_iter(source, smooth_r, damp, wlim, label):
+            """Run iter_with_best from base_snap for given config."""
             self._restore_state(base_snap)
-            self._refresh()
-            self.statusBar().showMessage('Full Realign: failed.')
-            return
-        bmax = float(e_final.max())
-        bmean = float(e_final.mean())
+            best_score = None
+            best_state = None
+            prev_sig = None
+            for _ in range(10):
+                if damp >= 1.0:
+                    self._align_paired_to_active(
+                        source_layer=source, smooth_radius=smooth_r,
+                        search_radius=20, width_ratio_limit=wlim)
+                else:
+                    pair = {'left': 'right', 'right': 'left'}.get(source)
+                    if source == 'center':
+                        self._align_polyline_damped(
+                            'center', 'left', smooth_radius=smooth_r,
+                            search_radius=20, width_ratio_limit=wlim,
+                            damp=damp)
+                        self._align_polyline_damped(
+                            'center', 'right', smooth_radius=smooth_r,
+                            search_radius=20, width_ratio_limit=wlim,
+                            damp=damp)
+                        self.state['center'] = (self.state['left']
+                                                + self.state['right']) / 2.0
+                    elif pair is not None:
+                        self._align_polyline_damped(
+                            source, pair, smooth_radius=smooth_r,
+                            search_radius=20, width_ratio_limit=wlim,
+                            damp=damp)
+                        if self.state['fmt'] == 'boundary':
+                            self.state['center'] = (self.state['left']
+                                                    + self.state['right']) / 2.0
+                e = self._compute_perp_err_deg()
+                if e is None:
+                    break
+                cx = self._count_rib_crossings()
+                # forbid candidates that introduce new crossings
+                if cx > cross_budget:
+                    sig = (cx, round(float(e.max()), 4), round(float(e.mean()), 4))
+                    if sig == prev_sig:
+                        break
+                    prev_sig = sig
+                    continue
+                score = (cx, float(e.max()), float(e.mean()))
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_state = self._snapshot_state()
+                sig = (cx, round(score[1], 4), round(score[2], 4))
+                if sig == prev_sig:
+                    break
+                prev_sig = sig
+            if best_state is not None:
+                candidates.append((best_score, label, best_state))
 
-        # If somehow the result is worse than baseline, restore baseline.
-        if bmax > before_max + 1e-3 or cx_final > before_cross:
-            self._restore_state(base_snap)
+        # === Stage 1: grid over (source, smooth_r, damp, wlim) ===
+        for src in ('left', 'right', 'center'):
+            for r in (1, 2, 4, 8):
+                for damp in (1.0, 0.7):
+                    for wlim in (1.3, 2.0):
+                        try_iter(src, r, damp, wlim,
+                                 f'{src}/r{r}/d{damp}/w{wlim}')
+
+        # Always seed with pre-swap and swap-only states so the chooser has
+        # safe fallbacks even if every alignment attempt fails.
+        candidates.append((
+            (before_crossings, before_max, before_mean),
+            'pre-swap',
+            pre_swap_snap,
+        ))
+        if post_resolve_cx <= before_crossings:
+            candidates.append((
+                (post_resolve_cx, post_swap_max, float(e_post_swap.mean())),
+                'swap-only',
+                base_snap,
+            ))
+
+        # score = (crossings, max, mean) — sort puts cross-free, low-max first
+        candidates.sort(key=lambda c: c[0])
+        s1_score, s1_label, s1_state = candidates[0]
+
+        # === Stage 2: Gauss-Seidel local polish from stage-1 best ===
+        # Per-index worst-first sweep on the L and R polylines.
+        self._restore_state(s1_state)
+        import os as _os_dbg
+        _dbg = bool(_os_dbg.environ.get('HJ_REALIGN_DEBUG'))
+        if _dbg:
+            _e = self._compute_perp_err_deg()
+            print(f'[realign-dbg] s1 state: cross={s1_score[0]} '
+                  f'mean={_e.mean():.3f}° max={_e.max():.3f}°')
+        self._local_polish_gs(max_iter=30, err_threshold=1.0,
+                              search_radius=30, width_ratio_limit=3.0,
+                              max_crossings=cross_budget)
+        e_p = self._compute_perp_err_deg()
+        polish_state = None
+        if e_p is not None:
+            cx_p = self._count_rib_crossings()
+            if cx_p <= cross_budget:
+                polish_state = self._snapshot_state()
+                candidates.append(((cx_p, float(e_p.max()), float(e_p.mean())),
+                                   s1_label + '+polish', polish_state))
+            if _dbg:
+                print(f'[realign-dbg] after polish: cross={cx_p} '
+                      f'mean={e_p.mean():.3f}° max={e_p.max():.3f}°')
+
+        # === Stage 3: Newton + snap from {baseline, stage-1 best, polished} ===
+        starts = [('base', base_snap), ('s1', s1_state)]
+        if polish_state is not None:
+            starts.append(('pol', polish_state))
+        for start_label, start_state in starts:
+            self._restore_state(start_state)
+            res = self._newton_snap_loop(
+                L_orig, R_orig, n_outer=30, newton_iters=8, step=0.5,
+                baseline_crossings=cross_budget)
+            if res is not None:
+                score, st = res
+                candidates.append((score, f'ns@{start_label}', st))
+                if _dbg:
+                    print(f'[realign-dbg] ns@{start_label}: cross={score[0]} '
+                          f'mean={score[2]:.3f}° max={score[1]:.3f}°')
+
+        # === Stage 4: targeted relocation around baseline cross regions ===
+        # Mimics manual dragging — but ONLY on indices near baseline cross
+        # locations, so the bulk of the boundary stays untouched. Pre-swap
+        # cross neighborhoods are widened (±5) to give the relocation room.
+        self._restore_state(pre_swap_snap)
+        base_crosses = self._find_rib_crossings()
+        allowed = set()
+        for i in base_crosses:
+            for off in range(-5, 6):
+                allowed.add((i + off) % self.state['n'])
+        relocate_candidates = []
+        if allowed and before_crossings > 0:
+            for score, label, state in list(candidates):
+                if score[0] > cross_budget or score[1] < 4.0:
+                    continue
+                self._restore_state(state)
+                self._relocate_bad_points(max_iter=8, err_threshold=4.0,
+                                          max_crossings=cross_budget,
+                                          blend_steps=(0.3, 0.5, 0.7, 1.0),
+                                          allowed_indices=allowed)
+                e_rel = self._compute_perp_err_deg()
+                if e_rel is None:
+                    continue
+                cx_rel = self._count_rib_crossings()
+                if cx_rel > cross_budget:
+                    continue
+                relocate_candidates.append((
+                    (cx_rel, float(e_rel.max()), float(e_rel.mean())),
+                    label + '+reloc',
+                    self._snapshot_state(),
+                ))
+                if _dbg:
+                    print(f'[realign-dbg] reloc from [{label}]: cross={cx_rel} '
+                          f'mean={e_rel.mean():.3f}° max={e_rel.max():.3f}° '
+                          f'(restricted to {len(allowed)} indices)')
+        candidates.extend(relocate_candidates)
+
+        # === Stage 5: Cubic-spline resample (preserves boundary curve shape,
+        # redistributes points freely). Try at original N and 2N.
+        # Per user: "boundary 선 내에서는 움직여도 돼. 형상만 유지되면."
+        for n_factor in (1.0, 2.0):
+            self._restore_state(pre_swap_snap)
+            n_target = int(round(self.state['n'] * n_factor))
+            res = self._spline_resample(n_out=n_target, dense_count=4000,
+                                         n_iter=12, smooth_radius=2)
+            if res is None:
+                continue
+            score, st, it = res
+            if score[0] > cross_budget:
+                # Spline result has more crossings than budget — skip.
+                if _dbg:
+                    print(f'[realign-dbg] spline n={n_target}: '
+                          f'cross={score[0]} > budget {cross_budget}, skipped')
+                continue
+            candidates.append((score, f'spline/n{n_target}@iter{it}', st))
+            if _dbg:
+                print(f'[realign-dbg] spline n={n_target}: cross={score[0]} '
+                      f'mean={score[2]:.3f}° max={score[1]:.3f}°')
+
+        # Reset to pre-swap before final winner application to avoid leaving
+        # any partially-applied spline state.
+        self._restore_state(pre_swap_snap)
+
+        # === Pick best by (crossings, max, mean) ===
+        candidates.sort(key=lambda c: c[0])
+        best_score, best_label, best_state = candidates[0]
+        best_cx, best_max, best_mean = best_score
+
+        tol = 1e-3
+        # Two-tier reject:
+        #   (a) if best is *better than* the pre-swap original on (cross,max),
+        #       apply it — this is the success path.
+        #   (b) if not, reject and restore the PRE-SWAP original — never
+        #       leave the user in a worse state than they started.
+        pre_score = (before_crossings, before_max, before_mean)
+        if best_score >= pre_score and best_max > before_max + tol:
+            self._restore_state(pre_swap_snap)
             self._refresh()
             self.statusBar().showMessage(
                 f'Full Realign: no improvement. '
                 f'⊥err mean={before_mean:.2f}° max={before_max:.2f}° '
-                f'cross={before_cross}.')
+                f'cross={before_crossings}.')
             return
 
-        ### HJ : enforce exact closure for closed-loop tracks. Downstream
-        ### smooth_track (track3D.py) requires |head - tail| < 1e-3 strictly.
-        ### Floating-point updates during Newton/shrink can leave a tiny
-        ### residual, which the closure check then rejects. Snap tail = head.
-        self._enforce_closure()
-
+        # Apply winner.
+        self._restore_state(best_state)
+        self.selected = {i for i in self.selected if 0 <= i < best_state['n']}
         self._refresh()
         self.statusBar().showMessage(
-            f'Full Realign (Newton+shrink): '
+            f'Full Realign [{best_label}]: '
             f'⊥err {before_mean:.2f}°/{before_max:.2f}° → '
-            f'{bmean:.4f}°/{bmax:.4f}° (mean/max), '
-            f'cross {before_cross}→{cx_final}')
-
-    ### HJ : insert a new point at the current mouse cursor (called from
-    ### 'I' key shortcut). Looks up where the mouse currently hovers inside
-    ### the plot and forwards to _insert_point_at.
-    def _insert_at_cursor(self):
-        vb = self.plot.getPlotItem().getViewBox()
-        cursor_scene = self.plot.mapToScene(
-            self.plot.mapFromGlobal(QtGui.QCursor.pos()))
-        data_pt = vb.mapSceneToView(cursor_scene)
-        # Bounds check: ignore if cursor is outside the view area.
-        view_rect = vb.viewRect()
-        if not view_rect.contains(data_pt):
-            self.statusBar().showMessage(
-                'Insert: move the mouse over the track view first.')
-            return
-        self._insert_point_at((float(data_pt.x()), float(data_pt.y())))
-
-    ### HJ : insert a new point at click position (xy is (x, y) in data coords).
-    ### The new point becomes part of the ACTIVE layer at exactly the click
-    ### location. Paired layers are linearly interpolated from neighbors so
-    ### each row remains a 1-to-1 (L, C, R) triple.
-    def _insert_point_at(self, xy):
-        x_click, y_click = xy
-        N = self.state['n']
-        if N < 2:
-            self.statusBar().showMessage('Insert: need at least 2 existing points.')
-            return
-
-        active_arr = self._layer_arr()
-        wrap = bool(self.wrap_around)
-        n_eff = self._n_effective if wrap else N
-
-        # Find closest segment on the active layer.
-        best = (float('inf'), 0, 0.0)  # (dist, seg_i, t01)
-        for i in range(n_eff if wrap else N - 1):
-            j = (i + 1) % n_eff if wrap else i + 1
-            A = active_arr[i, :2]; B = active_arr[j, :2]
-            seg = B - A
-            L2 = float(seg @ seg)
-            if L2 < 1e-12:
-                continue
-            t = float(np.clip(((np.array(xy) - A) @ seg) / L2, 0.0, 1.0))
-            proj = A + t * seg
-            d = float(np.linalg.norm(np.array(xy) - proj))
-            if d < best[0]:
-                best = (d, i, t)
-        _, seg_i, t01 = best
-        ins_idx = seg_i + 1  # insert AFTER seg_i (between seg_i and seg_i+1)
-
-        self._push_history()
-
-        # Build new point for each layer:
-        #   active layer: use the click position (so it lands exactly where user clicked)
-        #   other layers: linear interp between neighbors at the same t01
-        j = (seg_i + 1) % n_eff if wrap else seg_i + 1
-        new_pt = {}
-        for layer in ('left', 'right', 'center'):
-            P = self.state[layer]
-            if layer == self.active:
-                # active: click xy + interpolated z
-                z_new = (1 - t01) * P[seg_i, 2] + t01 * P[j, 2]
-                new_pt[layer] = np.array([x_click, y_click, z_new])
-            else:
-                new_pt[layer] = (1 - t01) * P[seg_i] + t01 * P[j]
-
-        # Insert at ins_idx in all layers + book-keeping arrays.
-        for layer in ('left', 'right', 'center'):
-            self.state[layer] = np.insert(
-                self.state[layer], ins_idx, new_pt[layer], axis=0)
-        raw = self.state['raw_data']
-        new_raw = np.zeros(raw.shape[1]) if raw.ndim == 2 else np.zeros(9)
-        self.state['raw_data'] = np.insert(raw, ins_idx, new_raw, axis=0)
-        self.state['dirty'] = np.insert(self.state['dirty'], ins_idx, True)
-        self.state['n'] = N + 1
-
-        # Re-index selection.
-        self.selected = {(i if i < ins_idx else i + 1) for i in self.selected}
-        self.selected.add(ins_idx)
-
-        # closed-loop state may flip; recompute.
-        self.wrap_around, self._n_effective = self._detect_closed_loop()
-        self._refresh()
-        self.statusBar().showMessage(
-            f'Inserted point at idx {ins_idx} '
-            f'({x_click:.2f}, {y_click:.2f}) on {self.active}. N={self.state["n"]}')
+            f'{best_mean:.2f}°/{best_max:.2f}° (mean/max), '
+            f'cross {before_crossings}→{best_cx}')
 
     def _on_drag_end(self):
         # In raw-boundary format, keep center = midpoint after a drag *unless*
@@ -2286,11 +2869,6 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         old_to_new = -np.ones(len(keep), dtype=int)
         old_to_new[keep] = np.arange(self.state['n'])
         self.selected = {int(old_to_new[i]) for i in self.selected if old_to_new[i] >= 0}
-        ### HJ : deletion can change whether the polyline is still closed,
-        ### and n_effective always needs to be refreshed (it was N-1 or N
-        ### depending on whether the tail point duplicates the head).
-        ### Without this refresh, Full Realign reads stale n_effective.
-        self.wrap_around, self._n_effective = self._detect_closed_loop()
         self._refresh()
 
     def _downsample_selection(self):
@@ -2546,9 +3124,6 @@ class BoundaryEditor(QtWidgets.QMainWindow):
             self._undo()
         elif k == QtCore.Qt.Key_D:
             self._downsample_selection()
-        elif k == QtCore.Qt.Key_I:
-            ### HJ : insert point at current mouse position
-            self._insert_at_cursor()
         elif k == QtCore.Qt.Key_Backspace:
             self._delete_selection()
         elif k == QtCore.Qt.Key_Escape:
@@ -2609,39 +3184,23 @@ def _resolve_csv_from_args():
             continue
         leftover.append(tok)
 
-    ### HJ : fallback to argparse for non-ROS CLI usage. Accepts:
-    ###        --map <name>   resolves $(stack_master)/maps/<name>/<name>_bounds_3d.csv
-    ###        -m <name>      same, short form
-    ###        <csv path>     positional, legacy
+    ### HJ : fallback to positional argparse only when neither _csv nor _map
+    ###      is given (preserves the original CLI for legacy non-ROS use).
     if csv_path is None and map_name is None:
         parser = argparse.ArgumentParser(
             description='Multi-select boundary editor (PyQt5 + pyqtgraph).')
-        parser.add_argument('--map', '-m', dest='map_name', default=None,
-                            help='Map name (resolves to <stack_master>/maps/<name>/<name>_bounds_3d.csv)')
-        parser.add_argument('csv', nargs='?', default=None,
-                            help='Track CSV path (alternative to --map).')
+        parser.add_argument(
+            'csv', help='Track CSV (raw boundary or 3D track format).')
         args = parser.parse_args(leftover)
         csv_path = args.csv
-        if args.map_name is not None:
-            map_name = args.map_name
 
     ### HJ : resolve via map name → $(stack_master)/maps/<map>/<map>_bounds_3d.csv
-    ### Try rospack first (ROS-sourced environments). Fall back to the
-    ### script's own location for non-ROS CLI use.
     if csv_path is None and map_name is not None:
-        stack_master_path = None
         try:
             import rospkg
             stack_master_path = rospkg.RosPack().get_path('stack_master')
-        except Exception:
-            # Fallback: this script lives at <stack_master>/scripts/.
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            candidate = os.path.dirname(script_dir)
-            if os.path.isdir(os.path.join(candidate, 'maps')):
-                stack_master_path = candidate
-        if stack_master_path is None:
-            print('Could not resolve stack_master path (no ROS, no fallback).',
-                  file=sys.stderr)
+        except Exception as e:
+            print(f'rospack stack_master lookup failed: {e}', file=sys.stderr)
             sys.exit(1)
         csv_path = os.path.join(
             stack_master_path, 'maps', map_name, f'{map_name}_bounds_3d.csv')
