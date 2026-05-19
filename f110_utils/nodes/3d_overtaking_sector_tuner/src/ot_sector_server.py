@@ -43,8 +43,10 @@ class OvertakingSectorPublisher:
             self.yaml_data["ot_sector_begin"] = config.ot_sector_begin
             
             for key, item in self.sectors.items():
-                self.yaml_data[key]['ot_flag'] = bool(getattr(config, key, None)) 
-                
+                self.yaml_data[key]['ot_flag'] = bool(getattr(config, key, None))
+                ### HJ : persist disable_static_avoidance from rqt toggle (default false if missing)
+                self.yaml_data[key]['disable_static_avoidance'] = bool(getattr(config, key + "_disable_static", False))
+
             with open(self.yaml_file_path, "w") as yaml_file:
                 yaml.dump(self.yaml_data, yaml_file, default_flow_style=False)
             rospy.loginfo("Configuration saved to YAML file: %s", self.yaml_file_path)
@@ -67,7 +69,9 @@ class OvertakingSectorPublisher:
         self.sectors = {k: v for k, v in yaml_data.items() if k.startswith('Overtaking_sector')}
 
         for key, item in self.sectors.items():
-            default_config[key] = bool(item['ot_flag'])            
+            default_config[key] = bool(item['ot_flag'])
+            ### HJ : load disable_static_avoidance default (false if missing from yaml)
+            default_config[key + "_disable_static"] = bool(item.get('disable_static_avoidance', False))
         return default_config
 
     def glb_wpnts_cb(self, data):

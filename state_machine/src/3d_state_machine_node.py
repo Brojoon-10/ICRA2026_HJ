@@ -195,6 +195,12 @@ class StateMachine:
         self.n_ot_sectors = self.ot_sectors_params["n_sectors"]
         self.overtake_wpnts = None
         self.overtake_zones = []
+        ### HJ : zones where static avoidance is forbidden (e.g. bridge). Built from ot_sectors.yaml disable_static_avoidance flag.
+        self.disable_static_zones = []
+        for i in range(self.n_ot_sectors):
+            sec = self.ot_sectors_params[f"Overtaking_sector{i}"]
+            if sec.get("disable_static_avoidance", False):
+                self.disable_static_zones.append([sec["start"], sec["end"] + 1])
         self.ot_begin_margin = 0.5
         self.cur_volt = 11.69  # default value for sim
         self.volt_threshold = rospy.get_param("state_machine/volt_threshold", default=10)
@@ -734,19 +740,26 @@ class StateMachine:
         """
         # reset overtake zones
         self.overtake_zones = []
-        # update overtake zones
+        ### HJ : rebuild disable_static_zones from rqt toggle (Overtaking_sector{i}_disable_static)
+        self.disable_static_zones = []
+        ### HJ : name-based lookup via params.bools (dynamic_reconfigure Config msg is a flat list of BoolParameter)
+        bools_by_name = {b.name: b.value for b in params.bools}
         try:
             for i in range(self.n_ot_sectors):
-                self.ot_sectors_params[f"Overtaking_sector{i}"]["ot_flag"] = params.bools[i + 1].value
-                # add start and end index of the sector
-                if self.ot_sectors_params[f"Overtaking_sector{i}"]["ot_flag"]:
-                    self.overtake_zones.append(
-                        [
-                            self.ot_sectors_params[f"Overtaking_sector{i}"]["start"],
-                            self.ot_sectors_params[f"Overtaking_sector{i}"]["end"] + 1,
-                        ]
-                    )
-        except IndexError as e:
+                key = f"Overtaking_sector{i}"
+                ot_flag = bool(bools_by_name.get(key, False))
+                disable_static = bool(bools_by_name.get(key + "_disable_static", False))
+
+                self.ot_sectors_params[key]["ot_flag"] = ot_flag
+                self.ot_sectors_params[key]["disable_static_avoidance"] = disable_static
+
+                s_idx = self.ot_sectors_params[key]["start"]
+                e_idx = self.ot_sectors_params[key]["end"] + 1
+                if ot_flag:
+                    self.overtake_zones.append([s_idx, e_idx])
+                if disable_static:
+                    self.disable_static_zones.append([s_idx, e_idx])
+        except (AttributeError, IndexError, KeyError) as e:
             raise IndexError(f"[State Machine] Error in overtaking sector numbers. \nTry switching map with the script in stack_master/scripts and re-source in every terminal. \nError thrown: {e}")
 
         self.ot_begin_margin = params.doubles[2].value  # Choose the dyn ot param value
@@ -893,6 +906,28 @@ class StateMachine:
 
         return False
     # ===== HJ MODIFIED END =====
+
+    ### HJ : bridge-protection gate — returns True if current position is in a sector with disable_static_avoidance=true
+    def _check_static_avoidance_disabled(self) -> bool:
+        """Check if current position is in a sector that forbids static avoidance (e.g. bridge).
+
+        Uses GB raceline coordinates like _check_ot_sector. Falls through to False if
+        disable_static_zones is empty (default state for maps without bridge flagging).
+        """
+        if not self.disable_static_zones:
+            return False
+
+        if hasattr(self, 'parent'):
+            cur_s_for_zone = self.parent.cur_s
+            waypoints_dist_for_zone = self.parent.waypoints_dist
+        else:
+            cur_s_for_zone = self.cur_s
+            waypoints_dist_for_zone = self.waypoints_dist
+
+        for sector in self.disable_static_zones:
+            if sector[0] <= cur_s_for_zone / waypoints_dist_for_zone <= sector[1]:
+                return True
+        return False
 
     # ===== HJ COMMENTED: Original version without distance check =====
     # def _check_getting_closer(self, threshold_m=3.0) -> bool:
@@ -1354,6 +1389,8 @@ class StateMachine:
         closer_check = self._check_getting_closer(threshold_m = 7.0)
         latest_check = self._check_latest_wpnts(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
         free_check = self._check_free_frenet(self.cur_static_avoidance_wpnts)
+        ### HJ : bridge protection — forbid static avoidance entry in flagged sectors
+        not_disabled = not self._check_static_avoidance_disabled()
 
         # Determine if this is smart_helper or parent for logging
         is_smart_helper = hasattr(self, 'parent')  # SmartStaticChecker has parent attribute
@@ -1372,13 +1409,14 @@ class StateMachine:
             closer=closer_check,
             latest=latest_check,
             free=free_check,
+            not_disabled=not_disabled,
             wpnts_avail=self.static_avoidance_wpnts is not None,
             wpnts=wpnts_info,
             num_obs=len(self.obstacles_in_interest)
         )
         # ===== HJ ADDED END =====
 
-        if vs_check and closer_check and latest_check and free_check:
+        if vs_check and closer_check and latest_check and free_check and not_disabled:
             self.static_overtaking_mode = True
             return True
         else:
@@ -1386,6 +1424,9 @@ class StateMachine:
 
     def _check_overtaking_mode_sustainability(self) -> bool:
         if self.static_overtaking_mode:
+            ### HJ : bridge protection — drop static avoidance immediately when entering a flagged sector
+            if self._check_static_avoidance_disabled():
+                return False
             if (
                 self._check_availability(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
                 and self._check_free_frenet(self.cur_static_avoidance_wpnts)

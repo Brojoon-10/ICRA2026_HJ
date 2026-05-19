@@ -101,11 +101,10 @@ class OvertakingInterpolator:
         """
         Notices the change in the parameters and scales the global waypoints
         """
-        # update params 
+        # update params
+        ### HJ : only process bools whose name matches a sector key — robust to future cfg additions (e.g. disable_static)
         for param in params.bools:
-            if param.name == 'save_params':
-                continue
-            else:
+            if param.name in self.sectors_params:
                 self.sectors_params[param.name]['ot_flag'] = param.value
         
         #assert params.doubles[0].name == 'yeet_factor'
