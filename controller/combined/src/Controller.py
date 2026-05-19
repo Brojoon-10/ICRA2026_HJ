@@ -178,6 +178,17 @@ class Controller:
         self.accel_lim_lookahead = rospy.get_param('L1_controller/accel_lim_lookahead', 0.3)
         ### HJ : end
 
+        ### HJ : raceline-deceleration curvature boost
+        # If the local waypoint at idx_nearest has ax_mps2 < 0 (raceline is asking
+        # for deceleration here), apply an additive curvature term so L1 shortens
+        # while braking into a corner. Works on any waypoint source (GB tracking,
+        # overtaking, etc.) — column 8 of waypoint_array_in_map is ax_mps2.
+        # k_eff = curvature_factor + (decel_curvature_factor if ax<0 else 0)
+        self.enable_straight_deceleration = rospy.get_param('L1_controller/enable_straight_deceleration', False)
+        self.decel_curvature_factor = rospy.get_param('L1_controller/decel_curvature_factor', 2.5)
+        self.acc_now_rslidar = np.zeros(10)  # legacy buffer, kept for future IMU-based gating
+        ### HJ : end
+
         ### HJ : yaw rate feedback (oversteer/understeer compensation)
         self.K_yr = rospy.get_param('L1_controller/K_yr', 0.0)
         self.K_yr_sat = rospy.get_param('L1_controller/K_yr_sat', 0.05)  ### HJ : corr clip [rad]
@@ -480,11 +491,31 @@ class Controller:
  
             speed_scaler = self.m_l1 * self.speed_now
             
+        ### HJ : raceline-deceleration curvature boost
+        # When the nearest local waypoint's ax_mps2 (column 8) is negative, the
+        # raceline is asking us to decelerate at this point — add a curvature term
+        # so the lookahead shortens. Works on any waypoint source.
+        k_factor_eff = self.curvature_factor
+        if self.enable_straight_deceleration and self.idx_nearest_waypoint is not None:
+            try:
+                wpa = self.waypoint_array_in_map
+                if wpa.shape[1] > 8:           # ax column present
+                    idx_now = int(self.idx_nearest_waypoint)
+                    ax_wpnt = float(wpa[idx_now, 8])
+                    if ax_wpnt < 0.0:
+                        k_factor_eff = self.curvature_factor + self.decel_curvature_factor
+                    rospy.loginfo_throttle(0.5,
+                        f"[DecelBoost] ax_wpnt={ax_wpnt:+.2f} decel={ax_wpnt < 0.0} k_eff={k_factor_eff:.2f}")
+            except Exception as e:
+                rospy.logwarn_throttle(2.0, f"[DecelBoost] disabled this tick: {e}")
+                k_factor_eff = self.curvature_factor
+        ### HJ : end
+
         if self.state == "START":
             curvature_scaler = self.start_curvature_factor*self.curvature_waypoints
         else :
-            curvature_scaler = self.curvature_factor*self.curvature_waypoints*self.speed_now*self.speed_now
- 
+            curvature_scaler = k_factor_eff*self.curvature_waypoints*self.speed_now*self.speed_now
+
         L1_distance = (speed_scaler - curvature_scaler) + self.q_l1
    
         # clip lower bound to avoid ultraswerve when far away from mincurv
@@ -1102,15 +1133,15 @@ class Controller:
     def waypoint_at_distance_before_car(self, distance, waypoints, idx_waypoint_behind_car):
         """
         Calculates the waypoint at a certain frenet distance in front of the car
- 
+
         Returns:
             waypoint as numpy array at a ceratin distance in front of the car
         """
-        
+
         if distance is None:
             distance = self.t_clip_min
         d_distance = distance
- 
+
         ### HJ : use 3D distance for lookahead accumulation on sloped tracks
         waypoints_ahead = waypoints[idx_waypoint_behind_car:]
 
@@ -1124,9 +1155,30 @@ class Controller:
         # Compute cumulative distances
         cum_lengths = np.cumsum(seg_lengths)
 
-        # Find the first index where cumulative distance exceeds lookahead
-        idx_offset = min(np.searchsorted(cum_lengths, d_distance), len(waypoints_ahead) - 1)
+        ### HJ : linear interpolation between adjacent waypoints for L1 point
+        # eliminates ~10 cm quantization that was producing tick-to-tick eta jumps.
+        # idx_seg is the segment index such that cum_lengths[idx_seg-1] < d <= cum_lengths[idx_seg].
+        n_seg = len(seg_lengths)
+        if n_seg == 0:
+            # only one waypoint ahead — fall back to it (no interp possible)
+            return waypoints_ahead[0, :3]
 
-        ### HJ : return xyz for 3D marker visualization (steering still uses xy)
-        return waypoints_ahead[idx_offset, :3]
+        idx_seg = int(np.searchsorted(cum_lengths, d_distance))
+        if idx_seg >= n_seg:
+            # requested distance exceeds available track ahead → clamp to last waypoint
+            return waypoints_ahead[-1, :3]
+
+        # arclength at the start of the segment (waypoints_ahead[idx_seg]) and at its end (idx_seg+1)
+        d_start = cum_lengths[idx_seg - 1] if idx_seg > 0 else 0.0
+        seg_len = seg_lengths[idx_seg]
+        if seg_len <= 1e-9:
+            # degenerate (duplicate waypoints) — just return the start of segment
+            return waypoints_ahead[idx_seg, :3]
+
+        t = (d_distance - d_start) / seg_len
+        t = float(np.clip(t, 0.0, 1.0))
+
+        p_start = waypoints_ahead[idx_seg, :3]
+        p_end = waypoints_ahead[idx_seg + 1, :3]
+        return (1.0 - t) * p_start + t * p_end
         ### HJ : end

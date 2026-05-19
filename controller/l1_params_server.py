@@ -81,6 +81,8 @@ class DynamicControllerConfigServer:
             self.yaml_data["brake_speed_diff_thres"] = config.brake_speed_diff_thres
             self.yaml_data["brake_current"] = config.brake_current
             self.yaml_data["brake_current_min"] = config.brake_current_min
+            self.yaml_data["enable_straight_deceleration"] = config.enable_straight_deceleration
+            self.yaml_data["decel_curvature_factor"] = config.decel_curvature_factor
             ### HJ : end
 
             with open(self.yaml_file_path, "w") as yaml_file:
@@ -161,6 +163,8 @@ class DynamicControllerConfigServer:
             "brake_speed_diff_thres": float(yaml_data.get("brake_speed_diff_thres", 0.5)),
             "brake_current": float(yaml_data.get("brake_current", 15.0)),
             "brake_current_min": float(yaml_data.get("brake_current_min", 3.0)),
+            "enable_straight_deceleration": bool(yaml_data.get("enable_straight_deceleration", False)),
+            "decel_curvature_factor": float(yaml_data.get("decel_curvature_factor", 2.5)),
             ### HJ : end
         }          
         return default_config
