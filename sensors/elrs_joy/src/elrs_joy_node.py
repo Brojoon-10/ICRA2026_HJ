@@ -252,11 +252,21 @@ class ELRSJoyNode:
                     self.print_stats()
                 rate.sleep()
 
-            except serial.SerialException as e:
+            ### HJ : also catch raw OSError (e.g. EIO from in_waiting ioctl on USB drop)
+            except (serial.SerialException, OSError) as e:
                 rospy.logerr("Serial error: %s. Reconnecting...", str(e))
                 self.connected = False
-                time.sleep(1.0)
-                self.connect_serial()
+                try:
+                    if self.serial_port and self.serial_port.is_open:
+                        self.serial_port.close()
+                except Exception:
+                    pass
+                self.serial_port = None
+                self.buffer.clear()
+                while not rospy.is_shutdown():
+                    time.sleep(1.0)
+                    if self.connect_serial():
+                        break
             except KeyboardInterrupt:
                 break
 
