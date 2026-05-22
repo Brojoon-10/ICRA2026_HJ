@@ -13,7 +13,6 @@ from steering_lookup.lookup_steer_angle import LookupSteerAngle
 import rospy
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
-from std_msgs.msg import String  ### HJ : state-noise filter debug topic
 
 # ===== HJ ADDED: Global flag for differential trailing control for static sector obstacles =====
 
@@ -986,83 +985,36 @@ class Controller:
         else:
             heading_error = (heading_error + np.pi) % (2 * np.pi) - np.pi
         # ===== HJ MODIFIED END =====
-
+ 
         if use_filter:
             if not hasattr(self, 'filtered_heading_error'):
                 self.filtered_heading_error = heading_error
             self.filtered_heading_error = alpha * heading_error + (1 - alpha) * self.filtered_heading_error
             heading_error = self.filtered_heading_error
-
+ 
         if speed < v_threshold:
             dynamic_gain = self.KP * (speed / v_threshold)
         else:
             dynamic_gain = self.KP
-
-
+ 
+ 
         if self.state == "OVERTAKE":
             dynamic_gain *= 0.65
-
+ 
         if not hasattr(self, 'heading_error_integral'):
             self.heading_error_integral = 0.0
         if not hasattr(self, 'prev_heading_error'):
             self.prev_heading_error = heading_error
-
-        ### HJ : state-noise filter — toggled D-term re-formulation
-        # Default OFF: identical to legacy pipeline (finite-diff derivative).
-        # ON: D = KD * (v * kappa_L1 - yaw_rate), no finite-diff noise amplification.
-        filter_on = getattr(self, 'filter_state_noise', False)
-        omega_target = 0.0
-        omega_meas = 0.0
-        kappa_L1 = 0.0
-        d_signal_legacy = 0.0
-        d_signal_model = 0.0
-
+ 
         if use_pid:
             self.heading_error_integral += heading_error * dt
             derivative = (heading_error - self.prev_heading_error) / dt if dt > 0 else 0.0
             self.prev_heading_error = heading_error
-            d_signal_legacy = derivative
-
-            if filter_on:
-                # L1 absolute point = future_position + L1_vector (caller passes Future_L1_vector)
-                try:
-                    L1_point_abs = self.future_position[0, :2] + np.asarray(L1_vector[:2])
-                    idx_L1 = self.nearest_waypoint(L1_point_abs, self.waypoint_array_in_map[:, :2])
-                    kappa_L1 = float(self.waypoint_array_in_map[idx_L1, 6])
-                except Exception:
-                    kappa_L1 = 0.0
-                kappa_sign = getattr(self, 'kappa_sign', 1)
-                omega_target = float(speed) * kappa_sign * kappa_L1
-                omega_meas = float(getattr(self, 'yaw_rate', 0.0))
-                d_signal_model = omega_target - omega_meas
-                correction = (dynamic_gain * heading_error
-                              + self.KI * self.heading_error_integral
-                              + self.KD * d_signal_model)
-            else:
-                correction = (dynamic_gain * heading_error
-                              + self.KI * self.heading_error_integral
-                              + self.KD * derivative)
+ 
+            correction = dynamic_gain * heading_error + self.KI * self.heading_error_integral + self.KD * derivative
         else:
             correction = dynamic_gain * heading_error
-
-        # Lazy-init debug publisher; publish only when filter is on (avoid topic spam by default)
-        if filter_on:
-            if not hasattr(self, '_state_filter_debug_pub'):
-                self._state_filter_debug_pub = rospy.Publisher(
-                    '/controller/state_filter_debug', String, queue_size=10)
-            try:
-                payload = (
-                    '{{"filter_on":1,"heading_error":{he:.4f},"omega_target":{ot:.4f},'
-                    '"omega_meas":{om:.4f},"kappa_L1":{kp:.4f},"d_signal_model":{ds:.4f},'
-                    '"d_signal_legacy":{dl:.4f},"correction":{co:.4f}}}'
-                ).format(he=float(heading_error), ot=omega_target, om=omega_meas,
-                         kp=kappa_L1, ds=d_signal_model, dl=d_signal_legacy,
-                         co=float(correction))
-                self._state_filter_debug_pub.publish(payload)
-            except Exception:
-                pass
-        ### HJ : end
-
+ 
         return correction
     
     def calc_future_position(self, T):

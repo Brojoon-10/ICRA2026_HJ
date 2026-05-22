@@ -88,28 +88,9 @@ class Controller_manager:
         # downstream code can read it safely (stays 0 → decel_gate=0 → no effect).
         self.acc_now_rslidar = np.zeros(10)
         ### HJ : end
-        self.speed_now_y =0
-        self.yaw_rate = 0
+        self.speed_now_y =0 
+        self.yaw_rate = 0 
         self.waypoint_safety_counter = 0
-
-        ### HJ : state-noise filter (toggled via dyn_reconfigure; default OFF = identical to legacy)
-        self.filter_state_noise = False
-        self.alpha_pos = 0.5
-        self.alpha_yaw = 0.4
-        self.alpha_omega = 0.5
-        self.kappa_sign = 1
-        self._pose_filt_init = False
-        self._x_filt = 0.0
-        self._y_filt = 0.0
-        self._theta_filt = 0.0
-        self._omega_filt_init = False
-        self._omega_filt = 0.0
-        # raw values kept for debug topic comparison
-        self._x_raw = 0.0
-        self._y_raw = 0.0
-        self._theta_raw = 0.0
-        self._omega_raw = 0.0
-        ### HJ : end
 
         # Trailing related variables
         self.opponent = [0,0,0,False, True] #s, d, vs, is_static
@@ -161,16 +142,8 @@ class Controller_manager:
         self.steer_gain_for_speed = rospy.get_param('L1_controller/steer_gain_for_speed')
 
         self.future_constant = rospy.get_param('L1_controller/future_constant')
-
+        
         self.AEB_thres = rospy.get_param('L1_controller/AEB_thres')
-
-        ### HJ : state-noise filter init values (defaults if yaml missing)
-        self.filter_state_noise = rospy.get_param('L1_controller/filter_state_noise', False)
-        self.alpha_pos = rospy.get_param('L1_controller/alpha_pos', 0.5)
-        self.alpha_yaw = rospy.get_param('L1_controller/alpha_yaw', 0.4)
-        self.alpha_omega = rospy.get_param('L1_controller/alpha_omega', 0.5)
-        self.kappa_sign = rospy.get_param('L1_controller/kappa_sign', 1)
-        ### HJ : end
 
 
         self.speed_diff_thres = rospy.get_param('L1_controller/speed_diff_thres')
@@ -253,10 +226,6 @@ class Controller_manager:
             logger_warn=rospy.logwarn
         )
 
-        ### HJ : seed state-noise filter flags on Controller before first main_loop
-        self.controller.filter_state_noise = self.filter_state_noise
-        self.controller.kappa_sign = self.kappa_sign
-        ### HJ : end
 
         # Publishers to view data
         self.lookahead_pub = rospy.Publisher('lookahead_point', Marker, queue_size=10)
@@ -385,14 +354,6 @@ class Controller_manager:
         self.speed_factor_for_lat_err = rospy.get_param('dyn_controller/speed_factor_for_lat_err')
         self.speed_factor_for_curvature = rospy.get_param('dyn_controller/speed_factor_for_curvature')
 
-        ### HJ : state-noise filter params (live tuning via rqt)
-        self.filter_state_noise = rospy.get_param('dyn_controller/filter_state_noise', False)
-        self.alpha_pos = rospy.get_param('dyn_controller/alpha_pos', 0.5)
-        self.alpha_yaw = rospy.get_param('dyn_controller/alpha_yaw', 0.4)
-        self.alpha_omega = rospy.get_param('dyn_controller/alpha_omega', 0.5)
-        self.kappa_sign = rospy.get_param('dyn_controller/kappa_sign', 1)
-        ### HJ : end
-
         ## Updating params for map and pp controller
         ## Lateral Control Parameters
         self.controller.t_clip_min = self.t_clip_min  
@@ -456,11 +417,6 @@ class Controller_manager:
         self.controller.K_us = rospy.get_param('dyn_controller/K_us', 0.0)
         ### HJ : end
 
-        ### HJ : state-noise filter flags forwarded to Controller (gates D-term re-formulation)
-        self.controller.filter_state_noise = self.filter_state_noise
-        self.controller.kappa_sign = self.kappa_sign
-        ### HJ : end
-
         ### HJ : brake control params from dyn_reconfigure
         self.enable_brake_ctrl = rospy.get_param('dyn_controller/enable_brake_ctrl', False)
         self.brake_mode = rospy.get_param('dyn_controller/brake_mode', 0)
@@ -492,19 +448,7 @@ class Controller_manager:
         self.controller.speed_now = self.speed_now
 
         ### HJ : yaw rate from odom (IMU /imu/data dead) — ENU, left+
-        omega_raw = data.twist.twist.angular.z
-        self._omega_raw = omega_raw
-        if self.filter_state_noise:
-            if not self._omega_filt_init:
-                self._omega_filt = omega_raw
-                self._omega_filt_init = True
-            else:
-                self._omega_filt = (self.alpha_omega * omega_raw
-                                    + (1.0 - self.alpha_omega) * self._omega_filt)
-            self.yaw_rate = self._omega_filt
-        else:
-            self._omega_filt_init = False
-            self.yaw_rate = omega_raw
+        self.yaw_rate = data.twist.twist.angular.z
         self.controller.yaw_rate = self.yaw_rate
         ### HJ : end
 
@@ -522,27 +466,7 @@ class Controller_manager:
         y = data.pose.position.y
         theta = euler_from_quaternion([data.pose.orientation.x, data.pose.orientation.y,
                                        data.pose.orientation.z, data.pose.orientation.w])[2]
-        ### HJ : state-noise source LPF (gated by filter_state_noise)
-        self._x_raw, self._y_raw, self._theta_raw = x, y, theta
-        if self.filter_state_noise:
-            if not self._pose_filt_init:
-                self._x_filt = x
-                self._y_filt = y
-                self._theta_filt = theta
-                self._pose_filt_init = True
-            else:
-                self._x_filt = self.alpha_pos * x + (1.0 - self.alpha_pos) * self._x_filt
-                self._y_filt = self.alpha_pos * y + (1.0 - self.alpha_pos) * self._y_filt
-                d_theta = math.atan2(math.sin(theta - self._theta_filt),
-                                     math.cos(theta - self._theta_filt))
-                t_new = self._theta_filt + self.alpha_yaw * d_theta
-                self._theta_filt = math.atan2(math.sin(t_new), math.cos(t_new))
-            x_use, y_use, theta_use = self._x_filt, self._y_filt, self._theta_filt
-        else:
-            self._pose_filt_init = False
-            x_use, y_use, theta_use = x, y, theta
-        self.position_in_map = np.array([x_use, y_use, theta_use])[np.newaxis]
-        ### HJ : end
+        self.position_in_map = np.array([x, y, theta])[np.newaxis]
         ### HJ : store z separately for 3D nearest waypoint search
         self.position_z = data.pose.position.z
         ### HJ : end
