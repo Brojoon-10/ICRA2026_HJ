@@ -65,17 +65,6 @@ class ELRSJoyNode:
         self.last_stats_time = time.time()
         self.stats_printed = False
 
-        ### HJ : settling window after self.connected flips False -> True (i.e. first
-        ### HJ : valid packet following a gap: USB EIO reconnect, failsafe recovery,
-        ### HJ : or initial startup). For settling_sec we keep parsing into
-        ### HJ : self.channels but DO NOT publish to /joy. This drops any post-
-        ### HJ : reconnect burst of bit-corrupted-but-validation-passing frames before
-        ### HJ : they can reach simple_mux and flip buttons[4] (LB) into a fake
-        ### HJ : humandrive switch — the path that breaks autodrive_latched mid-run
-        ### HJ : when the car jolts over a bridge and the USB blips.
-        self.settling_sec = float(rospy.get_param('~settling_sec', 0.2))
-        self.settling_until = 0.0  # epoch seconds; publish when time.time() >= this
-
     def normalize_axis(self, value):
         normalized = (value - self.CH_MID) / (self.NORM_MAX - self.CH_MID)
         normalized = max(-1.0, min(1.0, normalized))
@@ -175,11 +164,7 @@ class ELRSJoyNode:
                 if self.parse_rc_channels(payload):
                     if not self.connected:
                         self.connected = True
-                        ### HJ : arm settling window so simple_mux is shielded from any
-                        ### HJ : burst noise immediately following reconnect/failsafe.
-                        self.settling_until = time.time() + self.settling_sec
-                        rospy.loginfo("CRSF receiver connected! (settling %.0fms)",
-                                      self.settling_sec * 1000.0)
+                        rospy.loginfo("CRSF receiver connected!")
 
             self.buffer = self.buffer[total_size:]
 
@@ -259,11 +244,7 @@ class ELRSJoyNode:
                     self.buffer.extend(data)
                     self.parse_crsf_frame()
 
-                ### HJ : honor settling window. connected=True but publish suppressed
-                ### HJ : until settling_until elapses — simple_mux sees no /joy update
-                ### HJ : during this gap and keeps autodrive_latched from the pre-glitch
-                ### HJ : state, so the car keeps running.
-                if self.connected and time.time() >= self.settling_until:
+                if self.connected:
                     self.publish_joy()
 
                 self.check_failsafe()
