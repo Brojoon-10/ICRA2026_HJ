@@ -15,6 +15,10 @@ Controls (active layer = the layer you act on; toggle with L / R / C keys):
   Drag a SELECTED point   : translate whole selection
                               (Shift held = also translate paired layer = width-preserving)
                               (Ctrl held  = project translation onto local track normal)
+  Middle-button drag      : pan the view (pyqtgraph default).
+  Ctrl + Middle-button    : rotate the VIEW (camera) around the viewport
+    drag                    center. The track data itself is untouched —
+                            only the on-screen orientation changes.
   Right click             : context menu — delete (on a point), or pose_smooth.
                               pose_smooth pivots on the point you right-clicked,
                               or on the last point you dragged. Pick R from the
@@ -388,6 +392,11 @@ class EditorPlot(pg.PlotWidget):
 
         # Hit-test callback set by main window
         self.hit_test = None  # function(scene_pos, pix_radius) -> idx or None
+        ### HJ : view-rotation state — recorded at Ctrl+middle press, used
+        ### each move to apply an incremental QGraphicsView.rotate() around
+        ### the viewport center. Cleared on release.
+        self._view_rot_center = None       # QPoint, viewport center at press
+        self._view_rot_last_angle = 0.0    # degrees, atan2 angle of last move
 
     def _scene_to_data(self, scene_pos):
         vb = self.getPlotItem().getViewBox()
@@ -423,7 +432,21 @@ class EditorPlot(pg.PlotWidget):
             ev.accept()
             return
         elif ev.button() == QtCore.Qt.MiddleButton:
-            # let pyqtgraph handle pan
+            ### HJ : Ctrl + Middle-button drag = rotate the VIEW (camera)
+            ### around the viewport center. Plain middle-button drag stays
+            ### as pyqtgraph's pan. Implemented via QGraphicsView.rotate()
+            ### on each move, with the angle delta computed from atan2 of
+            ### the cursor relative to the viewport center.
+            ctrl_held = bool(ev.modifiers() & QtCore.Qt.ControlModifier)
+            if ctrl_held:
+                import math
+                self._press_scene = ev.pos()
+                self._view_rot_center = self.viewport().rect().center()
+                d = ev.pos() - self._view_rot_center
+                self._view_rot_last_angle = math.degrees(math.atan2(d.y(), d.x()))
+                self._mode = 'maybe_view_rotate'
+                ev.accept()
+                return
             super().mousePressEvent(ev)
             return
         super().mousePressEvent(ev)
@@ -448,6 +471,26 @@ class EditorPlot(pg.PlotWidget):
                      data_pt.y() - self._last_drag_data.y())
             self._last_drag_data = data_pt
             self.sigDragMove.emit(delta, ev.modifiers())
+            ev.accept()
+            return
+        if self._mode == 'maybe_view_rotate':
+            if (ev.pos() - self._press_scene).manhattanLength() > 3:
+                self._mode = 'view_rotate'
+            else:
+                ev.accept()
+                return
+        if self._mode == 'view_rotate':
+            import math
+            d = ev.pos() - self._view_rot_center
+            angle = math.degrees(math.atan2(d.y(), d.x()))
+            delta = angle - self._view_rot_last_angle
+            ### HJ : QGraphicsView.rotate() rotates the view transform by
+            ### the given degrees (positive = CW in screen space). This
+            ### turns the whole scene (track + axes) — exactly the "spin
+            ### the camera" gesture the user wants. Pan/zoom still work in
+            ### the rotated frame after release.
+            self.rotate(delta)
+            self._view_rot_last_angle = angle
             ev.accept()
             return
         super().mouseMoveEvent(ev)
@@ -475,6 +518,12 @@ class EditorPlot(pg.PlotWidget):
                 self.sigDragEnd.emit()
                 self._mode = None
                 self._drag_idx = None
+                ev.accept()
+                return
+        if ev.button() == QtCore.Qt.MiddleButton:
+            if self._mode in ('view_rotate', 'maybe_view_rotate'):
+                self._mode = None
+                self._view_rot_center = None
                 ev.accept()
                 return
         super().mouseReleaseEvent(ev)
@@ -2508,7 +2557,55 @@ class BoundaryEditor(QtWidgets.QMainWindow):
 
     def _on_pipeline_done(self, summary):
         self.statusBar().showMessage(f'Pipeline finished — {summary}')
+        ### HJ : auto-viz of the smoothed result, mirroring what
+        ### planner/.../track_processing/plot_track.py does
+        ### (Track3D.visualize(threeD=True)). Spawned as a subprocess so
+        ### matplotlib runs in its own process and doesn't fight Qt's main
+        ### loop. Skipped if the smoothed CSV wasn't produced (e.g. pipeline
+        ### only ran gen3D).
+        try:
+            self._spawn_smoothed_viz()
+        except Exception as e:
+            self.statusBar().showMessage(
+                f'Pipeline finished but viz spawn failed: {e}')
         QtWidgets.QMessageBox.information(self, 'Pipeline finished', summary)
+
+    def _spawn_smoothed_viz(self):
+        """Open Track3D.visualize(threeD=True) on the smoothed CSV in a
+        separate Python process. Non-blocking — the editor stays usable."""
+        import subprocess
+        p = self._pipeline_paths()
+        smoothed = p.get('smoothed_csv')
+        if not smoothed or not os.path.exists(smoothed):
+            return
+        # Resolve the Track3D src dir the same way _import_track3d does, so
+        # the subprocess can `from track3D import Track3D` regardless of ROS.
+        candidates = []
+        try:
+            import rospkg
+            candidates.append(os.path.join(
+                rospkg.RosPack().get_path('global_line_3d'), 'src'))
+        except Exception:
+            pass
+        here = os.path.dirname(os.path.abspath(__file__))
+        race_stack_root = os.path.dirname(os.path.dirname(here))
+        candidates.append(os.path.join(
+            race_stack_root, 'planner', '3d_gb_optimizer',
+            'global_line', 'src'))
+        t3d_dir = next((d for d in candidates if os.path.isdir(d)), None)
+        if t3d_dir is None:
+            self.statusBar().showMessage(
+                'Smoothed viz skipped: track3D.py path not resolvable.')
+            return
+        code = (
+            'import sys, os; '
+            f'sys.path.insert(0, {t3d_dir!r}); '
+            'from track3D import Track3D; '
+            f'Track3D(path={smoothed!r}).visualize(threeD=True)'
+        )
+        subprocess.Popen([sys.executable, '-c', code])
+        self.statusBar().showMessage(
+            f'Smoothed viz launched on {os.path.basename(smoothed)}.')
 
     def _on_pipeline_failed(self, err):
         self.statusBar().showMessage(f'Pipeline failed: {err}')
