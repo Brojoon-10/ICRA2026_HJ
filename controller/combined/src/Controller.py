@@ -13,7 +13,6 @@ from steering_lookup.lookup_steer_angle import LookupSteerAngle
 import rospy
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
-from std_msgs.msg import String  ### HJ : state-noise filter debug topic
 
 # ===== HJ ADDED: Global flag for differential trailing control for static sector obstacles =====
 
@@ -177,6 +176,9 @@ class Controller:
         self.accel_lim_ay_max = rospy.get_param('L1_controller/accel_lim_ay_max', 4.5)
         self.accel_lim_horizon = rospy.get_param('L1_controller/accel_lim_horizon', 0.3)
         self.accel_lim_lookahead = rospy.get_param('L1_controller/accel_lim_lookahead', 0.3)
+        self.accel_lim_activate_speed_thres = rospy.get_param('L1_controller/accel_lim_activate_speed_thres', 2.0)
+        self.accel_lim_deactivate_gap_thres = rospy.get_param('L1_controller/accel_lim_deactivate_gap_thres', 1.0)
+        self._accel_lim_active = False  # hysteresis state
         ### HJ : end
 
         ### HJ : raceline-deceleration curvature boost
@@ -629,7 +631,22 @@ class Controller:
         #                     the loop dt leaves VESC's inner loop enough
         #                     headroom to chase at full throttle.
         # Friction ellipse: (ay/ay_max)^2 + (ax/ax_max)^2 <= 1
-        if self.accel_limiter_enabled and speed_command > cur_speed:
+        ### HJ : hysteresis start-phase gate
+        # OFF -> ON: cur_speed <= activate_speed_thres AND gap > deactivate_gap_thres
+        # ON  -> OFF: gap <= deactivate_gap_thres (target reached)
+        # Anti-flap: activation requires both low cur_speed AND large gap.
+        gap = speed_command - cur_speed
+        if not self._accel_lim_active:
+            if (cur_speed <= self.accel_lim_activate_speed_thres
+                and gap > self.accel_lim_deactivate_gap_thres):
+                self._accel_lim_active = True
+        else:
+            if gap <= self.accel_lim_deactivate_gap_thres:
+                self._accel_lim_active = False
+
+        if (self.accel_limiter_enabled
+            and speed_command > cur_speed
+            and self._accel_lim_active):
             kappa_now = abs(self.waypoint_array_in_map[self.idx_nearest_waypoint, 6])
 
             # accel_lim_lookahead > 0: find waypoint at (position + v * T) for kappa_ref
@@ -1007,61 +1024,14 @@ class Controller:
         if not hasattr(self, 'prev_heading_error'):
             self.prev_heading_error = heading_error
 
-        ### HJ : state-noise filter — toggled D-term re-formulation
-        # Default OFF: identical to legacy pipeline (finite-diff derivative).
-        # ON: D = KD * (v * kappa_L1 - yaw_rate), no finite-diff noise amplification.
-        filter_on = getattr(self, 'filter_state_noise', False)
-        omega_target = 0.0
-        omega_meas = 0.0
-        kappa_L1 = 0.0
-        d_signal_legacy = 0.0
-        d_signal_model = 0.0
-
         if use_pid:
             self.heading_error_integral += heading_error * dt
             derivative = (heading_error - self.prev_heading_error) / dt if dt > 0 else 0.0
             self.prev_heading_error = heading_error
-            d_signal_legacy = derivative
 
-            if filter_on:
-                # L1 absolute point = future_position + L1_vector (caller passes Future_L1_vector)
-                try:
-                    L1_point_abs = self.future_position[0, :2] + np.asarray(L1_vector[:2])
-                    idx_L1 = self.nearest_waypoint(L1_point_abs, self.waypoint_array_in_map[:, :2])
-                    kappa_L1 = float(self.waypoint_array_in_map[idx_L1, 6])
-                except Exception:
-                    kappa_L1 = 0.0
-                kappa_sign = getattr(self, 'kappa_sign', 1)
-                omega_target = float(speed) * kappa_sign * kappa_L1
-                omega_meas = float(getattr(self, 'yaw_rate', 0.0))
-                d_signal_model = omega_target - omega_meas
-                correction = (dynamic_gain * heading_error
-                              + self.KI * self.heading_error_integral
-                              + self.KD * d_signal_model)
-            else:
-                correction = (dynamic_gain * heading_error
-                              + self.KI * self.heading_error_integral
-                              + self.KD * derivative)
+            correction = dynamic_gain * heading_error + self.KI * self.heading_error_integral + self.KD * derivative
         else:
             correction = dynamic_gain * heading_error
-
-        # Lazy-init debug publisher; publish only when filter is on (avoid topic spam by default)
-        if filter_on:
-            if not hasattr(self, '_state_filter_debug_pub'):
-                self._state_filter_debug_pub = rospy.Publisher(
-                    '/controller/state_filter_debug', String, queue_size=10)
-            try:
-                payload = (
-                    '{{"filter_on":1,"heading_error":{he:.4f},"omega_target":{ot:.4f},'
-                    '"omega_meas":{om:.4f},"kappa_L1":{kp:.4f},"d_signal_model":{ds:.4f},'
-                    '"d_signal_legacy":{dl:.4f},"correction":{co:.4f}}}'
-                ).format(he=float(heading_error), ot=omega_target, om=omega_meas,
-                         kp=kappa_L1, ds=d_signal_model, dl=d_signal_legacy,
-                         co=float(correction))
-                self._state_filter_debug_pub.publish(payload)
-            except Exception:
-                pass
-        ### HJ : end
 
         return correction
     
