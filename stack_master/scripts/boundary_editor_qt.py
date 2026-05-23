@@ -545,12 +545,18 @@ class _PipelineThread(QtCore.QThread):
     done = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, track3d_cls, steps, weights, step_size, parent=None):
+    def __init__(self, track3d_cls, steps, weights, step_size,
+                 seam_origin=None, parent=None):
         super().__init__(parent)
         self._cls = track3d_cls
         self._steps = list(steps)
         self._weights = dict(weights)
         self._step_size = float(step_size)
+        ### HJ : optional (x, y, yaw) — when set, the smoothed CSV produced
+        ###      by the 'smooth' step is rolled so the row closest to this
+        ###      pose becomes the new s=0 row. No-op when None.
+        self._seam_origin = seam_origin
+        ### HJ : end
 
     def run(self):
         import time
@@ -602,6 +608,17 @@ class _PipelineThread(QtCore.QThread):
                         out_path=out_path, weights=self._weights,
                         in_path=in_path, step_size=self._step_size,
                         visualize=False)
+                    ### HJ : optional post-smooth roll to the user-picked
+                    ###      seam origin. Runs in this thread so the
+                    ###      pipeline only reports 'done' once the CSV on
+                    ###      disk reflects the chosen s=0.
+                    if self._seam_origin is not None:
+                        sx, sy, syaw = self._seam_origin
+                        self.progress.emit(
+                            f'roll smoothed CSV → seam ({sx:.2f}, {sy:.2f}, '
+                            f'yaw={np.degrees(syaw):.0f}°) …')
+                        self._roll_smoothed_csv(out_path, self._seam_origin)
+                    ### HJ : end
                 else:
                     raise ValueError(f'Unknown pipeline step: {kind}')
                 outs.append((kind, out_path, time.time() - t0))
@@ -613,6 +630,102 @@ class _PipelineThread(QtCore.QThread):
         except Exception as e:
             import traceback
             self.failed.emit(f'{type(e).__name__}: {e}\n\n{traceback.format_exc()}')
+
+    ### HJ : post-smooth roll. Reads the freshly written smoothed CSV
+    ###      (closed loop: last row duplicates the first), finds the row
+    ###      closest to (seam_x, seam_y) with a heading filter against
+    ###      seam_yaw, then rolls the body so that row becomes s=0. The
+    ###      arc-length column s_m and all ds-derivative columns
+    ###      (dtheta_radpm, dmu_radpm, dphi_radpm, omega_z_radpm) are
+    ###      recomputed against the new ordering. Per-row attributes
+    ###      (x, y, z, theta, mu, phi, w_tr_left/right, omega_x/y) just
+    ###      travel with the row and need no recompute. The loop closure
+    ###      row at the tail is rebuilt so downstream Track3D consumers
+    ###      keep working unchanged. Original CSV is backed up once to
+    ###      *.preroll.bak so the roll can be undone manually.
+    @staticmethod
+    def _roll_smoothed_csv(csv_path, seam_origin):
+        import pandas as pd  # heavy import deferred to pipeline time
+        sx, sy, syaw = seam_origin
+        df = pd.read_csv(csv_path)
+        n = len(df)
+        if n < 4:
+            return  # nothing sensible to do
+
+        # Closed loop iff the tail row duplicates the head row (positionally).
+        closed = (
+            abs(df['x_m'].iloc[-1] - df['x_m'].iloc[0]) < 1e-6 and
+            abs(df['y_m'].iloc[-1] - df['y_m'].iloc[0]) < 1e-6
+        )
+        N = n - 1 if closed else n  # unique row count
+
+        # Closest row by 2D distance, with heading used only as a coarse
+        # direction filter (rules out rows whose tangent points the wrong
+        # way along the loop). Using heading as a fine tiebreaker pulls
+        # the pick toward neighbors when the user-supplied yaw has any
+        # noise, so we keep it deliberately loose.
+        xy = df[['x_m', 'y_m']].iloc[:N].values
+        d2 = (xy[:, 0] - sx) ** 2 + (xy[:, 1] - sy) ** 2
+        theta = df['theta_rad'].iloc[:N].values
+        err = (theta - syaw + np.pi) % (2 * np.pi) - np.pi
+        # |err| < 90° = same travel direction. On non-self-crossing loops
+        # this filter is a no-op everywhere except possible near misses
+        # where the boundary brushes itself in the opposite direction.
+        mask_dir = np.abs(err) < (np.pi / 2.0)
+        if not mask_dir.any():
+            mask_dir = np.ones_like(mask_dir, dtype=bool)
+        d2_masked = np.where(mask_dir, d2, np.inf)
+        k = int(np.argmin(d2_masked))
+        if k == 0:
+            return  # already aligned, nothing to roll
+
+        # Roll unique rows [0..N-1] → [k..N-1, 0..k-1].
+        rolled = pd.concat(
+            [df.iloc[k:N], df.iloc[:k]], ignore_index=True)
+
+        # Recompute s_m as cumulative arc length from the new row 0.
+        xyz = rolled[['x_m', 'y_m', 'z_m']].values
+        seg = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
+        s_new = np.concatenate([[0.0], np.cumsum(seg)])
+        rolled['s_m'] = s_new
+
+        # Recompute ds-derivatives against the new ordering. theta needs
+        # unwrap because pi-crossings appear at arbitrary rows after a
+        # roll. The last entry duplicates the prior step so the array
+        # length matches; the closure row that we append next overwrites
+        # any visible discontinuity at the tail anyway.
+        def _arc_deriv(values, unwrap=False):
+            v = np.unwrap(values) if unwrap else np.asarray(values, dtype=float)
+            d = np.diff(v) / seg
+            return np.concatenate([d, d[-1:]])
+
+        if 'dtheta_radpm' in rolled.columns:
+            rolled['dtheta_radpm'] = _arc_deriv(
+                rolled['theta_rad'].values, unwrap=True)
+        if 'dmu_radpm' in rolled.columns:
+            rolled['dmu_radpm'] = _arc_deriv(rolled['mu_rad'].values)
+        if 'dphi_radpm' in rolled.columns:
+            rolled['dphi_radpm'] = _arc_deriv(rolled['phi_rad'].values)
+        # Track3D treats omega_z as dtheta/ds — keep the two columns in sync.
+        if 'omega_z_radpm' in rolled.columns:
+            rolled['omega_z_radpm'] = _arc_deriv(
+                rolled['theta_rad'].values, unwrap=True)
+
+        # Restore loop closure at the tail so downstream readers
+        # (Track3D's `concatenate_arr`, the velocity planner, etc.) see
+        # the same shape they always have.
+        if closed:
+            closing_seg = float(np.linalg.norm(xyz[0] - xyz[-1]))
+            last_row = rolled.iloc[[0]].copy().reset_index(drop=True)
+            last_row['s_m'] = float(s_new[-1] + closing_seg)
+            rolled = pd.concat([rolled, last_row], ignore_index=True)
+
+        # One-shot backup so a wrong seam pick is recoverable.
+        bak = csv_path + '.preroll.bak'
+        if not os.path.exists(bak):
+            shutil.copy2(csv_path, bak)
+        rolled.to_csv(csv_path, index=False, float_format='%.6f')
+    ### HJ : end
 
 
 # ----------------------------- Main window -----------------------------
@@ -656,6 +769,16 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         # Active preview pivot — set while the right-click menu is open so that
         # slider/spinbox/wheel changes update the highlighted window in place.
         self._preview_pivot = None
+
+        ### HJ : seam-origin for rolling the smoothed CSV after Run Pipeline.
+        ###      Right-click any point → 'Set as start point' stores
+        ###      (x, y, yaw) here. Stored as a physical pose (not an index)
+        ###      so it survives the smoothing resample — the actual
+        ###      closest-row search is done on the smoothed CSV at
+        ###      pipeline-end (see _PipelineThread._roll_smoothed_csv).
+        self._seam_origin = None
+        self._seam_origin_idx = None
+        ### HJ : end
 
         self.setWindowTitle(f'Boundary Editor — {os.path.basename(csv_path)}')
         self.resize(1400, 900)
@@ -830,10 +953,28 @@ class BoundaryEditor(QtWidgets.QMainWindow):
             pen=pg.mkPen((255, 30, 30), width=2.5),
             brush=pg.mkBrush(255, 30, 30, 80),
             size=20, symbol='x', pxMode=True)
+        ### HJ : seam-origin marker — gold circle at the picked centerline
+        ### point + a 1.5 m arrow that points in the centerline tangent
+        ### direction (yaw). The circle is used instead of a 'star' symbol
+        ### because pyqtgraph's star points up regardless of data and
+        ### misled the eye into thinking the heading was pinned at 90°.
+        ### The arrow is a single 3-segment polyline (shaft + chevron
+        ### head) drawn in 'pairs' connect mode so each pair of points is
+        ### an independent segment.
+        self.scatter_seam = pg.ScatterPlotItem(
+            pen=pg.mkPen((255, 200, 0), width=2.5),
+            brush=pg.mkBrush(255, 200, 0, 220),
+            size=14, symbol='o')
+        self.line_seam_heading = self.plot.plot(
+            [], [], pen=pg.mkPen((255, 200, 0), width=4.0),
+            connect='pairs')
+        ### HJ : end
         for it in (self.scatter_left, self.scatter_right, self.scatter_center,
                    self.scatter_err_heat, self.scatter_err_top,
                    self.scatter_sel, self.scatter_preview, self.scatter_preview_pivot,
-                   self.scatter_cross):
+                   self.scatter_cross,
+                   ### HJ : seam marker
+                   self.scatter_seam):
             self.plot.addItem(it)
 
         # Plot signals
@@ -1008,6 +1149,12 @@ class BoundaryEditor(QtWidgets.QMainWindow):
             self.state['raw_data'].copy(),
             self.state['dirty'].copy(),
             self.state['n'],
+            ### HJ : carry the seam-origin so U also undoes a 'Set as start
+            ###      point' (or a clear). Tuples are immutable so a shallow
+            ###      reference is fine.
+            self._seam_origin,
+            self._seam_origin_idx,
+            ### HJ : end
         ))
         if len(self.history) > 50:
             self.history.pop(0)
@@ -1016,10 +1163,21 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         if not self.history:
             self.statusBar().showMessage('Nothing to undo')
             return
-        L, R, C, raw, dirty, n = self.history.pop()
+        snap = self.history.pop()
+        ### HJ : tolerate pre-seam history entries (older snapshots saved
+        ###      before the seam was added) so re-running the editor on an
+        ###      in-memory session doesn't crash on length mismatch.
+        L, R, C, raw, dirty, n = snap[:6]
+        seam = snap[6] if len(snap) > 6 else None
+        seam_idx = snap[7] if len(snap) > 7 else None
+        ### HJ : end
         self.state['left'] = L; self.state['right'] = R; self.state['center'] = C
         self.state['raw_data'] = raw; self.state['dirty'] = dirty; self.state['n'] = n
         self.selected = {i for i in self.selected if i < n}
+        ### HJ : restore seam-origin alongside the boundary state
+        self._seam_origin = seam
+        self._seam_origin_idx = seam_idx
+        ### HJ : end
         self._refresh()
         self.statusBar().showMessage(f'Undo. {self._status_text()}')
 
@@ -1073,6 +1231,35 @@ class BoundaryEditor(QtWidgets.QMainWindow):
             self.scatter_cross.setData(cx_x, cx_y)
         else:
             self.scatter_cross.setData([], [])
+
+        ### HJ : seam-origin marker refresh — circle + heading arrow.
+        ###      Arrow is a 3-segment polyline (shaft + 2 chevron arms)
+        ###      drawn in 'pairs' connect mode so direction is visually
+        ###      unambiguous even when the boundary widths overlap the
+        ###      arrow path. Shaft length 1.5 m is roughly 3× the
+        ###      typical F1TENTH track-width so the arrow is always
+        ###      longer than the circle marker even at zoomed-out scales.
+        if self._seam_origin is not None:
+            sx, sy, syaw = self._seam_origin
+            self.scatter_seam.setData([sx], [sy])
+            shaft_len = 1.5
+            chevron_len = 0.4
+            # 30° interior angle ⇒ chevron arms point 150° back from
+            # the shaft direction (i.e. away from the tip).
+            chev = np.deg2rad(150.0)
+            ex = sx + shaft_len * np.cos(syaw)
+            ey = sy + shaft_len * np.sin(syaw)
+            lx = ex + chevron_len * np.cos(syaw + chev)
+            ly = ey + chevron_len * np.sin(syaw + chev)
+            rx = ex + chevron_len * np.cos(syaw - chev)
+            ry = ey + chevron_len * np.sin(syaw - chev)
+            xs = [sx, ex, ex, lx, ex, rx]
+            ys = [sy, ey, ey, ly, ey, ry]
+            self.line_seam_heading.setData(xs, ys)
+        else:
+            self.scatter_seam.setData([], [])
+            self.line_seam_heading.setData([], [])
+        ### HJ : end
 
         self.sel_label.setText(str(len(self.selected)))
         self.statusBar().showMessage(self._status_text())
@@ -1185,6 +1372,53 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         self._delete_indices([idx])
         self.statusBar().showMessage(f'Deleted index {idx}. {self._status_text()}')
 
+    ### HJ : seam-origin helpers — pick a centerline row to become the s=0
+    ###      seam in the smoothed CSV produced by Run Pipeline. We store the
+    ###      physical pose (x, y, yaw) rather than the editor's row index so
+    ###      that the choice survives smoothing's resample (row count and
+    ###      step size both change between the editor's CSV and the
+    ###      pipeline output). yaw is the centerline tangent at idx,
+    ###      computed wrap-aware so it stays correct at the loop seam.
+    def _compute_seam_origin_at(self, idx):
+        C = self.state['center']
+        if self.wrap_around:
+            n_eff = self._n_effective
+            i_prev = (idx - 1) % n_eff
+            i_next = (idx + 1) % n_eff
+        else:
+            i_prev = max(0, idx - 1)
+            i_next = min(len(C) - 1, idx + 1)
+        dx = float(C[i_next, 0] - C[i_prev, 0])
+        dy = float(C[i_next, 1] - C[i_prev, 1])
+        yaw = float(np.arctan2(dy, dx))
+        return float(C[idx, 0]), float(C[idx, 1]), yaw
+
+    def _set_seam_origin(self, idx):
+        ### HJ : snapshot before mutating so U undoes the start-point pick.
+        ###      _push_history captures _seam_origin + _seam_origin_idx
+        ###      alongside the boundary state, so the same Undo button
+        ###      also rolls the marker back.
+        self._push_history()
+        ### HJ : end
+        x, y, yaw = self._compute_seam_origin_at(idx)
+        self._seam_origin = (x, y, yaw)
+        self._seam_origin_idx = int(idx)
+        self.statusBar().showMessage(
+            f'Start point set: idx={idx} ({x:.2f}, {y:.2f}, '
+            f'yaw={np.degrees(yaw):.0f}°). '
+            'Run Pipeline rolls the smoothed CSV to this point.')
+        self._refresh()
+
+    def _clear_seam_origin(self):
+        ### HJ : snapshot so U undoes the clear, restoring the prior pick.
+        self._push_history()
+        ### HJ : end
+        self._seam_origin = None
+        self._seam_origin_idx = None
+        self.statusBar().showMessage('Start point cleared.')
+        self._refresh()
+    ### HJ : end
+
     # ---------- context menu ----------
     def _on_context_menu(self, idx, global_pos):
         """Unified right-click menu — mirrors pub_track's pose_smooth flow.
@@ -1204,6 +1438,22 @@ class BoundaryEditor(QtWidgets.QMainWindow):
         if idx is not None:
             act_del = menu.addAction(f'Delete point {idx}')
             act_del.triggered.connect(lambda _=False, i=idx: self._on_point_right_click(i))
+
+            ### HJ : seam-origin set/clear — pick this row as the s=0 seam
+            ### that the smoothed CSV will be rolled to at the end of Run
+            ### Pipeline. yaw is the centerline tangent at idx so the
+            ### closest-row search in the smoothed CSV stays unambiguous
+            ### even on tracks where two segments pass near each other.
+            sx_, sy_, syaw_ = self._compute_seam_origin_at(idx)
+            act_seam = menu.addAction(
+                f'Set as start point  (idx={idx}, yaw={np.degrees(syaw_):.0f}°)')
+            act_seam.triggered.connect(
+                lambda _=False, i=idx: self._set_seam_origin(i))
+            if self._seam_origin is not None:
+                act_clear_seam = menu.addAction('Clear start point')
+                act_clear_seam.triggered.connect(self._clear_seam_origin)
+            ### HJ : end
+
             menu.addSeparator()
 
         ### HJ : Insert new point at the right-click position. Always shown
@@ -2500,7 +2750,13 @@ class BoundaryEditor(QtWidgets.QMainWindow):
             f'Pipeline starting on {os.path.basename(self.csv_path)} …')
 
         thread = _PipelineThread(track3d_cls, steps,
-                                 self.PIPELINE_WEIGHTS, step_size, parent=self)
+                                 self.PIPELINE_WEIGHTS, step_size,
+                                 ### HJ : forward optional seam-origin so
+                                 ###      the smoothed CSV is rolled at the
+                                 ###      end of the smooth step.
+                                 seam_origin=self._seam_origin,
+                                 ### HJ : end
+                                 parent=self)
         thread.progress.connect(self._on_pipeline_progress)
         thread.done.connect(self._on_pipeline_done)
         thread.failed.connect(self._on_pipeline_failed)
