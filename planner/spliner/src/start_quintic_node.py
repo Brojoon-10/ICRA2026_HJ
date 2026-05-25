@@ -107,21 +107,33 @@ class StartQuinticNode:
         x = np.array([w.x_m for w in msg.wpnts])
         y = np.array([w.y_m for w in msg.wpnts])
         z = np.array([w.z_m for w in msg.wpnts])
-        self.gb_d_left = np.array([w.d_left for w in msg.wpnts])
-        self.gb_d_right = np.array([w.d_right for w in msg.wpnts])
+        d_left = np.array([w.d_left for w in msg.wpnts])
+        d_right = np.array([w.d_right for w in msg.wpnts])
 
-        # Build / rebuild FrenetConverter only if waypoint count changed (cheap to skip).
-        first_build = self.converter is None
-        if first_build or len(self.converter.waypoints_x) != len(x):
-            self.converter = FrenetConverter(x, y, z)
+        # Build the FrenetConverter into a LOCAL var first; only commit to self.*
+        # at the end. self.converter is assigned LAST so the main loop's
+        # 'if self.converter is None' check acts as a real ready-gate — when it
+        # passes, gb_max_s / gb_s / gb_wpnt_dist are guaranteed already set.
+        # (Race observed before fix: gb_cb finished setting self.converter and
+        # logged 'FrenetConverter built', then GIL yielded to the main thread
+        # *before* gb_max_s assignment ran, so np.mod(s, None) crashed.)
+        if self.converter is None or len(self.converter.waypoints_x) != len(x):
+            converter = FrenetConverter(x, y, z)
             rospy.loginfo(f"[{self.name}] FrenetConverter built: {len(x)} wpnts, "
-                          f"raceline_length={self.converter.raceline_length:.2f}m, "
-                          f"d_left range=[{self.gb_d_left.min():.2f}, {self.gb_d_left.max():.2f}]m, "
-                          f"d_right range=[{self.gb_d_right.min():.2f}, {self.gb_d_right.max():.2f}]m")
-        self.gb_s = self.converter.waypoints_s
+                          f"raceline_length={converter.raceline_length:.2f}m, "
+                          f"d_left range=[{d_left.min():.2f}, {d_left.max():.2f}]m, "
+                          f"d_right range=[{d_right.min():.2f}, {d_right.max():.2f}]m")
+        else:
+            converter = self.converter
+
+        # Stage all derived fields, then publish self.converter as the gate.
+        self.gb_d_left = d_left
+        self.gb_d_right = d_right
+        self.gb_s = converter.waypoints_s
         self.gb_x, self.gb_y, self.gb_z = x, y, z
-        self.gb_max_s = float(self.converter.raceline_length)
-        self.gb_wpnt_dist = float(self.converter.waypoints_distance_m)
+        self.gb_max_s = float(converter.raceline_length)
+        self.gb_wpnt_dist = float(converter.waypoints_distance_m)
+        self.converter = converter   # LAST: ready gate for main loop
 
     def odom_cb(self, msg: Odometry):
         first = self.cur_x is None
