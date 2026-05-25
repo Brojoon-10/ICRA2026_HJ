@@ -1,9 +1,15 @@
 # IY 2026-05-17 : FBGA C++ runner, extracted from
 # stack_master/scripts/fbga_velocity_planner.py.
+# IY 2026-05-25 : added pybind11 native module path (fbga_native).
+#   When fbga_native.so is built (libs/FBGA/bin/), run_once skips the
+#   subprocess+CSV round-trip and calls FWBW in-process. params/gg.bin are
+#   loaded ONCE in FBGANative ctor instead of every solve.
+#   Env var FBGA_DISABLE_NATIVE=1 forces the legacy subprocess path.
 from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import struct
 import numpy as np
@@ -14,6 +20,24 @@ try:
     HAS_SCIPY_SG = True
 except ImportError:
     HAS_SCIPY_SG = False
+
+
+# IY 2026-05-25 : best-effort import of fbga_native.so. The .so lives next to
+# the exe under libs/FBGA/bin/. We add that directory to sys.path so a plain
+# `import fbga_native` works without site-packages install.
+def _try_import_fbga_native(fbga_bin_path: str):
+    """Return the fbga_native module or None. fbga_bin_path is the exe path;
+    the .so is expected as <dirname(exe)>/fbga_native.cpython-*.so."""
+    if os.environ.get('FBGA_DISABLE_NATIVE', '') == '1':
+        return None
+    so_dir = os.path.dirname(os.path.abspath(fbga_bin_path))
+    if so_dir not in sys.path:
+        sys.path.insert(0, so_dir)
+    try:
+        import fbga_native  # noqa: F401
+        return fbga_native
+    except Exception:
+        return None
 
 
 class FBGARunner:
@@ -73,6 +97,26 @@ class FBGARunner:
         self.slope_brake_vmax      = float(slope_brake_vmax)
 
         self.g_min, self.g_max = self._read_g_range()
+
+        # IY 2026-05-25 : try native pybind11 module. If available, run_once
+        # calls native.solve() directly (no subprocess, no CSV). Otherwise
+        # fall back silently to the exe path.
+        self._native_mod = _try_import_fbga_native(self.fbga_bin)
+        self._native_inst = None
+        if self._native_mod is not None:
+            try:
+                self._native_inst = self._native_mod.FBGANative(
+                    params_path=self.params_txt,
+                    gg_path=self.gg_bin)
+                self._log(f"[FBGARunner] using fbga_native (no subprocess)  "
+                          f"so={getattr(self._native_mod, '__file__', '?')}")
+            except Exception as e:
+                self._log(f"[FBGARunner] fbga_native init failed, "
+                          f"falling back to exe: {e}")
+                self._native_inst = None
+        else:
+            self._log("[FBGARunner] fbga_native module unavailable, using exe")
+
         self._log(f"[FBGARunner] ready bin={self.fbga_bin} gg={self.gg_bin}")
 
     # gg.bin / params helpers (identical to fbga_velocity_planner.py)
@@ -97,8 +141,9 @@ class FBGARunner:
     # are multiplied by gg_scale; everything else is copied unchanged. The
     # source folder is never modified.
     def _materialize_scaled_gg(self, source_gg_bin, scale):
-        if abs(scale - 1.0) < 1e-9:
-            return source_gg_bin  # default path: reuse source as-is
+        # IY 2026-05-25 : always snapshot (incl. scale==1.0) — isolate runtime source edits.
+        # if abs(scale - 1.0) < 1e-9:
+        #     return source_gg_bin  # default path: reuse source as-is
 
         src_velocity = os.path.dirname(source_gg_bin)        # .../<vehicle>/velocity_frame
         src_vehicle  = os.path.dirname(src_velocity)         # .../<vehicle>
@@ -219,7 +264,27 @@ class FBGARunner:
         return mu, dmu_ds
 
     def run_once(self, s, kappa, g_tilde, mu, dmu_ds, v0, timeout_s=10.0):
-        """One FBGA exe invocation. Returns (v, ax) arrays or None on failure."""
+        """One FBGA invocation. Returns (v, ax) arrays or None on failure.
+        IY 2026-05-25 : native path first (no subprocess); exe is fallback."""
+        # ── native (in-process) path ──
+        if self._native_inst is not None:
+            try:
+                v, ax = self._native_inst.solve(
+                    np.asarray(s,       dtype=np.float64),
+                    np.asarray(kappa,   dtype=np.float64),
+                    np.asarray(g_tilde, dtype=np.float64),
+                    np.asarray(mu,      dtype=np.float64),
+                    np.asarray(dmu_ds,  dtype=np.float64),
+                    float(v0),
+                    float(self.bridge_effect),   # slope_corr
+                )
+                return v, ax
+            except Exception as e:
+                self._log(f"[FBGARunner] native solve raised {type(e).__name__}: {e}; "
+                          f"falling back to exe for this call")
+                # fall through to exe path
+
+        # ── legacy exe path (subprocess + CSV) ──
         input_csv  = os.path.join(tempfile.gettempdir(), 'fbga_input.csv')
         output_csv = os.path.join(tempfile.gettempdir(), 'fbga_output.csv')
 
@@ -332,17 +397,58 @@ class FBGARunner:
         v_new = np.minimum(v_new, self.v_max)
         return v_new, ax_new
 
+    def refresh_from_disk(self):
+        """IY 2026-05-25 : re-pack gg.bin from .npy + rebuild native instance.
+        Used by /fbga/reload after gg_tuner regenerates GGV. No launch restart.
+        Returns True on success. On native rebuild failure, the old instance
+        is kept (atomic swap)."""
+        try:
+            self.gg_bin = self._materialize_scaled_gg(self.gg_bin_source, self.gg_scale)
+            self._convert_params_yml(self.params_yml)
+            self.g_min, self.g_max = self._read_g_range()
+        except Exception as e:
+            self._log(f"[FBGARunner] refresh_from_disk: materialise failed: {e}")
+            return False
+
+        if self._native_mod is None:
+            self._log("[FBGARunner] refresh_from_disk: exe mode, files updated")
+            return True
+
+        try:
+            new_inst = self._native_mod.FBGANative(
+                params_path=self.params_txt, gg_path=self.gg_bin)
+        except Exception as e:
+            self._log(f"[FBGARunner] refresh_from_disk: native rebuild failed: {e}")
+            return False
+        self._native_inst = new_inst   # atomic swap; refcount keeps old alive for in-flight solve
+        self._log(f"[FBGARunner] refresh_from_disk: native rebuilt (gg={self.gg_bin})")
+        return True
+
     def reload(self, *, gg_bin=None, params_yml=None, **kwargs):
         """Hot-reload paths and runtime knobs (mirrors fbga_velocity_planner reload_cb)."""
-        if gg_bin is not None:
+        gg_changed     = gg_bin is not None
+        params_changed = params_yml is not None and os.path.exists(params_yml)
+        if gg_changed:
             self.gg_bin = gg_bin
             if not os.path.exists(self.gg_bin):
                 self._generate_gg_bin(self.gg_bin)
             self.g_min, self.g_max = self._read_g_range()
-        if params_yml is not None and os.path.exists(params_yml):
+        if params_changed:
             self.params_yml = params_yml
             self._convert_params_yml(params_yml)
         for k, v in kwargs.items():
             if hasattr(self, k):
                 setattr(self, k, v)
+
+        # IY 2026-05-25 : rebuild native instance when gg or params changed so
+        # the in-memory tables stay in sync with the files on disk.
+        if (gg_changed or params_changed) and self._native_mod is not None:
+            try:
+                self._native_inst = self._native_mod.FBGANative(
+                    params_path=self.params_txt, gg_path=self.gg_bin)
+                self._log("[FBGARunner] native reloaded with new gg/params")
+            except Exception as e:
+                self._log(f"[FBGARunner] native reload failed: {e}; "
+                          f"continuing with prior instance")
+
         self._log("[FBGARunner] reloaded")

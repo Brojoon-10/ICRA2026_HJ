@@ -79,6 +79,9 @@
   </node>
 
   <!-- ══════════════════ SECTOR TUNERS (rqt: dyn_sector_tuner/) ══════════════════ -->
+  <!-- ## IY : OLD inlined block — commented out, replaced by include below.
+       speed/overtake/static_obs/velocity_scaler/ot_interpolator 5개만 이동.
+       friction/safety는 gg_tuner 토글, bridge는 아래 standalone 으로 유지.
   <rosparam ns="map_params" command="load"
     file="$(find stack_master)/maps/$(arg map)/speed_scaling.yaml"/>
   <rosparam ns="ot_map_params" command="load"
@@ -90,25 +93,25 @@
     <node pkg="sector_tuner_3d" type="sector_server.py" name="speed" output="screen" />
     <node pkg="overtaking_sector_tuner_3d" type="ot_sector_server.py" name="overtake" output="screen" />
     <node pkg="static_obstacle_sector_tuner_3d" type="static_obs_sector_server.py" name="static_obs" output="screen" />
-    <!-- <node pkg="friction_sector_tuner" type="friction_sector_server.py" name="friction" output="screen" /> -->
-    <!-- ### HJ : bridge sector marker publisher — RViz visualisation of
-         <map>/bridge_sectors.yaml. Missing yaml ⇒ no markers (silent). -->
     <node pkg="bridge_sector_tuner_3d" type="bridge_sector_server.py" name="bridge" output="screen" />
-    <!-- ## IY : safety-distance sector server is spawned on-demand by the
-         gg_tuner Safety group's `safety_sector_setting` toggle (persistent
-         on/off, not always-on). When OFF, no /dyn_sector_tuner/safety node
-         exists and gen_global_racing_line falls back to uniform margin. -->
   </group>
 
-  <!-- Velocity scaler -->
   <node pkg="sector_tuner_3d" type="vel_scaler_node.py" name="velocity_scaler" output="screen">
     <param name="enable_smart_scaling" value="$(arg enable_smart_scaling)" />
     <remap if="$(arg use_local_racing_line)"
            from="/global_waypoints_scaled" to="/global_waypoints_scaled_raw" />
   </node>
 
-  <!-- OT interpolator -->
   <node pkg="overtaking_sector_tuner_3d" type="ot_interpolator.py" name="ot_interpolator" output="screen"/>
+  -->
+  <!-- ## IY : NEW — speed/overtake/static_obs 5개는 include 로, bridge 는 standalone. -->
+  <include file="$(find stack_master)/launch/3d_sector_respawn.launch">
+    <arg name="map"                   value="$(arg map)"/>
+    <arg name="enable_smart_scaling"  value="$(arg enable_smart_scaling)"/>
+    <arg name="use_local_racing_line" value="$(arg use_local_racing_line)"/>
+  </include>
+  <node pkg="bridge_sector_tuner_3d" type="bridge_sector_server.py"
+        name="bridge" ns="dyn_sector_tuner" output="screen"/>
 
   <!-- Local racing line mux (event-triggered) -->
   <group if="$(arg use_local_racing_line)">
