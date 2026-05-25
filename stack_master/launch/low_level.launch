@@ -123,7 +123,7 @@
     <node pkg="stack_master" type="simple_mux.py" name="simple_mux" output="screen">
       <rosparam command="load"
                 file="$(find stack_master)/config/$(env CAR_NAME)/devices/launch_control.yaml"
-                unless="$(eval env('CAR_NAME','') == '')"/>
+                unless="$(eval optenv('CAR_NAME','') == '')"/>
     </node>
   </group>
 
