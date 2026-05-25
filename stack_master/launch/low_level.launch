@@ -117,7 +117,14 @@
       <arg name="racecar_version" value="$(arg racecar_version)" />
     </include>
 
-    <node pkg="stack_master" type="simple_mux.py" name="simple_mux" output="screen"/>
+    <!-- ### HJ : load per-car launch_control.yaml (4-phase exp current profile params).
+         Guarded: if CAR_NAME env is empty (e.g. bench/sim without car identity), skip
+         load so simple_mux falls back to cfg defaults instead of crashing on missing yaml. -->
+    <node pkg="stack_master" type="simple_mux.py" name="simple_mux" output="screen">
+      <rosparam command="load"
+                file="$(find stack_master)/config/$(env CAR_NAME)/devices/launch_control.yaml"
+                unless="$(eval env('CAR_NAME','') == '')"/>
+    </node>
   </group>
 
   <include file="$(find stack_master)/config/$(arg racecar_version)/devices/static_transforms.launch.xml"/>

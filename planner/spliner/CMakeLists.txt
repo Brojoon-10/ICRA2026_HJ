@@ -16,6 +16,7 @@ find_package(catkin REQUIRED COMPONENTS
 
 generate_dynamic_reconfigure_options(
   cfg/dyn_spliner_tuner.cfg
+  cfg/start_quintic.cfg  ### HJ : standalone test node for Frenet quintic start path
 )
 
 ## System dependencies are found with CMake's conventions

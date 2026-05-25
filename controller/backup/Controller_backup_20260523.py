@@ -176,9 +176,6 @@ class Controller:
         self.accel_lim_ay_max = rospy.get_param('L1_controller/accel_lim_ay_max', 4.5)
         self.accel_lim_horizon = rospy.get_param('L1_controller/accel_lim_horizon', 0.3)
         self.accel_lim_lookahead = rospy.get_param('L1_controller/accel_lim_lookahead', 0.3)
-        self.accel_lim_activate_speed_thres = rospy.get_param('L1_controller/accel_lim_activate_speed_thres', 2.0)
-        self.accel_lim_deactivate_gap_thres = rospy.get_param('L1_controller/accel_lim_deactivate_gap_thres', 1.0)
-        self._accel_lim_active = False  # hysteresis state
         ### HJ : end
 
         ### HJ : raceline-deceleration curvature boost
@@ -445,10 +442,10 @@ class Controller:
             if self.K_yr > 0:
                 steering_angle += corr
             applied = "ON " if self.K_yr > 0 else "obs"
-            # rospy.loginfo_throttle(0.3,
-            #     f"[YawFB {applied}] v={v:.2f} δ={steering_angle - (corr if self.K_yr > 0 else 0.0):+.4f} "
-            #     f"K_us={self.K_us:.3f} exp_yr={expected_yr:+.3f} act_yr={self.yaw_rate:+.3f} "
-            #     f"err={yr_error:+.3f} corr_raw={corr_raw:+.4f} corr={corr:+.4f}")
+            rospy.loginfo_throttle(0.3,
+                f"[YawFB {applied}] v={v:.2f} δ={steering_angle - (corr if self.K_yr > 0 else 0.0):+.4f} "
+                f"K_us={self.K_us:.3f} exp_yr={expected_yr:+.3f} act_yr={self.yaw_rate:+.3f} "
+                f"err={yr_error:+.3f} corr_raw={corr_raw:+.4f} corr={corr:+.4f}")
         ### HJ : end
 
         ### HJ : GP steering correction
@@ -631,22 +628,7 @@ class Controller:
         #                     the loop dt leaves VESC's inner loop enough
         #                     headroom to chase at full throttle.
         # Friction ellipse: (ay/ay_max)^2 + (ax/ax_max)^2 <= 1
-        ### HJ : hysteresis start-phase gate
-        # OFF -> ON: cur_speed <= activate_speed_thres AND gap > deactivate_gap_thres
-        # ON  -> OFF: gap <= deactivate_gap_thres (target reached)
-        # Anti-flap: activation requires both low cur_speed AND large gap.
-        gap = speed_command - cur_speed
-        if not self._accel_lim_active:
-            if (cur_speed <= self.accel_lim_activate_speed_thres
-                and gap > self.accel_lim_deactivate_gap_thres):
-                self._accel_lim_active = True
-        else:
-            if gap <= self.accel_lim_deactivate_gap_thres:
-                self._accel_lim_active = False
-
-        if (self.accel_limiter_enabled
-            and speed_command > cur_speed
-            and self._accel_lim_active):
+        if self.accel_limiter_enabled and speed_command > cur_speed:
             kappa_now = abs(self.waypoint_array_in_map[self.idx_nearest_waypoint, 6])
 
             # accel_lim_lookahead > 0: find waypoint at (position + v * T) for kappa_ref
@@ -691,22 +673,16 @@ class Controller:
         self.gap = (self.opponent[0] - self.position_in_map_frenet[0])%self.track_length # gap to opponent
         self.gap_actual = self.gap
         self.gap_should = self.trailing_vel_gain * self.speed_now + self.trailing_gap
-
-        ### HJ : clamp negative opp_vs (tracker sign/noise guard — prevents trailing acceleration blowup)
-        opp_vs_raw = self.opponent[2]
-        opp_vs = max(opp_vs_raw, 0.0)
-        if opp_vs_raw < 0.0:
-            rospy.logwarn_throttle(2.0, f"[trailing] negative opp_vs={opp_vs_raw:.2f} clamped to 0")
-
+ 
         self.gap_error = self.gap_should - self.gap_actual
-        self.v_diff =  self.position_in_map_frenet[2] - opp_vs
+        self.v_diff =  self.position_in_map_frenet[2] - self.opponent[2]
         self.i_gap = np.clip(self.i_gap + self.gap_error/self.loop_rate, -10, 10)
-
+    
         p_value = self.gap_error * self.trailing_p_gain
         d_value = self.v_diff * self.trailing_d_gain
         i_value = self.i_gap * self.trailing_i_gain
-
-        self.trailing_command = np.clip(opp_vs - p_value - i_value - d_value, 0, global_speed)
+ 
+        self.trailing_command = np.clip(self.opponent[2] - p_value - i_value - d_value, 0, global_speed)
         if not self.opponent[4] and self.gap_actual > self.gap_should:
             self.trailing_command = max(self.blind_trailing_speed, self.trailing_command)
  
@@ -776,10 +752,10 @@ class Controller:
             out = self._predictive_correction(steering_angle, signed_d, yaw)
         else:
             out = steering_angle  # 'none' — no correction
-        # rospy.loginfo_throttle(0.5,
-        #     f"[LatCorr] mode={self.lat_correction_mode} "
-        #     f"d={signed_d:+.3f} v={self.speed_now:.2f} "
-        #     f"δ_in={steering_angle:+.4f} δ_out={out:+.4f} Δ={out-steering_angle:+.4f}")
+        rospy.loginfo_throttle(0.5,
+            f"[LatCorr] mode={self.lat_correction_mode} "
+            f"d={signed_d:+.3f} v={self.speed_now:.2f} "
+            f"δ_in={steering_angle:+.4f} δ_out={out:+.4f} Δ={out-steering_angle:+.4f}")
         return out
 
     def _stanley_correction(self, steering_angle, signed_d, yaw):
@@ -1009,36 +985,36 @@ class Controller:
         else:
             heading_error = (heading_error + np.pi) % (2 * np.pi) - np.pi
         # ===== HJ MODIFIED END =====
-
+ 
         if use_filter:
             if not hasattr(self, 'filtered_heading_error'):
                 self.filtered_heading_error = heading_error
             self.filtered_heading_error = alpha * heading_error + (1 - alpha) * self.filtered_heading_error
             heading_error = self.filtered_heading_error
-
+ 
         if speed < v_threshold:
             dynamic_gain = self.KP * (speed / v_threshold)
         else:
             dynamic_gain = self.KP
-
-
+ 
+ 
         if self.state == "OVERTAKE":
             dynamic_gain *= 0.65
-
+ 
         if not hasattr(self, 'heading_error_integral'):
             self.heading_error_integral = 0.0
         if not hasattr(self, 'prev_heading_error'):
             self.prev_heading_error = heading_error
-
+ 
         if use_pid:
             self.heading_error_integral += heading_error * dt
             derivative = (heading_error - self.prev_heading_error) / dt if dt > 0 else 0.0
             self.prev_heading_error = heading_error
-
+ 
             correction = dynamic_gain * heading_error + self.KI * self.heading_error_integral + self.KD * derivative
         else:
             correction = dynamic_gain * heading_error
-
+ 
         return correction
     
     def calc_future_position(self, T):

@@ -52,10 +52,6 @@ class Controller_manager:
         self.loop_rate = 50 # rate in hertz
         self.ros_time = rospy.Time()
         self.scan = None
-
-        ### HJ : loop gap instrumentation — detect cycle stall (GC, mutex, scheduler delay)
-        self._last_cyc_t = None
-        self._cyc_gap_thresh_ms = 40.0  # log if gap > 40ms (= 2 cycles at 50Hz)
         
         self.mapping = rospy.get_param('controller_manager/mapping', False)
         if self.mapping:
@@ -92,8 +88,8 @@ class Controller_manager:
         # downstream code can read it safely (stays 0 → decel_gate=0 → no effect).
         self.acc_now_rslidar = np.zeros(10)
         ### HJ : end
-        self.speed_now_y =0
-        self.yaw_rate = 0
+        self.speed_now_y =0 
+        self.yaw_rate = 0 
         self.waypoint_safety_counter = 0
 
         # Trailing related variables
@@ -146,7 +142,7 @@ class Controller_manager:
         self.steer_gain_for_speed = rospy.get_param('L1_controller/steer_gain_for_speed')
 
         self.future_constant = rospy.get_param('L1_controller/future_constant')
-
+        
         self.AEB_thres = rospy.get_param('L1_controller/AEB_thres')
 
 
@@ -410,8 +406,6 @@ class Controller_manager:
         self.controller.accel_lim_ay_max = rospy.get_param('dyn_controller/accel_lim_ay_max', 4.5) * friction
         self.controller.accel_lim_horizon = rospy.get_param('dyn_controller/accel_lim_horizon', 0.3)
         self.controller.accel_lim_lookahead = rospy.get_param('dyn_controller/accel_lim_lookahead', 0.3)
-        self.controller.accel_lim_activate_speed_thres = rospy.get_param('dyn_controller/accel_lim_activate_speed_thres', 2.0)
-        self.controller.accel_lim_deactivate_gap_thres = rospy.get_param('dyn_controller/accel_lim_deactivate_gap_thres', 1.0)
         ### HJ : end
 
         ### HJ : GP residual + yaw rate feedback from dyn_reconfigure
@@ -685,14 +679,6 @@ class Controller_manager:
         rospy.loginfo(f"[{self.name}] Ready!")
 
         while not rospy.is_shutdown():
-            ### HJ : cycle gap detect
-            _now_cyc = time.perf_counter()
-            if self._last_cyc_t is not None:
-                _gap_ms = (_now_cyc - self._last_cyc_t) * 1000.0
-                if _gap_ms > self._cyc_gap_thresh_ms:
-                    rospy.logwarn(f"[cm] cycle gap: {_gap_ms:.1f}ms (expected ~{1000.0/self.loop_rate:.1f}ms)")
-            self._last_cyc_t = _now_cyc
-
             if self.measuring:
                 start = time.perf_counter()
             speed, acceleration, jerk, steering_angle = 0, 0, 0, 0

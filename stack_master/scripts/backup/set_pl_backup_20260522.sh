@@ -117,10 +117,7 @@ apply_pct() {
 
 monitor_loop() {
   local interval="${1:-1}"
-  # Override location with SETPL_LOGDIR=<path>. Useful when monitor runs inside
-  # a docker container but logs must land on a bind-mounted host path so an
-  # external analyzer (or Claude on the host) can read them.
-  local logdir="${SETPL_LOGDIR:-${HOME:-/tmp}/.set_pl_monitor}"
+  local logdir="${HOME:-/tmp}/.set_pl_monitor"
   mkdir -p "$logdir"
   local logfile="$logdir/$(date +%Y-%m-%d-%H-%M-%S).log"
   local nproc; nproc=$(nproc 2>/dev/null || echo 22)
@@ -128,17 +125,7 @@ monitor_loop() {
   echo "[INFO] monitor interval=${interval}s  Ctrl-C to stop"
   echo "[INFO] log: $logfile"
   echo "[INFO] flags: THROTTLE=clock cap | HOT=pkg>95C | IO=iowait>5% | IRQ=softirq>10% | LOAD=load1>nproc | MEM=used>90%"
-  echo "[INFO] PSI:   CPU_PRESS=cpu.some>20% (10s) | IO_STALL=io.full>5% | MEM_PRESS=mem.some>5%"
-
-  # PSI helper: $1=cpu|io|memory  $2=some|full  $3=avg10|avg60|avg300
-  # Returns the value as a float string, or empty if PSI not available (kernel <4.20).
-  psi() {
-    awk -v k="$2" -v w="$3" '$1==k {
-      for(i=2;i<=NF;i++) if(index($i,w"=")==1){
-        sub(w"=","",$i); printf "%.2f", $i+0; exit
-      }
-    }' "/proc/pressure/$1" 2>/dev/null
-  }
+  echo
 
   # baseline counters
   local prev_thr_pkg prev_thr_core prev_e prev_t
@@ -152,47 +139,12 @@ monitor_loop() {
   local prev_user prev_nice prev_sys prev_idle prev_iow prev_irq prev_sirq prev_steal
   read _ prev_user prev_nice prev_sys prev_idle prev_iow prev_irq prev_sirq prev_steal _ < /proc/stat
 
-  # CSV header (PSI + loadN appended at end so old log parsers still work)
-  local header="ts,PL1_W,PL2_W,pct,pkg_C,core_max_C,nvme_C,freq_avg_MHz,freq_max_MHz,thr_pkg_dt,thr_core_dt,pkg_W,usr%,sys%,iowait%,soft%,load1,mem_used%,top1,top1_pct,psi_cpu_some,psi_io_full,psi_mem_some,loadN"
+  # CSV header
+  local header="ts,PL1_W,PL2_W,pct,pkg_C,core_max_C,nvme_C,freq_avg_MHz,freq_max_MHz,thr_pkg_dt,thr_core_dt,pkg_W,usr%,sys%,iowait%,soft%,load1,mem_used%,top1,top1_pct"
   echo "$header" | tee "$logfile"
 
-  # Auto-spawn per-pid attribution tool (3-axis + spike dump) in background.
-  # stdout is NOT redirected → ATTR lines print inline with monitor lines.
-  # CSV + spike log still go to $logdir for postmortem.
-  # Disable with NO_ATTR=1.
-  local attr_pid="" attr_script attr_top="${ATTR_TOP:-3}"
-  attr_script="$(dirname "$0")/../../HJ_docs/debug/load_attribute.py"
-  if [ "${NO_ATTR:-0}" != "1" ]; then
-    if [ -x "$attr_script" ] && command -v python3 >/dev/null 2>&1; then
-      python3 -u "$attr_script" --interval "$interval" --top "$attr_top" \
-        --oneline --csv --logdir "$logdir" &
-      attr_pid=$!
-      echo "[INFO] load_attribute auto-spawned pid=$attr_pid (oneline, top=$attr_top — prints inline below)"
-      echo "[INFO]   csv:     ls -t $logdir/load_attr_*.csv | head -1"
-      echo "[INFO]   spikes:  ls -t $logdir/load_attr_*_spikes.log | head -1"
-      echo "[INFO]   tweak:   ATTR_TOP=5 $(basename "$0") monitor   |   disable: NO_ATTR=1 ..."
-    else
-      echo "[WARN] load_attribute.py not found/executable at $attr_script — skipping auto-spawn"
-    fi
-  else
-    echo "[INFO] load_attribute auto-spawn disabled (NO_ATTR=1)"
-  fi
-  echo
+  trap 'echo; echo "[INFO] monitor stopped. log: '"$logfile"'"; exit 0' INT TERM
 
-  # Single-quoted action: $attr_pid expands at trap-fire time (it is a local
-  # of monitor_loop and exists when the trap actually runs). $logfile is
-  # briefly unquoted so it expands NOW (at trap-set time).
-  trap 'echo
-if [ -n "${attr_pid:-}" ] && kill -0 "$attr_pid" 2>/dev/null; then
-  kill "$attr_pid" 2>/dev/null
-  wait "$attr_pid" 2>/dev/null
-  echo "[INFO] load_attribute stopped (pid=$attr_pid)"
-fi
-echo "[INFO] monitor stopped. log: '"$logfile"'"
-exit 0' INT TERM
-
-  local tick_n=0
-  local -a procR_hist=()
   while true; do
     sleep "$interval"
     now_t=$(date +%s.%N)
@@ -245,29 +197,9 @@ exit 0' INT TERM
     prev_user=$cur_user; prev_nice=$cur_nice; prev_sys=$cur_sys; prev_idle=$cur_idle
     prev_iow=$cur_iow; prev_irq=$cur_irq; prev_sirq=$cur_sirq; prev_steal=$cur_steal
 
-    # Load average (1 min) — kernel EMA, τ=60s. Slow to react / decay,
-    # good for sustained-trend view but useless for near-real-time changes.
+    # Load average (1 min)
     local load1
     load1=$(awk '{print $1}' /proc/loadavg)
-
-    # loadN — rolling average of /proc/stat procs_running over last N samples.
-    # N defaults to 5 (≈ 5s at 1Hz interval). Sharp short-window load metric.
-    # /proc/stat procs_running is an instantaneous R-state count (no averaging).
-    local procR_cur
-    procR_cur=$(awk '/^procs_running/{print $2}' /proc/stat)
-    procR_hist+=("$procR_cur")
-    if [ ${#procR_hist[@]} -gt "${MON_LOADN:-5}" ]; then
-      procR_hist=("${procR_hist[@]:1}")
-    fi
-    local loadN
-    loadN=$(printf '%s\n' "${procR_hist[@]}" | awk '{s+=$1;n++} END{if(n)printf "%.1f", s/n; else print "?"}')
-
-    # PSI (Pressure Stall Information, 10s window) — sharper short-window signal
-    # than load1, AND splits the cause into CPU / I/O / memory. Kernel ≥4.20.
-    local psi_cpu_some psi_io_full psi_mem_some
-    psi_cpu_some=$(psi cpu    some avg10)
-    psi_io_full=$(psi  io     full avg10)
-    psi_mem_some=$(psi memory some avg10)
 
     # Memory used %
     local mem_used
@@ -286,43 +218,18 @@ exit 0' INT TERM
     awk -v v=$p_soft 'BEGIN{exit !(v>10.0)}' && flags="$flags IRQ"
     awk -v l=$load1 -v n=$nproc 'BEGIN{exit !(l>n)}' && flags="$flags LOAD"
     awk -v v=$mem_used 'BEGIN{exit !(v>90.0)}' && flags="$flags MEM"
-    # PSI-derived flags (10s window — react ~6× faster than load1)
-    awk -v v=${psi_cpu_some:-0} 'BEGIN{exit !(v>20.0)}' && flags="$flags CPU_PRESS"
-    awk -v v=${psi_io_full:-0}  'BEGIN{exit !(v>5.0)}'  && flags="$flags IO_STALL"
-    awk -v v=${psi_mem_some:-0} 'BEGIN{exit !(v>5.0)}'  && flags="$flags MEM_PRESS"
-
-    # Flag display: 5-char fixed width, green=OK / red=first-flag.
-    # Multi-flag case shows only the first flag (truncated to 5 chars).
-    # Full flag list is visible in MON_VERBOSE mode.
-    local flag_short
     if [ -z "$flags" ]; then
-      flag_short="OK"
-      mark=$'\e[32m'"$(printf '%-5s' "$flag_short")"$'\e[0m'
+      mark=$'\e[32mOK\e[0m       '
     else
-      flag_short=$(echo "${flags# }" | awk '{print substr($1,1,5)}')
-      mark=$'\e[31m'"$(printf '%-5s' "$flag_short")"$'\e[0m'
+      mark=$'\e[31m'"${flags# }"$'\e[0m'
+      # pad to ~8 chars for alignment
+      mark=$(printf "%-30s" "$mark")
     fi
 
-    # CSV line — full data (parseable; loadN appended at end for backward compat)
-    line="$ts,$pl1,$pl2,$pct,$pkg_c,$core_max,${nvme:-?},$favg,$fmx,$thr_pkg_dt,$thr_core_dt,${pkg_w:-?},$p_usr,$p_sys,$p_iow,$p_soft,$load1,$mem_used,${t1n:-?},${t1c:-?},${psi_cpu_some:-?},${psi_io_full:-?},${psi_mem_some:-?},$loadN"
+    line="$ts,$pl1,$pl2,$pct,$pkg_c,$core_max,${nvme:-?},$favg,$fmx,$thr_pkg_dt,$thr_core_dt,${pkg_w:-?},$p_usr,$p_sys,$p_iow,$p_soft,$load1,$mem_used,${t1n:-?},${t1c:-?}"
     echo "$line" >> "$logfile"
-
-    # Periodic header for stdout readability (every 20 ticks)
-    if [ $((tick_n % 20)) -eq 0 ]; then
-      printf "\n%-8s %-5s  %-5s %-3s %-3s %-5s %-5s %-5s %-5s %-11s  %s\n" \
-        "TIME" "FLAG" "PL" "pct" "pkg" "thr" "load${MON_LOADN:-5}" "load1" "mem%" "psi(c/i/m)" "TOP1"
-    fi
-    tick_n=$((tick_n+1))
-
-    if [ "${MON_VERBOSE:-0}" = "1" ]; then
-      # Original full format (includes freq, pkg_W, usr/sys/iow/soft, core°C)
-      printf "%s [%s] PL=%s/%s pct=%s%%  pkg=%s°C core=%s°C  freq=%s/%s  thr=%s/%s  W=%s  usr=%s%% sys=%s%% iow=%s%% soft=%s%%  load%ss=%s load1=%s  mem=%s%%  psi=%s/%s/%s  top=%s(%s%%)\n" \
-        "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_c" "$core_max" "$favg" "$fmx" "$thr_pkg_dt" "$thr_core_dt" "${pkg_w:-?}" "$p_usr" "$p_sys" "$p_iow" "$p_soft" "${MON_LOADN:-5}" "$loadN" "$load1" "$mem_used" "${psi_cpu_some:-?}" "${psi_io_full:-?}" "${psi_mem_some:-?}" "${t1n:-?}" "${t1c:-?}"
-    else
-      # Compact format (default) — column widths aligned with header
-      printf "%s %s  %3s/%-2s %2s%% %3s %5s %5s %5s %5s %5s/%s/%s  %s(%s%%)\n" \
-        "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_c" "${thr_pkg_dt}/${thr_core_dt}" "$loadN" "$load1" "$mem_used" "${psi_cpu_some:-?}" "${psi_io_full:-?}" "${psi_mem_some:-?}" "${t1n:-?}" "${t1c:-?}"
-    fi
+    printf "%s [%s] PL=%s/%s pct=%s%%  pkg=%s°C core=%s°C  freq=%s/%s  thr=%s/%s  W=%s  usr=%s%% sys=%s%% iow=%s%% soft=%s%%  load1=%s  mem=%s%%  top=%s(%s%%)\n" \
+      "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_c" "$core_max" "$favg" "$fmx" "$thr_pkg_dt" "$thr_core_dt" "${pkg_w:-?}" "$p_usr" "$p_sys" "$p_iow" "$p_soft" "$load1" "$mem_used" "${t1n:-?}" "${t1c:-?}"
   done
 }
 

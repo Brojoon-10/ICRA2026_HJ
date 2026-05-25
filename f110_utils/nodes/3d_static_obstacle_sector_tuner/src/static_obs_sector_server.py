@@ -6,7 +6,7 @@ import numpy as np
 from f110_msgs.msg import WpntArray
 from tf.transformations import quaternion_from_euler
 from dynamic_reconfigure.server import Server
-from static_obstacle_sector_tuner.cfg import static_obs_dyn_sect_tunerConfig
+from static_obstacle_sector_tuner_3d.cfg import static_obs_dyn_sect_tunerConfig  ### HJ : use 3D cfg (was 2D, mismatched gg_tuner rebuild target)
 from visualization_msgs.msg import Marker, MarkerArray
 
 class StaticObstacleSectorPublisher:
