@@ -1,0 +1,18 @@
+<!-- ### HJ : standalone Frenet quintic start-path test node.
+     Does NOT bring up base_system / planners — run the usual 3D base system
+     in another terminal (provides /global_waypoints, /car_state/odom):
+
+         roslaunch stack_master 3d_base_system.launch map:=gazebo_wall_2 sim:=true
+
+     Then in another terminal:
+
+         roslaunch spliner start_quintic_test.launch
+
+     Then open rqt → Dynamic Reconfigure → /start_planner_v3 and drag
+     `s_target_m` to scan convergence points. RViz displays:
+         /start_planner_v3/markers   (LINE_STRIP path, ego/target spheres, status text)
+         /start_planner_v3/path      (WpntArray)
+         /start_planner_v3/debug     (std_msgs/String JSON per tick) -->
+<launch>
+  <node pkg="spliner" type="start_quintic_node.py" name="start_planner_v3" output="screen"/>
+</launch>

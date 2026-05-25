@@ -9,10 +9,7 @@
   <arg name="enable_prediction" default="True" />
   <arg name="dynamic_avoidance_mode" default="SQP" />
   <arg name="use_vd_prediction" default="False" />
-  <!-- ### HJ : when true, replace spliner / sqp / recovery_spliner with
-       sampling_based_planner_3d (state-aware OT + RECOVERY). Default false
-       keeps 2D-style planners wired as today. -->
-  <arg name="sampling_planner_enable" default="False" />
+
   <!-- ### HJ : When empty, sampling_planner reads /map rosparam set by 3d_base_system.launch.
        Set MAP_NAME env var to override. -->
   <arg name="map_name" default="$(optenv MAP_NAME '')"
@@ -70,7 +67,14 @@
           output="screen" />
 
     <!-- Start planner -->
-    <node pkg="spliner" type="start_spline_node_v2.py" name="start_planner" output="screen"/>
+    <!-- ### HJ : legacy start path (RViz 2D Nav Goal → BPoly through clicks → snap to GB).
+         Kept commented for rollback. Replaced by start_quintic_node below. -->
+    <!-- <node pkg="spliner" type="start_spline_node_v2.py" name="start_planner" output="screen"/> -->
+
+    <!-- ### HJ : new start path generator — Frenet quintic + optional POINTS mode (BPoly).
+         Publishes /planner/start_wpnts (OTWpntArray) when rqt toggle
+         publish_to_state_machine=True so state_machine's start_wpnts_cb picks it up. -->
+    <node pkg="spliner" type="start_quintic_node.py" name="start_planner_v3" output="screen"/>
 
     <!-- Static Avoidance (3D) — feeds /planner/avoidance/static_otwpnts (SMART_STATIC state) -->
     <node pkg="spliner" type="3d_static_avoidance_node.py" name="planner_spline" output="screen">
@@ -88,19 +92,6 @@
       <node pkg="sqp_planner" type="3d_sqp_avoidance_node.py" name="planner_sqp" output="screen"/>
       <node pkg="sqp_planner" type="update_waypoints.py" name="waypoint_updater" output="screen"/>
     </group>
-  </group>
-
-  <!-- ══════════════════ SAMPLING-BASED PLANNER 3D (observation-only) ══════════════════ -->
-  <!-- ### HJ : Observation-only until trajectory continuity is resolved. When
-       sampling_planner_enable:=true, /sampling_planner/{overtake,recovery} instances publish
-       to /planner/{avoidance/otwpnts,recovery/wpnts}_observation only. Actual driving is owned
-       by the legacy sqp / recovery_spliner planners. rqt_reconfigure groups both instances
-       under /sampling_planner/ for unified cost / sampling-grid tuning. -->
-  <group if="$(arg sampling_planner_enable)">
-    <include file="$(find sampling_based_planner_3d)/launch/sampling_planner_multi.launch">
-      <arg name="map_name"     value="$(arg map_name)"/>
-      <arg name="vehicle_name" value="$(arg vehicle_name)"/>
-    </include>
   </group>
 
   <!-- ══════════════════ GP PREDICTION (3D, enable_prediction:=True) ══════════════════ -->
