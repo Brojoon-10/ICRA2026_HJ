@@ -52,6 +52,10 @@ class Controller_manager:
         self.loop_rate = 50 # rate in hertz
         self.ros_time = rospy.Time()
         self.scan = None
+
+        ### HJ : loop gap instrumentation — detect cycle stall (GC, mutex, scheduler delay)
+        self._last_cyc_t = None
+        self._cyc_gap_thresh_ms = 40.0  # log if gap > 40ms (= 2 cycles at 50Hz)
         
         self.mapping = rospy.get_param('controller_manager/mapping', False)
         if self.mapping:
@@ -681,6 +685,14 @@ class Controller_manager:
         rospy.loginfo(f"[{self.name}] Ready!")
 
         while not rospy.is_shutdown():
+            ### HJ : cycle gap detect
+            _now_cyc = time.perf_counter()
+            if self._last_cyc_t is not None:
+                _gap_ms = (_now_cyc - self._last_cyc_t) * 1000.0
+                if _gap_ms > self._cyc_gap_thresh_ms:
+                    rospy.logwarn(f"[cm] cycle gap: {_gap_ms:.1f}ms (expected ~{1000.0/self.loop_rate:.1f}ms)")
+            self._last_cyc_t = _now_cyc
+
             if self.measuring:
                 start = time.perf_counter()
             speed, acceleration, jerk, steering_angle = 0, 0, 0, 0
