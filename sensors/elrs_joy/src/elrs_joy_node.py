@@ -76,6 +76,30 @@ class ELRSJoyNode:
         self.settling_sec = float(rospy.get_param('~settling_sec', 0.2))
         self.settling_until = 0.0  # epoch seconds; publish when time.time() >= this
 
+        ### HJ : LB-specific safety guard. LB (humandrive takeover) is the single
+        ### HJ : most dangerous bit: if it spuriously flips to 1 mid-autodrive,
+        ### HJ : simple_mux drops the autodrive latch and pushes raw stick value
+        ### HJ : to VESC — observed once as a sudden full-throttle event after a
+        ### HJ : bump shook the USB-TTL. LB is a discrete (click) switch so its
+        ### HJ : healthy CRSF value sits near 172 (pressed) or 1811 (released);
+        ### HJ : a single bit corruption typically lands the value in the wide
+        ### HJ : middle band that no real input ever produces. We treat any LB
+        ### HJ : sample inside (lb_pressed_max, lb_released_min) as untrusted and
+        ### HJ : hold the previous LB state. Asymmetric debounce: 0 -> 1
+        ### HJ : (humandrive entry) requires N consecutive trusted "pressed"
+        ### HJ : samples — this is the dangerous direction. 1 -> 0 (humandrive
+        ### HJ : release) is accepted immediately once a trusted "released"
+        ### HJ : sample arrives — release is safe (car falls back to autodrive
+        ### HJ : or idle), and delaying it would only keep the user trapped in
+        ### HJ : humandrive after they intentionally let go of the button.
+        self.lb_pressed_max  = int(rospy.get_param('~lb_pressed_max',  350))
+        self.lb_released_min = int(rospy.get_param('~lb_released_min', 1600))
+        self.lb_debounce_frames = int(rospy.get_param('~lb_debounce_frames', 3))
+        # State held across publish_joy calls
+        self.lb_state = 0          # last published LB button value (0=released, 1=pressed)
+        self.lb_pending = 0        # candidate value currently accumulating
+        self.lb_pending_count = 0  # consecutive trusted samples agreeing with lb_pending
+
     def normalize_axis(self, value):
         normalized = (value - self.CH_MID) / (self.NORM_MAX - self.CH_MID)
         normalized = max(-1.0, min(1.0, normalized))
@@ -198,8 +222,71 @@ class ELRSJoyNode:
             msg.axes[joy_idx] = sign * self.normalize_axis(self.channels[crsf_ch])
         for i, (joy_idx, crsf_ch) in enumerate(zip(self.button_joy_indices, self.button_crsf_channels)):
             inv = self.button_invert[i] if i < len(self.button_invert) else 0
-            msg.buttons[joy_idx] = self.channel_to_button(self.channels[crsf_ch], invert=inv)
+            ### HJ : LB (joy_idx==4) uses dead-band + N-frame debounce. Mid-band
+            ### HJ : samples are noise; on either side, require lb_debounce_frames
+            ### HJ : consecutive trusted samples before flipping lb_state.
+            if joy_idx == 4:
+                msg.buttons[joy_idx] = self._lb_filtered_button(self.channels[crsf_ch], inv)
+            else:
+                msg.buttons[joy_idx] = self.channel_to_button(self.channels[crsf_ch], invert=inv)
         self.joy_pub.publish(msg)
+
+    def _lb_filtered_button(self, raw_value, invert):
+        ### HJ : map raw CRSF value to a candidate (0/1/None=untrusted) using the
+        ### HJ : dead-band, then run an N-frame agreement filter against lb_state.
+        if invert:
+            # invert=1: pressed when value is HIGH (near 1811)
+            if raw_value >= self.lb_released_min:
+                candidate = 1
+            elif raw_value <= self.lb_pressed_max:
+                candidate = 0
+            else:
+                candidate = None
+        else:
+            # default: pressed when value is LOW (near 172)
+            if raw_value <= self.lb_pressed_max:
+                candidate = 1
+            elif raw_value >= self.lb_released_min:
+                candidate = 0
+            else:
+                candidate = None
+
+        if candidate is None:
+            ### HJ : mid-band sample - untrusted. Hold lb_state, reset pending.
+            self.lb_pending_count = 0
+            return self.lb_state
+
+        if candidate == self.lb_state:
+            ### HJ : sample agrees with current state - nothing to flip.
+            self.lb_pending_count = 0
+            return self.lb_state
+
+        ### HJ : asymmetric debounce. Releasing (1 -> 0) is the safe direction:
+        ### HJ : commit immediately on the first trusted "released" sample so
+        ### HJ : the user is never trapped in humandrive after intentionally
+        ### HJ : letting go. Entering (0 -> 1) is the dangerous direction:
+        ### HJ : require N consecutive trusted "pressed" samples.
+        if self.lb_state == 1 and candidate == 0:
+            self.lb_state = 0
+            self.lb_pending_count = 0
+            rospy.loginfo("[elrs_joy] LB 1 -> 0 (released, immediate)")
+            return self.lb_state
+
+        ### HJ : 0 -> 1 path: accumulate trusted "pressed" samples.
+        if candidate == self.lb_pending:
+            self.lb_pending_count += 1
+        else:
+            self.lb_pending = candidate
+            self.lb_pending_count = 1
+
+        if self.lb_pending_count >= self.lb_debounce_frames:
+            ### HJ : N consecutive trusted "pressed" samples - commit entry.
+            self.lb_state = 1
+            self.lb_pending_count = 0
+            rospy.loginfo("[elrs_joy] LB 0 -> 1 (debounced over %d frames)",
+                          self.lb_debounce_frames)
+
+        return self.lb_state
 
     def check_failsafe(self):
         elapsed = time.time() - self.last_valid_time
@@ -207,6 +294,11 @@ class ELRSJoyNode:
             if self.connected:
                 rospy.logwarn("CRSF signal lost! (no valid packet for %.1fs)", elapsed)
                 self.connected = False
+                ### HJ : on signal loss, reset LB filter to released so post-recovery
+                ### HJ : doesn't carry a stale "pressed" state across the gap.
+                self.lb_state = 0
+                self.lb_pending = 0
+                self.lb_pending_count = 0
                 msg = Joy()
                 msg.header.stamp = rospy.Time.now()
                 msg.header.frame_id = self.frame_id

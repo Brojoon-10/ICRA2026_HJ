@@ -37,6 +37,16 @@
         <!-- Failsafe timeout (seconds) -->
         <param name="failsafe_timeout" value="0.5"/>
 
+        <!-- ### HJ : LB (humandrive takeover) safety guard.
+             LB is a click switch so its healthy CRSF value is near 172 or 1811.
+             Anything in the middle band is treated as noise: LB state is held,
+             and crossing the band requires N consecutive trusted samples on
+             the other side. Protects against a bump-induced bit flip flipping
+             LB to "pressed" mid-autodrive (observed full-throttle takeover). -->
+        <param name="lb_pressed_max"     value="350"/>
+        <param name="lb_released_min"    value="1600"/>
+        <param name="lb_debounce_frames" value="3"/>
+
         <param name="frame_id" value="elrs_joy"/>
     </node>
 </launch>
