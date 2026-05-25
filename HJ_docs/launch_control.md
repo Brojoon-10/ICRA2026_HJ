@@ -252,6 +252,55 @@ ACTIVE 중에 실제 흐른 motor current 비교는 별도 패널로:
 rqt_plot /vesc/sensors/core/state/current_motor
 ```
 
+### YAML preset (시작값 + 저장/로드)
+
+곡선 파라미터는 yaml로 관리. `vesc.yaml`/`controller.yaml`과 동일 패턴: launch에서 rosparam load → 노드 init값 → 런타임 dyn_reconfigure로 튜닝 → plugin Save로 yaml 저장 → 다음 launch부터 그 값 시작.
+
+#### 차량별 yaml — `CAR_NAME` 자동 매핑
+
+각 차량 `devices/` 안에:
+
+```
+stack_master/config/<CAR_NAME>/devices/launch_control.yaml
+```
+
+`test_launch_control.launch`가 `$(env CAR_NAME)` 통해 자동으로 그 yaml을 simple_mux에 로드. **사용자가 path 지정 안 함**:
+
+```bash
+export CAR_NAME=SRX1     # 또는 .bashrc / udev rule
+roslaunch stack_master test_launch_control.launch    # 자동으로 SRX1/devices/launch_control.yaml 사용
+```
+
+7개 차량 (SRX1/SRX2/SRX_R_1/FIESTA1/FIESTA2/HOBAO/VIPER1) 모두 동일 default 박혀있음. 차량별로 튜닝해서 다른 값으로 갈라지면 그 차량 yaml만 갱신.
+
+#### rqt_reconfigure 안에서 Save / Load (controller.cfg 패턴 그대로)
+
+`controller.cfg`가 `save_params` / `load_params` 체크박스를 두고 콜백에서 처리하는 패턴 그대로 적용함. `SimpleMux.cfg` 맨 위에 두 bool:
+
+```python
+gen.add("save_params", bool_t, 1, "Save current params to launch_control.yaml", False)
+gen.add("load_params", bool_t, 1, "Reload params from launch_control.yaml",     False)
+```
+
+rqt_reconfigure UI에서 `/vesc/simple_mux` 선택하면 그 두 체크박스가 슬라이더들 위에 보임.
+
+- **save_params 체크**: simple_mux가 현재 dyn 값을 `stack_master/config/$CAR_NAME/devices/launch_control.yaml`에 dump → 즉시 체크 해제
+- **load_params 체크**: 같은 yaml을 다시 읽어서 dyn 서버에 push → 슬라이더 + plugin 곡선 즉시 갱신 → 즉시 체크 해제
+
+ACTIVE(launch fire 중)에는 두 trigger도 무시 (mid-flight 일관성).
+
+차량 결정 순서: `rospy.get_param('/racecar_version')` → env `$CAR_NAME` → 둘 다 없으면 save/load 비활성 (경고 로그).
+
+저장한 yaml은 launch가 다음 부팅에 자동 로드 (`launch_profile` arg가 가리키는 그 파일이라). 따라서 round-trip:
+
+```
+rqt_reconfigure 슬라이더 튜닝
+   → save_params 체크 → launch_control.yaml 갱신
+   → 다음 roslaunch → 그 값으로 자동 시작
+```
+
+별도 CLI 호출 필요 없음.
+
 ### 디버그 토픽
 
 `/launch_controller/debug` (std_msgs/String, JSON) — 매 50Hz. 필드: `profile`(0=CONSTANT,1=CURVE), `phase`(0~3), `t`, `armed`, `active`, `target_I_A`, `measured_v`.
