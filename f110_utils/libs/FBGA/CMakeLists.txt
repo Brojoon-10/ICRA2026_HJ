@@ -96,6 +96,10 @@ target_include_directories(
 
 add_library(${PROJECT_NAME} STATIC ${SOURCES} ${PUBLIC_HEADERS})
 
+# IY 2026-05-25 : -fPIC so this static lib can be linked into the pybind11
+# shared module (fbga_native.so). Harmless for the existing .exe builds.
+set_target_properties(${PROJECT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 target_link_libraries(${PROJECT_NAME} PUBLIC ${thirdpartysubmodules} thirdparty )
 target_include_directories(${PROJECT_NAME} PUBLIC ${SOURCE_DIR} )
 
@@ -138,4 +142,36 @@ foreach( S ${EXELISTCPP} )
   add_test( NAME "${S}" COMMAND ./bin/${S}.exe WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} )
   add_dependencies( "${PROJECT_NAME}_all_tests" ${S} )
 endforeach()
+
+
+# IY 2026-05-25 : pybind11 Python binding (fbga_native).
+# Eliminates the per-solve subprocess fork by exposing FWBW as a Python module.
+# Optional — if pybind11 isn't found, just skip and the legacy exe path still works.
+find_package(Python3 COMPONENTS Interpreter Development QUIET)
+if(Python3_FOUND)
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import pybind11; print(pybind11.get_cmake_dir())"
+    OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE PYBIND11_QUERY_RC
+  )
+  if(PYBIND11_QUERY_RC EQUAL 0 AND PYBIND11_CMAKE_DIR)
+    list(APPEND CMAKE_PREFIX_PATH ${PYBIND11_CMAKE_DIR})
+    find_package(pybind11 CONFIG QUIET)
+  endif()
+endif()
+
+if(pybind11_FOUND)
+  message(STATUS "pybind11 found at ${PYBIND11_CMAKE_DIR} - building fbga_native module")
+  pybind11_add_module(fbga_native ${CMAKE_CURRENT_SOURCE_DIR}/python/fbga_native.cpp)
+  target_link_libraries(fbga_native PRIVATE ${PROJECT_NAME} thirdparty)
+  target_include_directories(fbga_native PRIVATE ${SOURCE_DIR})
+  # Place the .so next to the test binaries so fbga_runner.py finds it via a
+  # fixed path: <FBGA>/bin/fbga_native.cpython-<py>-<arch>.so
+  set_target_properties(fbga_native PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
+else()
+  message(STATUS "pybind11 NOT found - skipping fbga_native module "
+                 "(legacy exe path still works). Run: pip3 install pybind11")
+endif()
 

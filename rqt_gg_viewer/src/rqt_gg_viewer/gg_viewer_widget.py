@@ -42,7 +42,7 @@ class GGViewerWidget(QWidget):
         super().__init__()
         self.setWindowTitle('GG Viewer')
 
-        self.current_data = None         # updated only by /gg_results topic
+        self.current_data = None         # updated by /gg_results topic; pre-seeded from _latest on disk
         self.baseline_data = None        # set by Load Baseline button
         ## IY : multi-snapshot overlay
         self.snapshots = {}              # disk-load cache: {snap_name: payload}
@@ -62,6 +62,10 @@ class GGViewerWidget(QWidget):
         self._connect_signals()
         self._subscribe_ros()
         self._refresh_snapshot_lists()   # initial disk scan
+        self._load_latest_from_disk()    # pre-seed current_data before ROS topic arrives
+        if self.current_data is not None:
+            self._populate_combos()
+            self._update_display()
 
     # ------------------------------------------------------------------ #
     #  UI construction
@@ -251,6 +255,24 @@ class GGViewerWidget(QWidget):
             snaps.append(name)
         return snaps
     ## IY : end
+
+    def _load_latest_from_disk(self):
+        """Pre-seed current_data from *_latest dir so the plot shows on cold start."""
+        if not os.path.isdir(self.gg_diagrams_dir):
+            return
+        for name in sorted(os.listdir(self.gg_diagrams_dir)):
+            if not name.endswith('_latest'):
+                continue
+            full = os.path.join(self.gg_diagrams_dir, name)
+            if not os.path.isdir(full):
+                continue
+            if not os.path.isfile(os.path.join(full, 'velocity_frame', 'v_list.npy')):
+                continue
+            data = self._load_snapshot_from_disk(name)
+            if data is not None:
+                self.current_data = data
+                rospy.loginfo(f'[GGViewer] pre-seeded current from disk: {name}')
+                return
 
     ## IY : load one snapshot from disk → /gg_results-style payload dict
     def _load_snapshot_from_disk(self, snap_name):
