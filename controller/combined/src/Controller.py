@@ -445,10 +445,10 @@ class Controller:
             if self.K_yr > 0:
                 steering_angle += corr
             applied = "ON " if self.K_yr > 0 else "obs"
-            rospy.loginfo_throttle(0.3,
-                f"[YawFB {applied}] v={v:.2f} δ={steering_angle - (corr if self.K_yr > 0 else 0.0):+.4f} "
-                f"K_us={self.K_us:.3f} exp_yr={expected_yr:+.3f} act_yr={self.yaw_rate:+.3f} "
-                f"err={yr_error:+.3f} corr_raw={corr_raw:+.4f} corr={corr:+.4f}")
+            # rospy.loginfo_throttle(0.3,
+            #     f"[YawFB {applied}] v={v:.2f} δ={steering_angle - (corr if self.K_yr > 0 else 0.0):+.4f} "
+            #     f"K_us={self.K_us:.3f} exp_yr={expected_yr:+.3f} act_yr={self.yaw_rate:+.3f} "
+            #     f"err={yr_error:+.3f} corr_raw={corr_raw:+.4f} corr={corr:+.4f}")
         ### HJ : end
 
         ### HJ : GP steering correction
@@ -691,16 +691,22 @@ class Controller:
         self.gap = (self.opponent[0] - self.position_in_map_frenet[0])%self.track_length # gap to opponent
         self.gap_actual = self.gap
         self.gap_should = self.trailing_vel_gain * self.speed_now + self.trailing_gap
- 
+
+        ### HJ : clamp negative opp_vs (tracker sign/noise guard — prevents trailing acceleration blowup)
+        opp_vs_raw = self.opponent[2]
+        opp_vs = max(opp_vs_raw, 0.0)
+        if opp_vs_raw < 0.0:
+            rospy.logwarn_throttle(2.0, f"[trailing] negative opp_vs={opp_vs_raw:.2f} clamped to 0")
+
         self.gap_error = self.gap_should - self.gap_actual
-        self.v_diff =  self.position_in_map_frenet[2] - self.opponent[2]
+        self.v_diff =  self.position_in_map_frenet[2] - opp_vs
         self.i_gap = np.clip(self.i_gap + self.gap_error/self.loop_rate, -10, 10)
-    
+
         p_value = self.gap_error * self.trailing_p_gain
         d_value = self.v_diff * self.trailing_d_gain
         i_value = self.i_gap * self.trailing_i_gain
- 
-        self.trailing_command = np.clip(self.opponent[2] - p_value - i_value - d_value, 0, global_speed)
+
+        self.trailing_command = np.clip(opp_vs - p_value - i_value - d_value, 0, global_speed)
         if not self.opponent[4] and self.gap_actual > self.gap_should:
             self.trailing_command = max(self.blind_trailing_speed, self.trailing_command)
  
@@ -770,10 +776,10 @@ class Controller:
             out = self._predictive_correction(steering_angle, signed_d, yaw)
         else:
             out = steering_angle  # 'none' — no correction
-        rospy.loginfo_throttle(0.5,
-            f"[LatCorr] mode={self.lat_correction_mode} "
-            f"d={signed_d:+.3f} v={self.speed_now:.2f} "
-            f"δ_in={steering_angle:+.4f} δ_out={out:+.4f} Δ={out-steering_angle:+.4f}")
+        # rospy.loginfo_throttle(0.5,
+        #     f"[LatCorr] mode={self.lat_correction_mode} "
+        #     f"d={signed_d:+.3f} v={self.speed_now:.2f} "
+        #     f"δ_in={steering_angle:+.4f} δ_out={out:+.4f} Δ={out-steering_angle:+.4f}")
         return out
 
     def _stanley_correction(self, steering_angle, signed_d, yaw):
