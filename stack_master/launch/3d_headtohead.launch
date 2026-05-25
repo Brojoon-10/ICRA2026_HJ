@@ -67,7 +67,14 @@
           output="screen" />
 
     <!-- Start planner -->
-    <node pkg="spliner" type="start_spline_node_v2.py" name="start_planner" output="screen"/>
+    <!-- ### HJ : legacy start path (RViz 2D Nav Goal → BPoly through clicks → snap to GB).
+         Kept commented for rollback. Replaced by start_quintic_node below. -->
+    <!-- <node pkg="spliner" type="start_spline_node_v2.py" name="start_planner" output="screen"/> -->
+
+    <!-- ### HJ : new start path generator — Frenet quintic + optional POINTS mode (BPoly).
+         Publishes /planner/start_wpnts (OTWpntArray) when rqt toggle
+         publish_to_state_machine=True so state_machine's start_wpnts_cb picks it up. -->
+    <node pkg="spliner" type="start_quintic_node.py" name="start_planner_v3" output="screen"/>
 
     <!-- Static Avoidance (3D) — feeds /planner/avoidance/static_otwpnts (SMART_STATIC state) -->
     <node pkg="spliner" type="3d_static_avoidance_node.py" name="planner_spline" output="screen">

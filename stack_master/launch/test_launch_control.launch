@@ -17,11 +17,20 @@
   <arg name="racecar_version" default="$(env CAR_NAME)" doc="Physical racecar (UNICORNx)" />
 
   <!-- ===== VESC stack (driver + ackermann_to_vesc + simple_mux) ===== -->
+  <!-- ### HJ : per-car launch profile yaml. Auto-resolved from $(env CAR_NAME).
+       Drop file at: stack_master/config/<CAR>/devices/launch_control.yaml
+       The yaml format matches rqt_launch_control plugin's Save YAML output —
+       round-trip "tune in rqt → Save → that yaml IS the next launch's seed". -->
+  <arg name="launch_profile"
+       default="$(find stack_master)/config/$(arg racecar_version)/devices/launch_control.yaml"
+       doc="YAML preset loaded into /vesc/simple_mux at startup (per-car, picked from CAR_NAME)"/>
   <group ns="vesc">
     <include file="$(find stack_master)/launch/vesc.launch">
       <arg name="racecar_version" value="$(arg racecar_version)" />
     </include>
-    <node pkg="stack_master" type="simple_mux.py" name="simple_mux" output="screen"/>
+    <node pkg="stack_master" type="simple_mux.py" name="simple_mux" output="screen">
+      <rosparam command="load" file="$(arg launch_profile)"/>
+    </node>
   </group>
 
   <!-- ===== Joy inputs (USB + ELRS) ===== -->

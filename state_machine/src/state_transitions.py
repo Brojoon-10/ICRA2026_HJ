@@ -14,6 +14,14 @@ if TYPE_CHECKING:
 close_threshold_smart = 0.5
 # close_threshold_gb replaced with state_machine._get_adaptive_close_threshold() (speed-adaptive)
 
+### HJ : launch grace — under this speed (m/s) the START state skips obstacle/on-spline
+# checks entirely. Rationale: during launch transient, the controller hasn't settled
+# onto the path (50cm on_spline tolerance is unfair) and collision energy is low (0.5·m·v²
+# ≈ 2.5 J at 1 m/s). Above the threshold the normal checks run and a real cut-in legitimately
+# drops to GB_TRACK + TRAILING — which is the correct merge response anyway.
+START_LOW_SPEED_GRACE_MPS = 1.0
+### HJ : end
+
 # ===== HJ ADDED: Debug logging helper - only logs when values change =====
 _debug_log_cache = {}
 DEBUG_LOGGING_ENABLED = False  # Set to False to disable all debug logging
@@ -206,6 +214,13 @@ def OvertakingTransition(state_machine: StateMachine) -> Tuple[StateType, StateT
 
 def StartTransition(state_machine: StateMachine) -> Tuple[StateType, StateType]:
     """Transitions for being in `StateType.START`"""
+    ### HJ : low-speed grace — keep START alive during launch transient. Skips both
+    # checks so neither flicker nor 50cm on_spline tolerance can kill cur_start_wpnts.
+    # See START_LOW_SPEED_GRACE_MPS comment near top for rationale.
+    if abs(state_machine.cur_vs) < START_LOW_SPEED_GRACE_MPS:
+        return StateType.START, StateType.START
+    ### HJ : end
+
     start_free = state_machine._check_free_cartesian(state_machine.cur_start_wpnts)
     on_spline = state_machine._check_on_spline(state_machine.cur_start_wpnts)
 
