@@ -10,7 +10,7 @@
   <arg name="perception" default="False" />
   <arg name="enable_planners" default="True" />
   <arg name="enable_prediction" default="True" />
-  <arg name="dynamic_avoidance_mode" default="SQP" />
+  <arg name="dynamic_avoidance_mode" default="NONE" />
   <arg name="use_vd_prediction" default="False" />
   <arg name="sampling_planner_enable" default="False" />
   <arg name="map_name" default="$(optenv MAP_NAME '')" />
@@ -30,7 +30,7 @@
        doc="state_machine publish-time uniform vx_mps scale." />
   <arg name="fbga_gg_scale"   default="1.0"
        doc="ax_max/ay_max multiplier applied to a scaled copy of the GGV (written under &lt;vehicle&gt;_fbga_latest/)." />
-  <arg name="fbga_max_iter"   default="5"
+  <arg name="fbga_max_iter"   default="3"
        doc="fixed-point iteration cap for local cycle." />
 
   <param name="measure" value="False" />

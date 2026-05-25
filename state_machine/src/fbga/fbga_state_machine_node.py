@@ -11,6 +11,8 @@ import importlib.util
 import numpy as np
 import rospy
 from rospkg import RosPack
+# IY 2026-05-25 : /fbga/reload service uses std_srvs Trigger.
+from std_srvs.srv import Trigger, TriggerResponse
 
 
 # Load 3d_state_machine_node.py via importlib (filename starts with a digit).
@@ -96,6 +98,24 @@ class FBGAStateMachine(sm3d.StateMachine):
             rospy.logwarn(f'[FBGAStateMachine] FBGA init failed; legacy '
                           f'for all states: {e}')
             self._fbga = None
+
+        # IY 2026-05-25 : /fbga/reload — refresh GGV without launch restart.
+        self._reload_srv = rospy.Service(
+            '/fbga/reload', Trigger, self._fbga_reload_cb)
+        rospy.loginfo("[FBGAStateMachine] /fbga/reload service ready")
+
+    def _fbga_reload_cb(self, req):
+        if self._fbga is None:
+            return TriggerResponse(success=False,
+                                   message="FBGA not initialised")
+        try:
+            ok = self._fbga.refresh_from_disk()
+            return TriggerResponse(
+                success=ok,
+                message="refreshed" if ok else "refresh failed")
+        except Exception as e:
+            rospy.logwarn(f"[FBGAStateMachine] /fbga/reload exception: {e}")
+            return TriggerResponse(success=False, message=str(e)[:200])
 
     # ── override
     def update_velocity(self, wpnts_msg, safety_factor=1.0):

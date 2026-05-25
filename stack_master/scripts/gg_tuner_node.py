@@ -3,9 +3,7 @@
 import os
 import sys
 import copy
-import glob
 import json
-import re
 import shutil
 import struct
 import subprocess
@@ -121,6 +119,8 @@ class GGTunerNode:
         ## IY : sector_slicing roslaunch handle
         self.sector_slicing_proc = None
         self._last_sector_slicing_state = False
+        ## IY : sector respawn handle (apply_new_sectors auto-clear trigger)
+        self.sector_respawn_proc = None
         ### HJ : bridge_tuner roslaunch handle (separate from sector_slicing
         ###      because bridges live on the smoothed centerline, not on the
         ###      raceline waypoints, so it doesn't need /global_waypoints).
@@ -175,6 +175,18 @@ class GGTunerNode:
         ##      /safety_sector_params/... rosparam tree and the yaml sync.
         ##      Nothing to sync here in gg_tuner.
         ## IY : end
+
+        ## IY 0525 : startup latch /gg_results from disk _latest so viewer
+        ##           gets current immediately (publisher alone leaves latch empty).
+        latest_vf_dir = os.path.join(
+            self.data_path, 'gg_diagrams',
+            f'{self.base_vehicle}_latest', 'velocity_frame')
+        if os.path.isdir(latest_vf_dir):
+            self._publish_gg_results(f'{self.base_vehicle}_latest')
+            rospy.loginfo(f"[GGTuner] startup latch: {self.base_vehicle}_latest")
+        else:
+            rospy.loginfo(f"[GGTuner] startup latch skipped (no _latest)")
+        ## IY 0525 : end
 
     ### HJ : bridge yaml ↔ rqt cfg synchronisation helpers.
     ###      yaml is the single source of truth; rqt is just an editor that
@@ -833,123 +845,56 @@ class GGTunerNode:
         rospy.loginfo("[GGTuner] [sectors] killed")
     ## IY : end
 
-    ## IY : Save/Load *all* GGTuner.cfg dynamic_reconfigure values to a
-    ##   versioned yml under rqt_gg_viewer/velopt_tun/. Triggered by the
-    ##   `save_params` / `load_params` bool fields rendered at the top of the
-    ##   rqt_reconfigure page. Same auto-clear pattern as `apply` / `save_ggv`.
-    _PARAM_SKIP_ON_LOAD = (
-        # never re-apply trigger bools — would fire the pipeline as a side effect
-        'apply', 'apply_ggv', 'apply_raceline', 'apply_fbga', 'apply_velopt',
-        'save_ggv', 'save_params', 'load_params',
-        ## IY : velopt-only save/load triggers — same skip rule
-        'save_velopt_params', 'load_velopt_params',
-        ### HJ : also skip our bridge trigger mirrors so reloading a saved
-        ###      yml never auto-spawns the tuner GUI or fires apply_bridge.
-        'apply_bridge', 'run_bridge_tuner', 'run_sector_slicing',
-        ### HJ : end
-        ## IY : safety sector triggers — apply mirror, slicing trigger,
-        ##      and persistent server toggle all force-cleared on yml load
-        ##      so reopening a saved session never auto-spawns anything.
-        'apply_safety', 'safety_sector_tuner', 'safety_sector_setting',
-        'apply_friction', 'friction_sector_tuner', 'friction_sector_setting',
-        ## IY : end
-    )
+    ## IY : apply_new_sectors — kill 5 sector consumer nodes and respawn via
+    ##      3d_sector_respawn.launch so a fresh sector slicing yaml takes
+    ##      effect without restarting 3d_base_system.
+    def _apply_new_sectors(self, map_name):
+        if map_name not in self.available_maps:
+            rospy.logerr(f"[GGTuner] [apply_sectors] invalid map '{map_name}'")
+            self.status_pub.publish("FAILED_APPLY_SECTORS: invalid map")
+            return False
 
-    def _params_yml_dir(self):
-        d = os.path.join(self.race_stack_root, 'rqt_gg_viewer', 'velopt_tun')
-        os.makedirs(d, exist_ok=True)
-        return d
-
-    def _scan_param_versions(self):
-        pat = os.path.join(self._params_yml_dir(), 'gg_params_v*.yml')
-        out = []
-        for fpath in glob.glob(pat):
-            m = re.match(r'gg_params_v(\d+)\.yml$', os.path.basename(fpath))
-            if m:
-                out.append((int(m.group(1)), fpath))
-        return sorted(out)
-
-    def _save_params_yaml(self, config):
-        params = {}
-        for k, v in dict(config).items():
-            if k == 'groups' or k.startswith('_'):
-                continue
-            # persist triggers as False so a yml reload never auto-fires them
-            if k in ('apply', 'apply_ggv', 'apply_raceline', 'apply_fbga',
-                     'apply_velopt', 'save_ggv', 'save_params', 'load_params',
-                     ## IY : velopt-only save/load triggers force-False on dump
-                     'save_velopt_params', 'load_velopt_params',
-                     ### HJ : also force HJ-side triggers to False on save
-                     'apply_bridge', 'run_bridge_tuner', 'run_sector_slicing',
-                     ## IY : safety triggers — all saved as False on dump
-                     'apply_safety', 'safety_sector_tuner',
-                     'safety_sector_setting',
-                     'apply_friction', 'friction_sector_tuner',
-                     'friction_sector_setting'):
-                params[k] = False
-                continue
-            if isinstance(v, bool):
-                params[k] = bool(v)
-            elif isinstance(v, (int, float)):
-                params[k] = float(v) if isinstance(v, float) else int(v)
-            else:
-                params[k] = v
-        versions = self._scan_param_versions()
-        next_n = (versions[-1][0] + 1) if versions else 1
-        fpath = os.path.join(self._params_yml_dir(),
-                             f'gg_params_v{next_n}.yml')
-        payload = {
-            'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'version': next_n,
-            'source': '/gg_tuner dynamic_reconfigure',
-            'params': params,
-        }
-        with open(fpath, 'w') as f:
-            yaml.dump(payload, f, default_flow_style=False, sort_keys=True)
-        rospy.loginfo(
-            f"[GGTuner] save_params: {len(params)} keys → {fpath}")
-        self.status_pub.publish(f"PARAMS_SAVED_v{next_n}")
-        return next_n
-
-    def _load_params_yaml_into(self, config):
-        versions = self._scan_param_versions()
-        if not versions:
-            rospy.logwarn("[GGTuner] load_params: no gg_params_v*.yml found")
-            self.status_pub.publish("PARAMS_LOAD_NONE")
-            return None
-        n, fpath = versions[-1]
-        with open(fpath) as f:
-            payload = yaml.safe_load(f) or {}
-        params = payload.get('params') if isinstance(payload, dict) else None
-        if not isinstance(params, dict) or not params:
-            rospy.logwarn(
-                f"[GGTuner] load_params: no params field in v{n}.yml")
-            self.status_pub.publish(f"PARAMS_LOAD_EMPTY_v{n}")
-            return n
-        applied = 0
-        skipped = 0
-        for k, v in params.items():
-            if k in self._PARAM_SKIP_ON_LOAD:
-                continue
+        rospy.loginfo("[GGTuner] [apply_sectors] killing 5 nodes")
+        targets = ('/dyn_sector_tuner/speed',
+                   '/dyn_sector_tuner/overtake',
+                   '/dyn_sector_tuner/static_obs',
+                   '/velocity_scaler',
+                   '/ot_interpolator')
+        for n in targets:
             try:
-                config[k] = v
-                applied += 1
-            except (KeyError, TypeError) as e:
-                rospy.logwarn(
-                    f"[GGTuner] load_params: skip {k} ({type(v).__name__}): {e}")
-                skipped += 1
-        rospy.loginfo(
-            f"[GGTuner] load_params: gg_params_v{n}.yml → "
-            f"applied={applied} skipped={skipped}")
-        self.status_pub.publish(f"PARAMS_LOADED_v{n}_n{applied}")
-        return n
+                subprocess.run(['rosnode', 'kill', n],
+                               capture_output=True, timeout=3, check=False)
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+
+        if self.sector_respawn_proc is not None and \
+                self.sector_respawn_proc.poll() is None:
+            try:
+                self.sector_respawn_proc.terminate()
+                self.sector_respawn_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.sector_respawn_proc.kill()
+        self.sector_respawn_proc = None
+
+        time.sleep(0.3)  # kill 안정화
+
+        cmd = ['roslaunch', 'stack_master', '3d_sector_respawn.launch',
+               f'map:={map_name}']
+        rospy.loginfo(f"[GGTuner] [apply_sectors] respawn: {' '.join(cmd)}")
+        try:
+            self.sector_respawn_proc = subprocess.Popen(cmd)
+            self.status_pub.publish(f"SECTORS_APPLIED: {map_name}")
+            return True
+        except OSError as e:
+            rospy.logerr(f"[GGTuner] [apply_sectors] launch failed: {e}")
+            self.status_pub.publish(f"FAILED_APPLY_SECTORS: {map_name}")
+            return False
     ## IY : end
 
     ## IY : VelOpt-only save/load — scoped to vo_* keys only AND per-map.
     ##   Single file at stack_master/maps/<map>/velopt_params.yml, overwritten
     ##   on each save (no version history). Map is read from the D_Raceline
-    ##   `map` slider (config.map). Independent of the global save_params /
-    ##   load_params (which dump everything to velopt_tun/gg_params_v*.yml).
+    ##   `map` slider (config.map).
     def _velopt_params_path(self, map_name):
         if not map_name:
             return None
@@ -1236,33 +1181,6 @@ class GGTunerNode:
             pass
         self.status_pub.publish("FRICTION_SETTING_OFF")
         rospy.loginfo("[GGTuner] [friction-setting] stopped")
-    ## IY : end
-
-    ## IY : persist velopt tuning to a single overwritten yaml so the latest
-    ##   slider state survives session restarts. Path is fixed under
-    ##   rqt_gg_viewer/velopt_tun/ to keep tuning artifacts close to the UI.
-    def _save_velopt_yaml(self, velopt_opts, bridge_effect, map_name,
-                          vehicle_name):
-        out_dir = os.path.join(self.race_stack_root, 'rqt_gg_viewer',
-                               'velopt_tun')
-        os.makedirs(out_dir, exist_ok=True)
-        yml_path = os.path.join(out_dir, 'velopt_tuning.yml')
-        payload = {
-            'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'base_vehicle': self.base_vehicle,
-            'vehicle_name': vehicle_name,
-            'map': map_name,
-            'vo_bridge': float(bridge_effect),
-            **{f'vo_{k}': float(v) if not isinstance(v, bool) else v
-               for k, v in velopt_opts.items()},
-        }
-        try:
-            with open(yml_path, 'w') as f:
-                yaml.dump(payload, f, default_flow_style=False,
-                          allow_unicode=True, sort_keys=True)
-            rospy.loginfo(f"[GGTuner] velopt tuning saved: {yml_path}")
-        except OSError as e:
-            rospy.logerr(f"[GGTuner] velopt tuning save failed: {e}")
     ## IY : end
 
     ## IY : Stage 4 alternative — 3d_optimized_vel_planner (NLP velocity).
@@ -1581,18 +1499,12 @@ class GGTunerNode:
                         ## IY : direct ax_pos^2 corner penalty
                         'w_ax_corner_acc':      run_opts['vo_w_axc'],
                         'w_ax_corner_k':        run_opts['vo_k_axc'],
-                        ### HJ : extra per-direction mu scale (persisted in
-                        ###      velopt_tuning.yml via _save_velopt_yaml prefixing
-                        ###      vo_*; vel_opt reads them as rosparam each reload).
+                        ### HJ : extra per-direction mu scale slots (currently
+                        ###      disabled; vel_opt reads them as rosparam each reload).
                         # 'mu_scale_x':           run_opts['vo_mu_scale_x'],
                         # 'mu_scale_y':           run_opts['vo_mu_scale_y'],
                         ### HJ : end
                     }
-                    ## IY : persist velopt slider state (single overwriting yml)
-                    self._save_velopt_yaml(
-                        velopt_opts, run_opts['vo_bridge'],
-                        run_opts['map'], vehicle_name)
-                    ## IY : end
                     ok = self._run_velopt_planner(
                         vehicle_name, run_opts['map'], velopt_opts,
                         bridge_effect=run_opts['vo_bridge'],
@@ -1655,32 +1567,6 @@ class GGTunerNode:
                 return config
         ## IY : end
 
-        ## IY : Save/Load *all* params (rqt_reconfigure top-of-page triggers).
-        ##   Auto-clear after handling; early-return when no apply pending so a
-        ##   tuning yml round-trip never accidentally fires the pipeline.
-        if getattr(config, 'save_params', False):
-            try:
-                self._save_params_yaml(config)
-            except Exception as e:
-                rospy.logerr(f"[GGTuner] save_params exception: {e}")
-                self.status_pub.publish(
-                    f"SAVE_PARAMS_EXCEPTION: {str(e)[:80]}")
-            config.save_params = False
-            if not apply_any:
-                return config
-
-        if getattr(config, 'load_params', False):
-            try:
-                self._load_params_yaml_into(config)
-            except Exception as e:
-                rospy.logerr(f"[GGTuner] load_params exception: {e}")
-                self.status_pub.publish(
-                    f"LOAD_PARAMS_EXCEPTION: {str(e)[:80]}")
-            config.load_params = False
-            if not apply_any:
-                return config
-        ## IY : end
-
         ## IY : VelOpt-only save/load triggers — scoped to vo_* sliders so
         ##   velopt presets are decoupled from ggv/raceline/fbga/bridge.
         ##   Same auto-clear + early-return-when-no-apply pattern.
@@ -1721,6 +1607,12 @@ class GGTunerNode:
             self._run_sector_slicing(str(config.map))
             config.run_sector_slicing = False
             self._last_sector_slicing_state = False
+
+        ## IY : apply_new_sectors — auto-clear trigger (kill+respawn 5 nodes)
+        if bool(getattr(config, 'apply_new_sectors', False)):
+            self._apply_new_sectors(str(config.map))
+            config.apply_new_sectors = False
+        ## IY : end
             if not apply_any:
                 return config
         if bool(getattr(config, 'run_bridge_tuner', False)):
@@ -1937,6 +1829,15 @@ class GGTunerNode:
                 self.sector_slicing_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.sector_slicing_proc.kill()
+        ## IY : also clean up sector_respawn roslaunch
+        if self.sector_respawn_proc is not None and \
+                self.sector_respawn_proc.poll() is None:
+            rospy.loginfo("[GGTuner] Terminating sector_respawn roslaunch...")
+            try:
+                self.sector_respawn_proc.terminate()
+                self.sector_respawn_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.sector_respawn_proc.kill()
         ### HJ : also clean up bridge_tuner roslaunch
         if self.bridge_tuner_proc is not None and \
                 self.bridge_tuner_proc.poll() is None:
