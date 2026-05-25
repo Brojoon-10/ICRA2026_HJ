@@ -75,9 +75,28 @@ show() {
   noturbo=$(cat "$NOTURBO_FILE" 2>/dev/null || echo "?")
   thr=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count 2>/dev/null || echo n/a)
   thr_t=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms 2>/dev/null || echo n/a)
+  # current package power: sample RAPL energy counter over 1s.
+  # energy_uj is 0400-root on modern kernels (CVE-2020-8694), so we
+  # try sudo -n (NOPASSWD) when not already root. Falls back to a
+  # hint message if no sudo cached.
+  pkg_c=$(($(cat /sys/class/thermal/thermal_zone6/temp 2>/dev/null || echo 0)/1000))
+  read_e() {
+    if [ -r "$PL_DIR/energy_uj" ]; then
+      cat "$PL_DIR/energy_uj" 2>/dev/null
+    else
+      sudo -n cat "$PL_DIR/energy_uj" 2>/dev/null
+    fi
+  }
+  e1=$(read_e); sleep 1; e2=$(read_e)
+  if [ -n "${e1:-}" ] && [ -n "${e2:-}" ]; then
+    pkg_w=$(awk -v a="$e1" -v b="$e2" 'BEGIN{d=b-a; if(d<0)d+=2^32; printf "%.1f W", d/1e6}')
+  else
+    pkg_w="N/A (rerun via sudo — energy_uj is 0400 root)"
+  fi
   printf "PL1 (long_term):    %3d W   window=%s us\n" "$((pl1/1000000))" "$tw1"
   printf "PL2 (short_term):   %3d W   window=%s us\n" "$((pl2/1000000))" "$tw2"
   printf "max_perf_pct:       %s%%   no_turbo=%s\n" "$pct" "$noturbo"
+  printf "package_power:      %s W (1s avg)   pkg_temp=%s°C\n" "$pkg_w" "$pkg_c"
   printf "package_throttle:   count=%s  total_ms=%s\n" "$thr" "$thr_t"
   printf "uptime: %s\n" "$(uptime -p 2>/dev/null || echo n/a)"
 }
@@ -140,12 +159,24 @@ monitor_loop() {
     }' "/proc/pressure/$1" 2>/dev/null
   }
 
+  # energy_uj is 0400-root on modern kernels. Use sudo -n when available.
+  read_energy() {
+    if [ -r "$PL_DIR/energy_uj" ]; then
+      cat "$PL_DIR/energy_uj" 2>/dev/null || echo 0
+    else
+      sudo -n cat "$PL_DIR/energy_uj" 2>/dev/null || echo 0
+    fi
+  }
+
   # baseline counters
   local prev_thr_pkg prev_thr_core prev_e prev_t
   prev_thr_pkg=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count 2>/dev/null || echo 0)
   prev_thr_core=$(awk '{s+=$1} END{print s+0}' /sys/devices/system/cpu/cpu*/thermal_throttle/core_throttle_count 2>/dev/null)
-  prev_e=$(cat "$PL_DIR/energy_uj" 2>/dev/null || echo 0)
+  prev_e=$(read_energy)
   prev_t=$(date +%s.%N)
+  if [ "${prev_e:-0}" = "0" ]; then
+    echo "[WARN] energy_uj unreadable (need sudo for pkg_W column). Run with: sudo -E $(basename "$0") monitor"
+  fi
 
   # baseline /proc/stat (for CPU breakdown deltas)
   # cpu  user nice system idle iowait irq softirq steal guest guest_nice
@@ -218,7 +249,7 @@ exit 0' INT TERM
     thr_core_dt=$((thr_core - prev_thr_core)); prev_thr_core=$thr_core
 
     # Package power from RAPL energy counter (uJ -> J -> avg W over interval)
-    e=$(cat "$PL_DIR/energy_uj" 2>/dev/null || echo 0)
+    e=$(read_energy)
     if [ "$e" != "0" ] && [ "$prev_e" != "0" ]; then
       pkg_w=$(awk -v a=$prev_e -v b=$e -v t=$dt 'BEGIN{d=b-a; if(d<0)d+=2^32; if(t>0)printf "%.1f", d/1e6/t; else print "0.0"}')
     else
@@ -303,14 +334,43 @@ exit 0' INT TERM
       mark=$'\e[31m'"$(printf '%-5s' "$flag_short")"$'\e[0m'
     fi
 
+    # Per-metric color (all → red at danger):
+    #   pkg_temp : orange256, red ≥90°C
+    #   W (pkg_w): yellow,    red ≥PL1
+    #   loadN/1  : cyan,      red ≥nproc
+    # Wrap the printed value only; printf widths inside the colored
+    # string keep column alignment.
+    # ANSI: 33=yellow, 36=cyan, 38;5;208=orange256, 31=red.
+    local pkg_col w_col load_col load1_col
+    if [ "${pkg_c:-0}" -ge 90 ] 2>/dev/null; then
+      pkg_col=$'\e[31m'"$(printf '%3s' "$pkg_c")"$'\e[0m'
+    else
+      pkg_col=$'\e[38;5;208m'"$(printf '%3s' "$pkg_c")"$'\e[0m'
+    fi
+    if [ "${pkg_w:-?}" != "?" ] && awk -v w="$pkg_w" -v p="$pl1" 'BEGIN{exit !(w+0>=p+0)}'; then
+      w_col=$'\e[31m'"$(printf '%5s' "$pkg_w")"$'\e[0m'
+    else
+      w_col=$'\e[33m'"$(printf '%5s' "${pkg_w:-?}")"$'\e[0m'
+    fi
+    if awk -v l="$loadN" -v n="$nproc" 'BEGIN{exit !(l+0>=n+0)}'; then
+      load_col=$'\e[31m'"$(printf '%5s' "$loadN")"$'\e[0m'
+    else
+      load_col=$'\e[36m'"$(printf '%5s' "$loadN")"$'\e[0m'
+    fi
+    if awk -v l="$load1" -v n="$nproc" 'BEGIN{exit !(l+0>=n+0)}'; then
+      load1_col=$'\e[31m'"$(printf '%5s' "$load1")"$'\e[0m'
+    else
+      load1_col=$'\e[36m'"$(printf '%5s' "$load1")"$'\e[0m'
+    fi
+
     # CSV line — full data (parseable; loadN appended at end for backward compat)
     line="$ts,$pl1,$pl2,$pct,$pkg_c,$core_max,${nvme:-?},$favg,$fmx,$thr_pkg_dt,$thr_core_dt,${pkg_w:-?},$p_usr,$p_sys,$p_iow,$p_soft,$load1,$mem_used,${t1n:-?},${t1c:-?},${psi_cpu_some:-?},${psi_io_full:-?},${psi_mem_some:-?},$loadN"
     echo "$line" >> "$logfile"
 
     # Periodic header for stdout readability (every 20 ticks)
     if [ $((tick_n % 20)) -eq 0 ]; then
-      printf "\n%-8s %-5s  %-5s %-3s %-3s %-5s %-5s %-5s %-5s %-11s  %s\n" \
-        "TIME" "FLAG" "PL" "pct" "pkg" "thr" "load${MON_LOADN:-5}" "load1" "mem%" "psi(c/i/m)" "TOP1"
+      printf "\n%-8s %-5s  %-5s %-3s %-3s %-5s %-5s %-5s %-5s %-5s %-11s  %s\n" \
+        "TIME" "FLAG" "PL" "pct" "pkg" "W" "thr" "load${MON_LOADN:-5}" "load1" "mem%" "psi(c/i/m)" "TOP1"
     fi
     tick_n=$((tick_n+1))
 
@@ -319,9 +379,10 @@ exit 0' INT TERM
       printf "%s [%s] PL=%s/%s pct=%s%%  pkg=%s°C core=%s°C  freq=%s/%s  thr=%s/%s  W=%s  usr=%s%% sys=%s%% iow=%s%% soft=%s%%  load%ss=%s load1=%s  mem=%s%%  psi=%s/%s/%s  top=%s(%s%%)\n" \
         "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_c" "$core_max" "$favg" "$fmx" "$thr_pkg_dt" "$thr_core_dt" "${pkg_w:-?}" "$p_usr" "$p_sys" "$p_iow" "$p_soft" "${MON_LOADN:-5}" "$loadN" "$load1" "$mem_used" "${psi_cpu_some:-?}" "${psi_io_full:-?}" "${psi_mem_some:-?}" "${t1n:-?}" "${t1c:-?}"
     else
-      # Compact format (default) — column widths aligned with header
-      printf "%s %s  %3s/%-2s %2s%% %3s %5s %5s %5s %5s %5s/%s/%s  %s(%s%%)\n" \
-        "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_c" "${thr_pkg_dt}/${thr_core_dt}" "$loadN" "$load1" "$mem_used" "${psi_cpu_some:-?}" "${psi_io_full:-?}" "${psi_mem_some:-?}" "${t1n:-?}" "${t1c:-?}"
+      # Compact format (default) — column widths aligned with header.
+      # pkg_col / load_col already include ANSI + padding; use %s for them.
+      printf "%s %s  %3s/%-2s %2s%% %s %s %5s %s %s %5s %5s/%s/%s  %s(%s%%)\n" \
+        "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_col" "$w_col" "${thr_pkg_dt}/${thr_core_dt}" "$load_col" "$load1_col" "$mem_used" "${psi_cpu_some:-?}" "${psi_io_full:-?}" "${psi_mem_some:-?}" "${t1n:-?}" "${t1c:-?}"
     fi
   done
 }
