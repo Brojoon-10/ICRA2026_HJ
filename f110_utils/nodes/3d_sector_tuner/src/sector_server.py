@@ -6,7 +6,9 @@ import numpy as np
 from f110_msgs.msg import Wpnt, WpntArray
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 from dynamic_reconfigure.server import Server
-from sector_tuner_3d.cfg import dyn_sect_tunerConfig  ### HJ : use 3D cfg (was 2D, mismatched gg_tuner rebuild target)
+# origin: from sector_tuner.cfg import dyn_sect_tunerConfig
+## IY : use self-contained 3D Config
+from sector_tuner_3d.cfg import dyn_sect_tuner_3dConfig as dyn_sect_tunerConfig
 from visualization_msgs.msg import Marker, MarkerArray
 
 class SectorPublisher:
