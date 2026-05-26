@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
+import csv
+import datetime as _dt
 import json
 import math
 import os
+import threading
 import rospkg
 import rospy
 import yaml
@@ -11,10 +14,16 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import Empty, Float64, String
 from sensor_msgs.msg import Joy
 from ackermann_msgs.msg import AckermannDriveStamped
+from vesc_msgs.msg import VescStateStamped
 from copy import deepcopy
 ### HJ : dynamic_reconfigure for live launch tuning via rqt_reconfigure
 from dynamic_reconfigure.server import Server as DynRecServer
 from stack_master.cfg import SimpleMuxConfig
+
+### HJ : per-session log root. In docker container, $HOME/catkin_ws/src/race_stack maps to host's HJ_docs.
+_REC_LOG_ROOT = os.path.expanduser("~/catkin_ws/src/race_stack/HJ_docs/debug/launch_logs")
+_REC_PLOT_HORIZON_SEC = 2.5  # window length rendered in PNG. CSV is full session.
+_REC_NAN = float('nan')
 class SimpleMuxNode:
 
     def __init__(self):
@@ -119,6 +128,18 @@ class SimpleMuxNode:
         # Same effect as LB rising: drop autodrive latch, reset launch state, force release_time so timer
         # broadcasts 1s of zero ackermann then idles.
         rospy.Subscriber("/launch_controller/abort", Empty, self._abort_cb, queue_size=1)
+
+        ### HJ : optional state_machine subscription. simple_mux must run standalone
+        # (without 3d_headtohead.launch), so the topic may never publish — in that
+        # case state stays None and launch-override behaves as before. When
+        # state_machine is up and emits TRAILING, the launch current-injection is
+        # force-aborted so the controller's speed command reaches VESC.
+        self.state_topic = rospy.get_param("~state_topic", "/state_machine")
+        self.state_stale_sec = float(rospy.get_param("~state_stale_sec", 0.5))
+        self._cur_state = None       # last string received, e.g. 'TRAILING'
+        self._state_stamp = None     # rospy.Time of last reception; None == never received
+        self._trailing_abort_logged = False  # log-once per trailing-abort event
+        rospy.Subscriber(self.state_topic, String, self._state_cb, queue_size=1)
 
         self.drive_pub = rospy.Publisher(self.out_topic, AckermannDriveStamped, queue_size=10)
         self.current_pub = rospy.Publisher("/vesc/commands/motor/current", Float64, queue_size=10)
@@ -300,6 +321,10 @@ class SimpleMuxNode:
     # First tick after DONE: pass-through but enforce safety floor (speed >= measured + small margin)
     # to defend against the edge case where controller's first speed cmd happens to be below measured.
     def _apply_launch_override(self, drive_msg):
+        ### HJ : safety gate. If state_machine reports TRAILING, abort launch and
+        # fall through so the controller's speed command reaches VESC. No-op when
+        # state_machine is absent or state is fresh-but-non-TRAILING.
+        self._maybe_abort_launch_for_trailing()
         if self.launch_active and self.launch_t0 is not None:
             t = (rospy.Time.now() - self.launch_t0).to_sec()
             if t >= self.launch_t_total:
@@ -342,6 +367,7 @@ class SimpleMuxNode:
             "accel_cmd": round(float(drive_msg.drive.acceleration), 4),
             "target_I_A": round(float(target_I), 2),
             "measured_v": round(float(self.cur_v), 3),
+            "sm_state": self._active_state() or "NONE",
         }
         self.launch_debug_pub.publish(String(data=json.dumps(d)))
 
@@ -362,6 +388,7 @@ class SimpleMuxNode:
             "accel_cmd": 0.0,
             "target_I_A": 0.0,
             "measured_v": round(float(self.cur_v), 3),
+            "sm_state": self._active_state() or "NONE",
         }
         self.launch_debug_pub.publish(String(data=json.dumps(d)))
 
@@ -400,6 +427,41 @@ class SimpleMuxNode:
             # self.human_drive = None
         # else:
         #     self.drive_pub.publish(self.zero_msg)
+    ### HJ : state_machine subscriber. Stores raw string + timestamp.
+    def _state_cb(self, msg):
+        self._cur_state = msg.data
+        self._state_stamp = rospy.Time.now()
+
+    ### HJ : returns active state string or None.
+    # None when: (a) state_machine never published (standalone simple_mux), or
+    # (b) last message older than state_stale_sec (state_machine died mid-run).
+    def _active_state(self):
+        if self._state_stamp is None:
+            return None
+        if (rospy.Time.now() - self._state_stamp).to_sec() > self.state_stale_sec:
+            return None
+        return self._cur_state
+
+    ### HJ : if active state == TRAILING, kill any in-flight or armed launch.
+    # Called every tick from _apply_launch_override before injecting current.
+    # Returns True if a launch was just aborted (so override path bails out and
+    # falls through to controller speed command).
+    def _maybe_abort_launch_for_trailing(self):
+        if self._active_state() != 'TRAILING':
+            self._trailing_abort_logged = False
+            return False
+        if not (self.launch_active or self.launch_armed):
+            return False
+        if not self._trailing_abort_logged:
+            rospy.logwarn("[launch] ABORT(TRAILING) armed=%s active=%s -> speed control",
+                          self.launch_armed, self.launch_active)
+            self._trailing_abort_logged = True
+        self.launch_armed = False
+        self.launch_active = False
+        self.launch_t0 = None
+        self.launch_post_done = False
+        return True
+
     ### HJ : equivalent of LB press from external client.
     def _abort_cb(self, _msg):
         rospy.logwarn("[launch] ABORT(external) armed=%s active=%s -> humandrive idle",
