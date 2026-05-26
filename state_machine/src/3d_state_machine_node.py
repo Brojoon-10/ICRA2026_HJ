@@ -324,6 +324,14 @@ class StateMachine:
         self.save_start_traj = False
         self.cur_start_wpnts_candidate = OTWpntArray()
         self.need_start_traj = False
+        ### HJ : pending flag set by save_start_traj_cb (callback thread) and consumed
+        # by the main loop. Avoids race where cb writes self.cur_state=START between
+        # the main loop's `state_transitions[self.cur_state]` lookup and call, which
+        # would let the freshly-set START be overwritten by the previous state's
+        # transition return value within the same tick (= the "save_traj click gets
+        # eaten" symptom).
+        self._pending_start_request = False
+        ### HJ : end
         # visualization variables
         self.first_visualization = True
         self.x_viz = 0
@@ -439,17 +447,14 @@ class StateMachine:
     # CALLBACKS #
     #############
     def save_start_traj_cb(self, msg):
-        # self.save_start_traj = True
-        if len(self.cur_start_wpnts_candidate.wpnts) !=0:
-            # self.start_wpnts = data
-            # self.start_wpnts.header.stamp = rospy.Time.now()
-            # self.start_wpnts_array = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in self.start_wpnts.wpnts])
-            self.update_velocity(self.cur_start_wpnts_candidate, self.cur_start_wpnts.vel_planner_safety_factor)
-            
-
-            self.cur_start_wpnts.initialize_traj(self.cur_start_wpnts_candidate)
-            self.cur_state = StateType.START
-            # self.save_start_traj = False
+        ### HJ : flag-only handoff to the main loop. Do NOT touch cur_state or
+        # cur_start_wpnts here — those writes raced with the main loop's
+        # state_transitions[cur_state] dispatch, causing the START transition to be
+        # overwritten in the same tick. The main loop consumes this flag at the top
+        # of its state-decision block (single-threaded, so no race).
+        if len(self.cur_start_wpnts_candidate.wpnts) != 0:
+            self._pending_start_request = True
+        ### HJ : end
 
 
     def vesc_state_cb(self, data):
@@ -2220,7 +2225,22 @@ class StateMachine:
         prev_wpnts_src = self.local_wpnts_src
         # ===== HJ ADDED END =====
 
-        if self.force_gbtrack_state:
+        ### HJ : consume pending START request from save_start_traj_cb BEFORE
+        # running the transition. Doing the initialize_traj + state set here (main
+        # thread) eliminates the cb/main-loop race. We skip state_transitions[...]
+        # for this one tick so START is guaranteed to be visible to downstream
+        # publishers; from the next tick StartTransition takes over normally.
+        if self._pending_start_request:
+            if len(self.cur_start_wpnts_candidate.wpnts) != 0:
+                self.update_velocity(self.cur_start_wpnts_candidate,
+                                     self.cur_start_wpnts.vel_planner_safety_factor)
+                self.cur_start_wpnts.initialize_traj(self.cur_start_wpnts_candidate)
+                self.cur_state = StateType.START
+                self.local_wpnts_src = StateType.START
+                rospy.logwarn(f"[{self.name}] START requested via save_start_traj")
+            self._pending_start_request = False
+        elif self.force_gbtrack_state:
+        ### HJ : end
             self.cur_state = StateType.GB_TRACK
             self.local_wpnts_src = StateType.GB_TRACK
             # rospy.logwarn(f"[{self.name}] GBTRACK state forced!!!")
