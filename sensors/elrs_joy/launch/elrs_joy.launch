@@ -19,6 +19,14 @@
         <rosparam param="axes_crsf_channels">[2, 0]</rosparam>
         <!-- Axis sign: [throttle, steering], -1.0 to invert -->
         <rosparam param="axes_invert">[1.0, -1.0]</rosparam>
+        <!-- ### HJ : per-axis CRSF calibration (measured on this transmitter).
+             Index order matches axes_crsf_channels: [throttle(CH2), steering(CH0)].
+             throttle: 174 / 1007 / 1811   (full range, mid offset from 992)
+             steering: 174 /  992 / 1773   (positive end short of 1811)
+             Asymmetric normalize ensures ±1.0 hits both mechanical stops. -->
+        <rosparam param="axes_cal_min">[174, 174]</rosparam>
+        <rosparam param="axes_cal_mid">[1007, 992]</rosparam>
+        <rosparam param="axes_cal_max">[1811, 1773]</rosparam>
 
         <!-- Button mapping: joy_index -> CRSF channel -->
         <!-- buttons[4]=LB(CH6), buttons[5]=RB(CH7) -->
@@ -38,12 +46,14 @@
         <param name="failsafe_timeout" value="0.5"/>
 
         <!-- ### HJ : LB (humandrive takeover) safety guard.
-             LB is a click switch so its healthy CRSF value is near 172 or 1811.
-             Anything in the middle band is treated as noise: LB state is held,
-             and crossing the band requires N consecutive trusted samples on
-             the other side. Protects against a bump-induced bit flip flipping
-             LB to "pressed" mid-autodrive (observed full-throttle takeover). -->
+             LB is a 3-position switch with healthy values ≈191 / ≈992 / ≈1792.
+             pos1 (low) = pressed (humandrive ON). pos2 (mid) and pos3 (high)
+             both count as released. Anything between bands is treated as
+             noise: LB state is held, and 0->1 (entry) requires N consecutive
+             trusted "pressed" samples. 1->0 (release) commits immediately. -->
         <param name="lb_pressed_max"     value="350"/>
+        <param name="lb_idle_min"        value="700"/>
+        <param name="lb_idle_max"        value="1300"/>
         <param name="lb_released_min"    value="1600"/>
         <param name="lb_debounce_frames" value="3"/>
 
