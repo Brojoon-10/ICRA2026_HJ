@@ -392,6 +392,12 @@ def ObstacleTransition_SmartMode(state_machine: StateMachine, close_to_smart: bo
     """
     smart_helper = state_machine.smart_helper
 
+    ### HJ : Priority 0 — same prediction-signaled force_trailing gate as GB mode.
+    # Smart static mode still uses the parent state_machine's force_trailing flag.
+    if state_machine._check_force_trailing():
+        return StateType.TRAILING, StateType.GB_TRACK
+    ### HJ : end
+
     wpnts_valid = smart_helper._check_latest_wpnts(
         state_machine.smart_static_wpnts,
         state_machine.cur_smart_static_avoidance_wpnts)
@@ -493,6 +499,15 @@ def ObstacleTransition_GBMode(state_machine: StateMachine, close_to_gb: bool) ->
         close_to_gb: True if close to GB raceline
     """
     # rospy.logwarn(f">>> ObstacleTransition_GBMode: close_to_gb={close_to_gb}, num_obs={len(state_machine.cur_obstacles_in_interest)}")
+
+    ### HJ : Priority 0 — prediction-signaled force_trailing.
+    # When prediction is on its stop-gap branch (GP not trained yet or opponent off its
+    # raceline) it requests trailing. self.force_trailing is already gated by
+    # use_force_trailing in the callback, so reaching here means the master switch is on
+    # AND prediction wants trailing. Honor it before any GB / OT logic.
+    if state_machine._check_force_trailing():
+        return StateType.TRAILING, StateType.GB_TRACK
+    ### HJ : end
 
     gb_path_free = state_machine._check_free_frenet(state_machine.cur_gb_wpnts)
 

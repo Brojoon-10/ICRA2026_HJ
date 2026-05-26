@@ -222,6 +222,21 @@ class OppTrajPredictor:
     def state_cb(self, data: String):
         self.state = data.data
 
+    ### HJ : centralize force_trailing publish with START-phase guard.
+    # Branches 1/2 (VD blended, linear-to-center) emit True because the
+    # underlying prediction is a stop-gap when GP raceline is not yet
+    # trustworthy. But during START the controller is still settling and
+    # forcing trailing kills the launch dash. State machine has its own
+    # _check_free_frenet that catches a real path violation, so it is safe
+    # to suppress the force flag while state == "START".
+    def _publish_force_trailing(self, value: bool):
+        current_state = self.state if isinstance(self.state, str) else ""
+        if current_state == "START":
+            self.force_trailing_pub.publish(False)
+        else:
+            self.force_trailing_pub.publish(value)
+    ### HJ : end
+
     def dyn_param_cb(self, params: Config):
         self.time_steps = rospy.get_param("dynamic_prediction_tuner_node/n_time_steps", 200)
         self.dt = rospy.get_param("dynamic_prediction_tuner_node/dt", 0.02)
@@ -324,7 +339,7 @@ class OppTrajPredictor:
 
                 # ===== VD blended method =====
                 if use_vd_method:
-                    self.force_trailing_pub.publish(True)
+                    self._publish_force_trailing(True)  ### HJ : START-guarded publish
 
                     obstacle_list = []
                     prediction_list = []
@@ -427,7 +442,7 @@ class OppTrajPredictor:
 
                 # ===== Linear interpolation to center =====
                 elif use_original_method:
-                    self.force_trailing_pub.publish(True)
+                    self._publish_force_trailing(True)  ### HJ : START-guarded publish
 
                     obstacle_list = []
                     prediction_list = []
@@ -498,7 +513,7 @@ class OppTrajPredictor:
 
                 # ===== Follow learned trajectory =====
                 else:
-                    self.force_trailing_pub.publish(False)
+                    self._publish_force_trailing(False)  ### HJ : START-guarded publish (passes through)
 
                     obstacle_list = []
                     prediction_list = []

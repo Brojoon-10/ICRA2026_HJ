@@ -283,7 +283,12 @@ class StateMachine:
         self.side_by_side_threshold = 0.6
         self.merger = None
         self.force_trailing = False
-        self.use_force_trailing = not rospy.get_param("state_machine/use_force_trailing", False)
+        ### HJ : use_force_trailing is a master switch — True means "accept prediction's
+        # force_trailing opinion", False means "ignore prediction's request entirely".
+        # The previous `not` inverted this so yaml=false became enabled; that fights the
+        # dynparam path at L707 (no `not`) and is now removed.
+        self.use_force_trailing = rospy.get_param("state_machine/use_force_trailing", False)
+        ### HJ : end
 
         # spliner variables
         self.splini_ttl = rospy.get_param("state_machine/splini_ttl", 2.0) if self.ot_planner == "spliner" else rospy.get_param("state_machine/pred_splini_ttl", 0.2)
@@ -403,7 +408,11 @@ class StateMachine:
                 rospy.Subscriber("/planner/avoidance/static_otwpnts", OTWpntArray, self.static_avoidance_cb)
         if self.ot_planner == "predictive_spliner":
             rospy.Subscriber("/planner/avoidance/merger", Float32MultiArray, self.merger_cb)
-            rospy.Subscriber("collision_prediction/force_trailing", Bool, self.force_trailing_cb)
+            ### HJ : rewired from legacy `collision_prediction/force_trailing` (no publisher
+            # anywhere in the repo — dangling since the 3D migration) to the actual publisher
+            # in prediction/gp_traj_predictor/src/3d_opp_prediction.py.
+            rospy.Subscriber("/opponent_prediction/force_trailing", Bool, self.force_trailing_cb)
+            ### HJ : end
             rospy.Subscriber("planner/avoidance/fail_trailing", Bool, self.fail_trailing_cb)
         if not rospy.get_param("/sim"):
             rospy.Subscriber("/vesc/sensors/core", VescStateStamped, self.vesc_state_cb) # for reading battery voltage
@@ -1460,8 +1469,13 @@ class StateMachine:
     #             return False
     #     return False
         
-    # def _check_force_trailing(self) -> bool:
-    #     return self.force_trailing
+    ### HJ : restored — consumed by state_transitions to gate TRAILING on prediction
+    # unreliability signal. self.force_trailing is already clamped to False in the
+    # callback when use_force_trailing is False, so this method does not need to
+    # re-check the master switch.
+    def _check_force_trailing(self) -> bool:
+        return self.force_trailing
+    ### HJ : end
 
     # def _check_fail_trailing(self) -> bool:
     #     return self.fail_trailing
