@@ -14,8 +14,11 @@ find_package(catkin REQUIRED COMPONENTS
   dynamic_reconfigure
 )
 
+## IY : switched to self-contained 3D cfg
+##      (cfg/static_obs_dyn_sect_tuner_3d.cfg). Legacy cfg referenced the
+##      2D package and is left in-tree as dead code.
 generate_dynamic_reconfigure_options(
-  cfg/static_obs_dyn_sect_tuner.cfg
+  cfg/static_obs_dyn_sect_tuner_3d.cfg
 )
 
 ## System dependencies are found with CMake's conventions
