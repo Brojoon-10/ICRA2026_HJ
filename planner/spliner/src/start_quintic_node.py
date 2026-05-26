@@ -17,22 +17,40 @@
 ###   d(s*) = 0, d'(s*) = 0, d''(s*) = 0                  # G2 convergence
 ###   Cartesian curvature uses full formula so feasibility is honest in curves.
 import math
+import os
 import json
+import yaml
 import rospy
+import rospkg
 import numpy as np
 import tf.transformations as tft
 
 from nav_msgs.msg import Odometry
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, PoseStamped
 from scipy.interpolate import BPoly
 from dynamic_reconfigure.server import Server
+import dynamic_reconfigure.client
 
 from f110_msgs.msg import WpntArray, Wpnt, OTWpntArray
 from frenet_converter.frenet_converter import FrenetConverter
 
 from spliner.cfg import start_quinticConfig
+
+### HJ : keys persisted to per-car yaml. Trigger-style bools (snapshot, clear_points,
+# abort_start, save_params, load_params, auto_commit_on_snapshot) intentionally excluded
+# — they are momentary commands, not state. auto_commit_on_snapshot is a behavior toggle
+# but trivial; keep it out of yaml to avoid load resurrecting an unexpected default.
+_PERSISTED_PARAM_KEYS = [
+    "path_mode",
+    "target_delta_s_m", "bound_margin_m", "ay_max_mps2", "assume_speed_mps",
+    "n_samples", "min_delta_s_m", "zero_start_slope",
+    "use_straight_prefix", "straight_prefix_m",
+    "spline_scale", "points_tail_n",
+    "points_use_straight_prefix", "points_straight_prefix_m",
+]
+### HJ : end
 
 
 def _wrap_pi(a):
@@ -95,10 +113,83 @@ class StartQuinticNode:
         # 3d_state_machine_node's start_wpnts_cb picks it up unmodified. Only emits
         # when publish_to_state_machine is True (rqt toggle).
         self.sm_pub = rospy.Publisher("/planner/start_wpnts", OTWpntArray, queue_size=1)
+        ### HJ : auto-commit + abort publishers. /save_start_traj is the same topic the
+        # dynamic_statemachine save_start_traj toggle drives; we add a second publisher
+        # so the rqt toggle there remains as a manual fallback. /abort_start_traj is new.
+        self.save_pub = rospy.Publisher("/save_start_traj", Bool, queue_size=1)
+        self.abort_pub = rospy.Publisher("/abort_start_traj", Bool, queue_size=1)
+        self.auto_commit_on_snapshot = True
+        ### HJ : end
 
-        Server(start_quinticConfig, self.dyn_cb)
+        ### HJ : resolve per-car yaml path. racecar_version is the standard rosparam used
+        # across the stack (launch files set it from $(env CAR_NAME)). Fall back to env
+        # for standalone runs without launch, then to 'default' so the node never errors.
+        car = rospy.get_param("~racecar_version", None)
+        if not car:
+            car = rospy.get_param("/racecar_version", None)
+        if not car:
+            car = os.getenv("CAR_NAME", None)
+        if not car:
+            car = "default"
+            rospy.logwarn(f"[{self.name}] no racecar_version / CAR_NAME found, using '{car}'")
+        self._car_name = car
+        try:
+            cfg_root = rospkg.RosPack().get_path("stack_master")
+        except rospkg.ResourceNotFound:
+            cfg_root = os.path.expanduser("~/catkin_ws/src/race_stack/stack_master")
+            rospy.logwarn(f"[{self.name}] stack_master not found via rospack, falling back to {cfg_root}")
+        self._yaml_path = os.path.join(cfg_root, "config", car, "start_quintic.yaml")
+        rospy.loginfo(f"[{self.name}] yaml param store: {self._yaml_path}")
+        ### HJ : end
+
+        # Server must be created before dyn_client (client needs the service up).
+        self._dyn_server = Server(start_quinticConfig, self.dyn_cb)
+
+        ### HJ : self-client for load_params — pushes loaded values back through dyn
+        # service so dyn_cb runs and self.* attributes stay in sync with rqt sliders.
+        self._dyn_client = dynamic_reconfigure.client.Client(self.name, timeout=5.0)
+        ### HJ : end
+
+        ### HJ : auto-load on startup. If yaml exists, push it. Otherwise dump the
+        # current .cfg defaults so the file exists for next time.
+        if rospy.get_param("~auto_load_on_startup", True):
+            if os.path.isfile(self._yaml_path):
+                self._load_params_from_yaml()
+            else:
+                rospy.loginfo(f"[{self.name}] no yaml at {self._yaml_path}, creating with .cfg defaults")
+                self._save_params_to_yaml()
+        ### HJ : end
 
         self.rate = rospy.Rate(10.0)
+
+    ### HJ : yaml persistence helpers ───────────────────
+    def _current_params_dict(self):
+        """Read current self.* values for the persisted keys."""
+        return {k: getattr(self, k) for k in _PERSISTED_PARAM_KEYS}
+
+    def _save_params_to_yaml(self):
+        try:
+            os.makedirs(os.path.dirname(self._yaml_path), exist_ok=True)
+            data = self._current_params_dict()
+            with open(self._yaml_path, "w") as f:
+                yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+            rospy.loginfo(f"[{self.name}] params saved to {self._yaml_path}")
+        except Exception as e:
+            rospy.logwarn(f"[{self.name}] save_params failed: {e}")
+
+    def _load_params_from_yaml(self):
+        try:
+            with open(self._yaml_path, "r") as f:
+                data = yaml.safe_load(f) or {}
+            update = {k: data[k] for k in _PERSISTED_PARAM_KEYS if k in data}
+            if not update:
+                rospy.logwarn(f"[{self.name}] yaml at {self._yaml_path} had no known keys")
+                return
+            self._dyn_client.update_configuration(update)
+            rospy.loginfo(f"[{self.name}] params loaded from {self._yaml_path} ({len(update)} keys)")
+        except Exception as e:
+            rospy.logwarn(f"[{self.name}] load_params failed: {e}")
+    ### HJ : end
 
     # ─────────────────── Callbacks ───────────────────
     def gb_cb(self, msg: WpntArray):
@@ -169,6 +260,22 @@ class StartQuinticNode:
             rospy.loginfo(f"[{self.name}] cleared {len(self.points)} point(s)")
             self.points = []
             config.clear_points = False
+        ### HJ : new triggers — auto-commit setting, abort, save/load yaml.
+        self.auto_commit_on_snapshot = config.auto_commit_on_snapshot
+        if config.abort_start:
+            self.abort_pub.publish(Bool(data=True))
+            rospy.logwarn(f"[{self.name}] abort_start published")
+            config.abort_start = False
+        if config.save_params:
+            self._save_params_to_yaml()
+            config.save_params = False
+        if config.load_params:
+            # update_configuration would re-enter dyn_cb; defer one tick is overkill —
+            # the recursive call just runs through this block again with all triggers
+            # already False, which is safe.
+            self._load_params_from_yaml()
+            config.load_params = False
+        ### HJ : end
         return config
 
     def point_cb(self, msg: PoseStamped):
@@ -389,6 +496,14 @@ class StartQuinticNode:
             self._publish_to_state_machine(s_all, d_all, x_all, y_all, psi_path, kappa_all)
             self._pending_snapshot = False
             rospy.loginfo(f"[{self.name}] snapshot sent to state_machine candidate")
+            ### HJ : auto-commit — fire /save_start_traj in the same tick so the
+            # state_machine pending-flag is set right after start_wpnts_cb stores
+            # the candidate. Race-safe on the state_machine side: both subs land in
+            # the same callback queue and the main loop drains the flag next tick.
+            if self.auto_commit_on_snapshot:
+                self.save_pub.publish(Bool(data=True))
+                rospy.loginfo(f"[{self.name}] auto-commit: /save_start_traj published")
+            ### HJ : end
 
     # ─────────────────── POINTS mode ───────────────────
     def _tick_points(self):
@@ -525,6 +640,11 @@ class StartQuinticNode:
             self._publish_to_state_machine(s_all, d_all, x_all, y_all, psi_path, kappa_all)
             self._pending_snapshot = False
             rospy.loginfo(f"[{self.name}] snapshot sent to state_machine candidate")
+            ### HJ : auto-commit (POINTS mode) — same flow as QUINTIC.
+            if self.auto_commit_on_snapshot:
+                self.save_pub.publish(Bool(data=True))
+                rospy.loginfo(f"[{self.name}] auto-commit: /save_start_traj published")
+            ### HJ : end
 
     # ─────────────────── Publish helpers ───────────────────
     def _publish_path(self, s, d, x, y, psi, kappa):
