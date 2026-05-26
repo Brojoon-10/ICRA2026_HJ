@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 
 import numpy as np
+import rospkg
 import rospy
 import yaml
 from std_msgs.msg import String
@@ -876,7 +877,35 @@ class GGTunerNode:
                 self.sector_respawn_proc.kill()
         self.sector_respawn_proc = None
 
-        time.sleep(0.3)  # kill 안정화
+        time.sleep(0.3) 
+
+        ## IY : rebuild 3 sector_tuner_3d packages so the new yaml in
+        ##      each pkg's cfg/ regenerates the dyn_reconfigure Config
+        ##      that the respawned servers will import. Run in parallel
+        ##      and wait for all to finish before respawn.
+        rebuild_pkgs = ('sector_tuner_3d',
+                        'overtaking_sector_tuner_3d',
+                        'static_obstacle_sector_tuner_3d')
+        rebuild_procs = []
+        for pkg in rebuild_pkgs:
+            try:
+                pkg_path = rospkg.RosPack().get_path(pkg)
+            except rospkg.ResourceNotFound:
+                rospy.logerr(f"[GGTuner] [apply_sectors] pkg not found: {pkg}")
+                continue
+            shell = os.path.join(pkg_path, 'scripts/finish_sector_3d.sh')
+            if not os.path.exists(shell):
+                rospy.logerr(f"[GGTuner] [apply_sectors] missing: {shell}")
+                continue
+            rospy.loginfo(f"[GGTuner] [apply_sectors] rebuild: {pkg}")
+            rebuild_procs.append(subprocess.Popen([shell]))
+        for p in rebuild_procs:
+            try:
+                p.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                rospy.logerr("[GGTuner] [apply_sectors] rebuild timeout")
+                p.kill()
+        ## IY : end rebuild
 
         cmd = ['roslaunch', 'stack_master', '3d_sector_respawn.launch',
                f'map:={map_name}']
