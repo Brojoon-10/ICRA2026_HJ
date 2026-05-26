@@ -336,6 +336,11 @@ class StateMachine:
         # transition return value within the same tick (= the "save_traj click gets
         # eaten" symptom).
         self._pending_start_request = False
+        ### HJ : abort flag — set by /abort_start_traj cb (quintic's rqt trigger),
+        # consumed by the main loop. Always clears cur_start_wpnts.is_init; only
+        # forces GB_TRACK when currently in START so an idle abort does not yank
+        # the car out of a normal state.
+        self._pending_abort_start = False
         ### HJ : end
         # visualization variables
         self.first_visualization = True
@@ -439,6 +444,9 @@ class StateMachine:
             self.latency_pub = rospy.Publisher("/state_machine/latency", Float32, queue_size=10)
 
         rospy.Subscriber("/save_start_traj", Bool, self.save_start_traj_cb)
+        ### HJ : abort START path (quintic publishes this on the abort_start trigger).
+        rospy.Subscriber("/abort_start_traj", Bool, self.abort_start_traj_cb)
+        ### HJ : end
 
         # ===== HJ ADDED: Initialize Smart Static helper for Fixed Frenet transitions =====
         from state_helper_for_smart import SmartStaticChecker
@@ -464,6 +472,13 @@ class StateMachine:
         if len(self.cur_start_wpnts_candidate.wpnts) != 0:
             self._pending_start_request = True
         ### HJ : end
+
+    ### HJ : abort START — quintic's rqt trigger publishes Bool(True) on
+    # /abort_start_traj. Same flag-only pattern as save_start_traj_cb; consumed in
+    # the main loop where cur_state can be safely mutated.
+    def abort_start_traj_cb(self, msg):
+        self._pending_abort_start = True
+    ### HJ : end
 
 
     def vesc_state_cb(self, data):
@@ -2238,6 +2253,21 @@ class StateMachine:
         prev_state = self.cur_state
         prev_wpnts_src = self.local_wpnts_src
         # ===== HJ ADDED END =====
+
+        ### HJ : consume pending ABORT request first — abort always wins over a
+        # stale start request and over forced states. Clears candidate buffer and
+        # drops to GB_TRACK only if currently in START.
+        if self._pending_abort_start:
+            self.cur_start_wpnts.is_init = False
+            self._pending_start_request = False   # cancel any racing start request
+            if self.cur_state == StateType.START:
+                self.cur_state = StateType.GB_TRACK
+                self.local_wpnts_src = StateType.GB_TRACK
+                rospy.logwarn(f"[{self.name}] ABORT: START → GB_TRACK")
+            else:
+                rospy.logwarn(f"[{self.name}] ABORT: candidate cleared (state={self.cur_state.name})")
+            self._pending_abort_start = False
+        ### HJ : end
 
         ### HJ : consume pending START request from save_start_traj_cb BEFORE
         # running the transition. Doing the initialize_traj + state set here (main
