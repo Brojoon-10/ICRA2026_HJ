@@ -10,6 +10,7 @@ ELRS Joy Node (ROS1)
 
 import rospy
 from sensor_msgs.msg import Joy
+from std_msgs.msg import Int32MultiArray
 import serial
 import time
 
@@ -48,10 +49,21 @@ class ELRSJoyNode:
         self.button_invert = rospy.get_param('~button_invert', [0, 0])
         self.button_threshold = rospy.get_param('~button_threshold', 992)
         self.axes_invert = rospy.get_param('~axes_invert', [1.0, 1.0])
+        ### HJ : per-axis (min, mid, max) calibration in CRSF raw units. Each
+        ### HJ : entry is for the corresponding axes_crsf_channels[i]. Used by
+        ### HJ : normalize_axis to map raw -> [-1, +1] with asymmetric stops so
+        ### HJ : that hitting the real mechanical max yields exactly +1.0 even
+        ### HJ : when the transmitter end-point isn't the canonical 172/1811.
+        ### HJ : Falls back to (172, 992, 1811) per axis if length mismatches.
+        self.axes_cal_min = rospy.get_param('~axes_cal_min', [172, 172])
+        self.axes_cal_mid = rospy.get_param('~axes_cal_mid', [992, 992])
+        self.axes_cal_max = rospy.get_param('~axes_cal_max', [1811, 1811])
         self.deadzone = rospy.get_param('~deadzone', 0.05)
         self.failsafe_timeout = rospy.get_param('~failsafe_timeout', 2.0)
 
         self.joy_pub = rospy.Publisher('joy', Joy, queue_size=10)
+        ### HJ : raw CRSF channels for live debug (Int32MultiArray of 16 ch values)
+        self.debug_ch_pub = rospy.Publisher('~debug_channels', Int32MultiArray, queue_size=10)
 
         self.channels = [self.CH_MID] * self.CRSF_NUM_CHANNELS
         self.last_valid_time = time.time()
@@ -80,19 +92,22 @@ class ELRSJoyNode:
         ### HJ : most dangerous bit: if it spuriously flips to 1 mid-autodrive,
         ### HJ : simple_mux drops the autodrive latch and pushes raw stick value
         ### HJ : to VESC — observed once as a sudden full-throttle event after a
-        ### HJ : bump shook the USB-TTL. LB is a discrete (click) switch so its
-        ### HJ : healthy CRSF value sits near 172 (pressed) or 1811 (released);
-        ### HJ : a single bit corruption typically lands the value in the wide
-        ### HJ : middle band that no real input ever produces. We treat any LB
-        ### HJ : sample inside (lb_pressed_max, lb_released_min) as untrusted and
-        ### HJ : hold the previous LB state. Asymmetric debounce: 0 -> 1
-        ### HJ : (humandrive entry) requires N consecutive trusted "pressed"
-        ### HJ : samples — this is the dangerous direction. 1 -> 0 (humandrive
-        ### HJ : release) is accepted immediately once a trusted "released"
-        ### HJ : sample arrives — release is safe (car falls back to autodrive
-        ### HJ : or idle), and delaying it would only keep the user trapped in
-        ### HJ : humandrive after they intentionally let go of the button.
+        ### HJ : bump shook the USB-TTL.
+        ### HJ : LB is a 3-position switch with healthy resting values:
+        ### HJ :   pos1 ≈ 191  (pressed / humandrive ON)
+        ### HJ :   pos2 ≈ 992  (mid, IDLE — user's "released")
+        ### HJ :   pos3 ≈ 1792 (high, also treated as released)
+        ### HJ : Any sample outside these three bands is untrusted (bit
+        ### HJ : corruption / transient) and lb_state is held. Asymmetric
+        ### HJ : debounce: 0 -> 1 (humandrive entry) requires N consecutive
+        ### HJ : trusted "pressed" samples — this is the dangerous direction.
+        ### HJ : 1 -> 0 (release) commits immediately on first trusted
+        ### HJ : "released" sample so the user is never trapped in humandrive.
+        ### HJ : Released = pos2 band OR pos3 band; mid-band gaps (between
+        ### HJ : positions) remain untrusted.
         self.lb_pressed_max  = int(rospy.get_param('~lb_pressed_max',  350))
+        self.lb_idle_min     = int(rospy.get_param('~lb_idle_min',     700))
+        self.lb_idle_max     = int(rospy.get_param('~lb_idle_max',    1300))
         self.lb_released_min = int(rospy.get_param('~lb_released_min', 1600))
         self.lb_debounce_frames = int(rospy.get_param('~lb_debounce_frames', 3))
         # State held across publish_joy calls
@@ -100,8 +115,23 @@ class ELRSJoyNode:
         self.lb_pending = 0        # candidate value currently accumulating
         self.lb_pending_count = 0  # consecutive trusted samples agreeing with lb_pending
 
-    def normalize_axis(self, value):
-        normalized = (value - self.CH_MID) / (self.NORM_MAX - self.CH_MID)
+    def normalize_axis(self, value, cal_min=None, cal_mid=None, cal_max=None):
+        ### HJ : asymmetric normalization around per-axis calibrated mid.
+        ### HJ : below mid -> scale by (mid - min); above mid -> scale by
+        ### HJ : (max - mid). Guarantees full ±1.0 reach at each side's real
+        ### HJ : end-point, independent of transmitter end-point asymmetry.
+        if cal_min is None:
+            cal_min = self.NORM_MIN
+        if cal_mid is None:
+            cal_mid = self.CH_MID
+        if cal_max is None:
+            cal_max = self.NORM_MAX
+        if value >= cal_mid:
+            span = cal_max - cal_mid
+            normalized = (value - cal_mid) / span if span > 0 else 0.0
+        else:
+            span = cal_mid - cal_min
+            normalized = (value - cal_mid) / span if span > 0 else 0.0
         normalized = max(-1.0, min(1.0, normalized))
         if abs(normalized) < self.deadzone:
             normalized = 0.0
@@ -219,7 +249,11 @@ class ELRSJoyNode:
         msg.buttons = [0] * self.num_buttons
         for i, (joy_idx, crsf_ch) in enumerate(zip(self.axes_joy_indices, self.axes_crsf_channels)):
             sign = self.axes_invert[i] if i < len(self.axes_invert) else 1.0
-            msg.axes[joy_idx] = sign * self.normalize_axis(self.channels[crsf_ch])
+            cal_min = self.axes_cal_min[i] if i < len(self.axes_cal_min) else self.NORM_MIN
+            cal_mid = self.axes_cal_mid[i] if i < len(self.axes_cal_mid) else self.CH_MID
+            cal_max = self.axes_cal_max[i] if i < len(self.axes_cal_max) else self.NORM_MAX
+            msg.axes[joy_idx] = sign * self.normalize_axis(
+                self.channels[crsf_ch], cal_min, cal_mid, cal_max)
         for i, (joy_idx, crsf_ch) in enumerate(zip(self.button_joy_indices, self.button_crsf_channels)):
             inv = self.button_invert[i] if i < len(self.button_invert) else 0
             ### HJ : LB (joy_idx==4) uses dead-band + N-frame debounce. Mid-band
@@ -230,12 +264,20 @@ class ELRSJoyNode:
             else:
                 msg.buttons[joy_idx] = self.channel_to_button(self.channels[crsf_ch], invert=inv)
         self.joy_pub.publish(msg)
+        ### HJ : also publish raw CRSF channel snapshot for live diagnosis
+        dbg = Int32MultiArray()
+        dbg.data = [int(v) for v in self.channels]
+        self.debug_ch_pub.publish(dbg)
 
     def _lb_filtered_button(self, raw_value, invert):
         ### HJ : map raw CRSF value to a candidate (0/1/None=untrusted) using the
-        ### HJ : dead-band, then run an N-frame agreement filter against lb_state.
+        ### HJ : 3-position band model, then run an N-frame agreement filter
+        ### HJ : against lb_state. For the default (invert=0) LB switch, pos1
+        ### HJ : (≈191) is pressed and both pos2 (≈992) and pos3 (≈1792) count
+        ### HJ : as released — any value outside those bands is untrusted noise.
         if invert:
-            # invert=1: pressed when value is HIGH (near 1811)
+            # invert=1: pressed when value is HIGH (near 1811), released when LOW.
+            # Kept for non-LB channels that reuse this filter via legacy config.
             if raw_value >= self.lb_released_min:
                 candidate = 1
             elif raw_value <= self.lb_pressed_max:
@@ -243,13 +285,15 @@ class ELRSJoyNode:
             else:
                 candidate = None
         else:
-            # default: pressed when value is LOW (near 172)
+            # 3-position model
             if raw_value <= self.lb_pressed_max:
-                candidate = 1
+                candidate = 1  # pos1: pressed
+            elif self.lb_idle_min <= raw_value <= self.lb_idle_max:
+                candidate = 0  # pos2: idle = released
             elif raw_value >= self.lb_released_min:
-                candidate = 0
+                candidate = 0  # pos3: also released
             else:
-                candidate = None
+                candidate = None  # between-position transient / bit corruption
 
         if candidate is None:
             ### HJ : mid-band sample - untrusted. Hold lb_state, reset pending.
