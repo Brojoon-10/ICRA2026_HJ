@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
+import json
+
 import rospy
 
+from std_msgs.msg import String
 from visualization_msgs.msg import Marker
 from blink1.msg import Blink1msg
 
@@ -9,6 +12,10 @@ BL_FADE      = 1  # fade to the RGB color, t is the time of fading in ms
 BL_ON        = 2  # turn on to the RGB color, t is ignored
 BL_BLINK     = 3  # blink the RGB color, t is the period in ms
 BL_RANDBLINK = 4  # blink at random RGB colors, t is the period in ms
+
+### HJ : current (launch) mode override colour — cyan.
+LAUNCH_OVERRIDE_RGB = (0, 255, 255)
+### HJ : end
 
 
 class StateIndicatorNode:
@@ -25,8 +32,23 @@ class StateIndicatorNode:
         self.name = "state_indicator_node"
         rospy.init_node(self.name, anonymous=True)
 
+        ### HJ : launch (current-injection) mode flag, driven by simple_mux's
+        # /launch_controller/debug heartbeat (50Hz, present whenever the mux runs).
+        # The LED is repainted on the active EDGE (not just on /state_marker) so the
+        # override works even when state_machine / headtohead is NOT running and no
+        # /state_marker ever arrives. last_state_rgb caches the most recent normal
+        # state colour; it starts OFF so that without state_machine the LED simply
+        # goes cyan during launch and back to OFF afterwards.
+        self.launch_active = False
+        self.last_state_rgb = (0, 0, 0)  # OFF until a real /state_marker is seen
+        ### HJ : end
+
         # Subscribe to the topics
         rospy.Subscriber('/state_marker', Marker, self.state_callback)
+        ### HJ : current-mode source. Topic name overridable to match simple_mux.
+        launch_topic = rospy.get_param('~launch_debug_topic', '/launch_controller/debug')
+        rospy.Subscriber(launch_topic, String, self.launch_debug_callback)
+        ### HJ : end
         # Publish the topics
         self.blink_pub = rospy.Publisher('blink1/blink', Blink1msg, queue_size=10)
 
@@ -34,20 +56,51 @@ class StateIndicatorNode:
     # CALLBACKS #
     #############
 
+    ### HJ : push an RGB triple to the blink1 LED.
+    def _publish_rgb(self, rgb):
+        blink_msg = Blink1msg()
+        blink_msg.function = BL_ON
+        blink_msg.t = 10  # milliseconds
+        blink_msg.r, blink_msg.g, blink_msg.b = rgb
+        self.blink_pub.publish(blink_msg)
+    ### HJ : end
+
+    ### HJ : track launch (current) mode and repaint the LED every heartbeat. simple_mux
+    # publishes /launch_controller/debug at 50Hz with active true AND false (idle
+    # heartbeat), so we just paint the current intent each tick — no edge detection,
+    # no timer. This is also the single repaint source that makes the override robust:
+    # if a frame is lost or a concurrent state_callback briefly clobbers the colour,
+    # the next heartbeat (20ms) repaints it. When active is false we repaint
+    # last_state_rgb, which is the real state colour if state_machine is running, or
+    # the OFF default if it is not (so the LED goes dark after launch without
+    # state_machine).
+    def launch_debug_callback(self, msg):
+        try:
+            self.launch_active = bool(json.loads(msg.data).get("active", False))
+        except (ValueError, TypeError):
+            # Malformed payload — leave the last known flag untouched.
+            return
+        if self.launch_active:
+            self._publish_rgb(LAUNCH_OVERRIDE_RGB)          # cyan while in current mode
+        else:
+            self._publish_rgb(self.last_state_rgb)          # restore (OFF if no state_machine)
+    ### HJ : end
+
     def state_callback(self, state_msg):
         """
-        Callback function for the state of the racecar. 
+        Callback function for the state of the racecar.
 
         Args:
         - state_msg (String): The received message containing the state.
         """
-        blink_msg = Blink1msg()
-        blink_msg.function = BL_ON # BL_FADE, BL_ON, BL_RANDBLINK, BL_BLINK
-        blink_msg.t= 10 # miliseconds
-        blink_msg.r= int(255 * state_msg.color.r)
-        blink_msg.g= int(255 * state_msg.color.g)
-        blink_msg.b= int(255 * state_msg.color.b)        
-        self.blink_pub.publish(blink_msg)
+        ### HJ : cache the normal state colour; only paint it while NOT in launch
+        # mode so the cyan override is not clobbered by incoming state markers.
+        self.last_state_rgb = (int(255 * state_msg.color.r),
+                               int(255 * state_msg.color.g),
+                               int(255 * state_msg.color.b))
+        if not self.launch_active:
+            self._publish_rgb(self.last_state_rgb)
+        ### HJ : end
 
 
 if __name__ == '__main__':
