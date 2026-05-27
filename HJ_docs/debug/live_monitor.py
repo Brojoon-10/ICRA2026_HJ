@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # Live monitor v2 — delay/wait 중심 (CPU 안 봄)
 # 100ms 단위 fine-grained 샘플링 → 5s마다 max wait, p95, event count 보고
-import os, sys, time
+#
+# 5 axes (what we watch): rslidar input, lidar-odom(glim worker), base_odom, sm, cm.
+# - PIDs are re-discovered every report so node restarts are tracked automatically;
+#   a node that is down simply shows blank (does not break the rest).
+# - With --json-out <path>, the latest slice is written as one JSON line each
+#   report so an external tool (set_pl.sh monitor) can merge it. Loose coupling:
+#   the consumer treats a missing/stale file as "no data".
+import os, sys, time, json, argparse
 from collections import deque
 
 INTERVAL = 5.0
@@ -12,18 +19,54 @@ import rospy
 from sensor_msgs.msg import PointCloud2
 from nav_msgs.msg import Odometry
 
+ap = argparse.ArgumentParser()
+ap.add_argument("--json-out", default=os.environ.get("LIVE_MONITOR_JSON", ""),
+                help="path to write latest-slice JSON (one line, overwritten each report)")
+args = ap.parse_args()
 
-def find_pid(pat):
-    for p in os.popen(f"pgrep -f '{pat}'").read().split():
-        return int(p)
+# Substrings that must ALL be present in a process's cmdline for it to count as
+# the real node. Using "__name:=<node>" (set by roslaunch on the actual node)
+# plus the script/binary token rules out the launch parent, wrapper shells, and
+# our own pgrep/grep — those were matching the loose patterns and getting picked
+# by head -1, which is why sm/cm sometimes read 0ms.
+NODE_MATCH = {
+    "sm":   ["__name:=state_machine", "3d_state_machine_node"],
+    "cm":   ["__name:=controller_manager", "controller_manager.py"],
+    "glim": ["__name:=glim_ros", "glim_rosnode"],
+}
+SELF_PID = os.getpid()
+
+
+def _cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def find_pid(key):
+    """Return the pid of the real node for `key`, or None. A process qualifies
+    only if its cmdline contains ALL required tokens (so launch/bash/pgrep that
+    merely mention the node name are excluded)."""
+    toks = NODE_MATCH[key]
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        p = int(pid)
+        if p == SELF_PID:
+            continue
+        cl = _cmdline(p)
+        if cl and all(t in cl for t in toks):
+            return p
     return None
 
 
-pids = {
-    "sm":   find_pid("3d_state_machine_node"),
-    "cm":   find_pid("controller_manager"),
-    "glim": find_pid("__name:=glim_ros"),
-}
+def discover_pids():
+    return {k: find_pid(k) for k in NODE_MATCH}
+
+
+pids = discover_pids()
 
 
 def read_wait_ns(pid):
@@ -76,6 +119,36 @@ prev_t = time.monotonic()
 next_report = prev_t + INTERVAL
 slice_waits = {k: [] for k in pids}
 
+# Track which pid each key currently maps to, so a restart resets the baseline
+# (new pid's cumulative run_delay must not be diffed against the old pid's).
+cur_pid = dict(pids)
+
+
+def write_json(path, ts, stats, base_hz, base_max_gap, rsl_hz, rsl_max_gap, flags):
+    """Overwrite path with one JSON line describing the latest slice. Atomic via
+    temp+rename so a concurrent reader never sees a half-written file."""
+    if not path:
+        return
+    rec = {
+        "t": time.time(),  # wall clock for staleness check by consumer
+        "ts": ts,
+        # None => node not running (consumer shows blank)
+        "sm":   None if cur_pid["sm"]   is None else round(stats["sm"][0], 1),
+        "cm":   None if cur_pid["cm"]   is None else round(stats["cm"][0], 1),
+        "glim": None if cur_pid["glim"] is None else round(stats["glim"][0], 1),
+        "base_hz": round(base_hz, 1), "base_gap": round(base_max_gap, 1),
+        "rsl_hz": round(rsl_hz, 1), "rsl_gap": round(rsl_max_gap, 1),
+        "flags": flags,
+    }
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(rec))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 try:
     while True:
         time.sleep(SAMPLE_DT)
@@ -83,8 +156,9 @@ try:
         for k, pid in pids.items():
             w = read_wait_ns(pid)
             dw = w - prev_wait[k]
+            # negative dw (pid wrapped/restarted) -> treat as 0 this slice
             prev_wait[k] = w
-            slice_waits[k].append(dw / 1e6)  # ms in this ~100ms slice
+            slice_waits[k].append(max(0.0, dw) / 1e6)  # ms in this ~100ms slice
         prev_t = now
 
         if now >= next_report:
@@ -125,6 +199,20 @@ try:
                   f"{base_hz:>5.1f} {base_max_gap:>6.1f}  "
                   f"{rsl_hz:>5.1f} {rsl_max_gap:>6.1f}  {flag_str}")
             sys.stdout.flush()
+
+            # Write latest slice for external consumers (set_pl.sh monitor).
+            write_json(args.json_out, ts, stats, base_hz, base_max_gap,
+                       rsl_hz, rsl_max_gap, flags)
+
+            # Re-discover PIDs so node restarts are tracked. If a pid changed,
+            # reset that key's baseline to the new pid's current run_delay so the
+            # next slice isn't a bogus huge delta (old cumulative vs new).
+            newpids = discover_pids()
+            for k, np_ in newpids.items():
+                if np_ != cur_pid[k]:
+                    cur_pid[k] = np_
+                    pids[k] = np_
+                    prev_wait[k] = read_wait_ns(np_)
             next_report = now + INTERVAL
 except KeyboardInterrupt:
     pass

@@ -128,6 +128,15 @@ class StateMachine:
     def __init__(self, name) -> None:
         self.name = name
         self.rate_hz = rospy.get_param("state_machine/rate")  # rate of planner in hertz
+
+        ### HJ : run_delay instrumentation — same metric as live_monitor (sum of
+        ### sched_info.run_delay across all threads = time runnable-but-not-on-CPU).
+        ### Accumulated over a 100ms window (matches live_monitor's slice) and
+        ### logged only when CPU-wait in that window exceeds threshold.
+        self._rd_window_start_ns = None  # run_delay at window start
+        self._rd_window_t0 = None        # wall-clock at window start
+        self._rd_log_period_s = 0.1      # 100ms window, same as live_monitor
+        self._run_delay_thresh_ms = 30.0 # warn if CPU-wait in window > 30ms
         self.n_loc_wpnts = rospy.get_param("state_machine/n_loc_wpnts")  # number of local waypoints published
         self.local_wpnts = WpntArray()
         self.waypoints_dist = 0.1  # [m]
@@ -2222,10 +2231,38 @@ class StateMachine:
     #############
     # MAIN LOOP #
     #############
+    ### HJ : sum sched_info.run_delay (ns) across all threads of this process.
+    ### Identical to live_monitor's read_wait_ns: field [1] of each task's schedstat.
+    def _read_run_delay_ns(self):
+        total = 0
+        try:
+            for tid in os.listdir("/proc/self/task"):
+                try:
+                    with open(f"/proc/self/task/{tid}/schedstat") as f:
+                        total += int(f.read().split()[1])
+                except (FileNotFoundError, IndexError, ValueError):
+                    pass
+        except FileNotFoundError:
+            pass
+        return total
+
     def loop(self):
         """Main loop of the state machine. It is called at a fixed rate by the
         ROS node.
         """
+        ### HJ : run_delay detect — accumulate summed sched_info.run_delay over a
+        ### 100ms window (same metric/window as live_monitor). Pure CPU-starvation
+        ### time (not compute/sleep). Warn only when window CPU-wait exceeds thresh.
+        _rd = self._read_run_delay_ns()
+        _now = time.perf_counter()
+        if self._rd_window_start_ns is None:
+            self._rd_window_start_ns, self._rd_window_t0 = _rd, _now
+        elif _now - self._rd_window_t0 >= self._rd_log_period_s:
+            _wait_ms = (_rd - self._rd_window_start_ns) / 1e6
+            if _wait_ms > self._run_delay_thresh_ms:
+                rospy.logwarn(f"[sm] run_delay: {_wait_ms:.1f}ms/100ms CPU-wait")
+            self._rd_window_start_ns, self._rd_window_t0 = _rd, _now
+
         # do state transition (unless we want to force it into GB_TRACK via dynamic reconfigure)
         if self.measuring:
             start = time.perf_counter()
