@@ -1124,7 +1124,18 @@ class StateMachine:
     
     def _check_on_spline(self, wpnt_data) -> bool:
         if wpnt_data.is_init:
-            gap = (wpnt_data.list[-1].s_m - self.cur_s) % self.track_length
+            ### HJ : signed gap. Plain `% track_length` turned a car that just PASSED
+            # the spline endpoint (cur_s slightly > last s_m → small negative raw) into
+            # a near-full-lap positive gap, so gap_ok stayed True and START never
+            # graduated to GB_TRACK (intermittent: depended on the exact tick the car
+            # crossed the endpoint). Normalizing to [-L/2, +L/2] makes "just past the
+            # end" read as a small NEGATIVE gap → gap_ok False → graduate, while a path
+            # that legitimately wraps s=0 still reads as the correct small positive gap
+            # (start/recovery splines are far shorter than L/2).
+            raw = wpnt_data.list[-1].s_m - self.cur_s
+            half = self.track_length / 2.0
+            gap = (raw + half) % self.track_length - half
+            ### HJ : end
             min_dist = np.min(np.linalg.norm(wpnt_data.array[:, 0:2] - self.current_position[:2], axis=1))
 
             # ===== HJ ADDED: Debug logging for failed checks =====
@@ -1864,10 +1875,19 @@ class StateMachine:
             return start_wpnts
 
         else:
-            rospy.logwarn(f"[{self.name}] No valid avoidance waypoints, passing global waypoints")
-            pass
-
-        # return splini_glob
+            ### HJ : safety net. cur_start_wpnts not initialized but wpnts_src is still
+            # START for this tick (e.g. StartTransition's low-speed grace returned
+            # (START, START) right after another check set is_init=False). The old
+            # `pass` here returned None → empty local_wpnts → controller's
+            # waypoint_safety_counter tripped "Received no local wpnts. STOPPING!!".
+            # Fall back to GB waypoints (full-track wrap, never empty) so the car keeps
+            # a valid path; the next tick StartTransition graduates to GB_TRACK anyway.
+            rospy.logwarn_throttle(1.0,
+                f"[{self.name}] start wpnts not init while in START, falling back to GB")
+            s = int(self.cur_s / self.waypoints_dist + 0.5)
+            return [self.cur_gb_wpnts.list[(s + i) % self.num_glb_wpnts]
+                    for i in range(self.n_loc_wpnts)]
+            ### HJ : end
 
     #######
     # VIZ #
