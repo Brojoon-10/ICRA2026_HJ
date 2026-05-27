@@ -276,19 +276,32 @@ PY
   fi
 
   # Auto-spawn live_monitor.py (5 ROS axes: rslidar/glim/base_odom/sm/cm).
-  # We always run inside the docker container where ROS is sourced, so just
-  # launch it directly. Its stdout/stderr is discarded (set_pl merges the JSON
-  # into its own line); it writes the latest slice to $lm_json which read_live_axes
-  # picks up. Disable with NO_LIVE=1.
-  local live_pid="" live_script
-  live_script="$(dirname "$0")/../../HJ_docs/debug/live_monitor.py"
+  # live_monitor needs rospy, which needs the ROS env. But set_pl is usually run
+  # via sudo (energy/MSR need root), and sudo strips ROS_PACKAGE_PATH etc, so a
+  # naive spawn dies on `import rospy`. Fix: source ROS and, when running under
+  # sudo, drop back to the invoking user ($SUDO_USER) whose shell has ROS set up.
+  # Errors go to a log (not /dev/null) so failures are diagnosable.
+  local live_pid="" live_script live_log
+  live_script="$(cd "$(dirname "$0")/../../HJ_docs/debug" 2>/dev/null && pwd)/live_monitor.py"
+  live_log="$logdir/live_monitor.out"
   if [ "${NO_LIVE:-0}" != "1" ]; then
     if [ -f "$live_script" ] && command -v python3 >/dev/null 2>&1; then
       rm -f "$lm_json" 2>/dev/null
-      python3 -u "$live_script" --json-out "$lm_json" >/dev/null 2>&1 &
+      # Build a command that re-sources ROS then runs live_monitor.
+      local ros_setup="${ROS_SETUP:-$HOME/catkin_ws/devel/setup.bash}"
+      [ -f "$ros_setup" ] || ros_setup="/opt/ros/noetic/setup.bash"
+      # ROS_HOSTNAME ends up empty under some shells, which breaks rospy
+      # networking ("invalid ROS_HOSTNAME"); pin it so topic subscriptions work.
+      local inner="source /opt/ros/noetic/setup.bash; [ -f '$ros_setup' ] && source '$ros_setup'; export ROS_HOSTNAME=\${ROS_HOSTNAME:-localhost}; [ -n \"\$ROS_HOSTNAME\" ] || export ROS_HOSTNAME=localhost; exec python3 -u '$live_script' --json-out '$lm_json'"
+      if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        # Re-source as the original user (their env has ROS); HOME must be theirs.
+        sudo -u "$SUDO_USER" -H bash -lc "$inner" >"$live_log" 2>&1 &
+      else
+        bash -lc "$inner" >"$live_log" 2>&1 &
+      fi
       live_pid=$!
       echo "[INFO] live_monitor auto-spawned pid=$live_pid (5 ROS axes -> cyan tail; json=$lm_json)"
-      echo "[INFO]   nodes down => their wait shows '-'; restarts auto-tracked."
+      echo "[INFO]   nodes down => '-'; restarts auto-tracked; errors -> $live_log"
     else
       echo "[WARN] live_monitor.py not found at $live_script — 5-axis columns disabled"
     fi
