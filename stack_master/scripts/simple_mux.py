@@ -33,7 +33,13 @@ class SimpleMuxNode:
 
         # Initialize the node
         self.name = "simple_mux"
-        rospy.init_node(self.name, anonymous=True)
+        ### HJ : anonymous=False so the node keeps its launch-assigned name
+        # (/vesc/simple_mux). With anonymous=True the random suffix
+        # (/vesc/simple_mux_<pid>_<time>) moved the dynamic_reconfigure server to a
+        # per-run namespace, so rqt_reconfigure never showed it under the vesc group.
+        # Only one mux runs per launch, so a fixed name is safe.
+        rospy.init_node(self.name, anonymous=False)
+        ### HJ : end
 
         self.out_topic  = rospy.get_param("/vesc/out_topic", "low_level/ackermann_cmd_mux/output")
         self.in_topic  = rospy.get_param("/vesc/in_topic", "high_level/ackermann_cmd_mux/input/nav_1")
