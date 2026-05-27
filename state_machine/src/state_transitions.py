@@ -214,15 +214,20 @@ def OvertakingTransition(state_machine: StateMachine) -> Tuple[StateType, StateT
 
 def StartTransition(state_machine: StateMachine) -> Tuple[StateType, StateType]:
     """Transitions for being in `StateType.START`"""
-    ### HJ : low-speed grace — keep START alive during launch transient. Skips both
-    # checks so neither flicker nor 50cm on_spline tolerance can kill cur_start_wpnts.
-    # See START_LOW_SPEED_GRACE_MPS comment near top for rationale.
-    if abs(state_machine.cur_vs) < START_LOW_SPEED_GRACE_MPS:
+    on_spline = state_machine._check_on_spline(state_machine.cur_start_wpnts)
+
+    ### HJ : low-speed grace — at launch the controller hasn't settled onto the path
+    # and a stopped/slow ego shouldn't be yanked into TRAILING by a car ahead. The
+    # grace's real purpose is to skip the OBSTACLE (free_cartesian) check at low speed,
+    # NOT to ignore where we are on the path. So gate it on on_spline: while still on
+    # the start spline + slow, hold START (trailing-proof launch); once we run off the
+    # end of the spline (on_spline False, now correct thanks to the signed-gap fix),
+    # the grace no longer applies and we graduate to GB_TRACK even at low speed.
+    if abs(state_machine.cur_vs) < START_LOW_SPEED_GRACE_MPS and on_spline:
         return StateType.START, StateType.START
     ### HJ : end
 
     start_free = state_machine._check_free_cartesian(state_machine.cur_start_wpnts)
-    on_spline = state_machine._check_on_spline(state_machine.cur_start_wpnts)
 
     if start_free and on_spline:
         return StateType.START, StateType.START
