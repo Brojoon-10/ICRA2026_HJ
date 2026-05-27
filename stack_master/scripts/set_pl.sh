@@ -12,7 +12,7 @@
 #                                   #   set 40 80 -> PL1=40 PL2=80 (PCT unchanged)
 #                                   #   set 64 64 70 -> all three
 #   pct N                           # only set max_perf_pct (boost ratio %, 1-100)
-#   reset                           # back to PPD-default-ish (PL1=200, PL2=40, pct=100)
+#   reset                           # back to PPD-default-ish (PL1=200, PL2=64, pct=100)
 #   monitor [interval_sec]          # live throttle/temp/power until Ctrl-C; logs to file
 #   install                         # install required tools (msr-tools, sysstat)
 #
@@ -144,6 +144,13 @@ monitor_loop() {
   local logfile="$logdir/$(date +%Y-%m-%d-%H-%M-%S).log"
   local nproc; nproc=$(nproc 2>/dev/null || echo 22)
 
+  # live_monitor.py latest-slice JSON (loose coupling). Path is derived from this
+  # script's own location so it works regardless of host vs container cwd. Both
+  # set_pl.sh (here) and the auto-spawned live_monitor write/read the same path.
+  # Override with LIVE_MONITOR_JSON env. Missing/stale => the 5 ROS axes show "-".
+  local lm_json="${LIVE_MONITOR_JSON:-$(cd "$(dirname "$0")/../../HJ_docs/debug" 2>/dev/null && pwd)/.live_monitor_latest.json}"
+  local lm_stale_s=8   # JSON older than this => treat as no data (live_monitor reports every 5s)
+
   echo "[INFO] monitor interval=${interval}s  Ctrl-C to stop"
   echo "[INFO] log: $logfile"
   echo "[INFO] flags: THROTTLE=clock cap | HOT=pkg>95C | IO=iowait>5% | IRQ=softirq>10% | LOAD=load1>nproc | MEM=used>90%"
@@ -168,6 +175,65 @@ monitor_loop() {
     fi
   }
 
+  # Decode MSR 0x64F (MSR_CORE_PERF_LIMIT_REASONS) on cpu0 into a short cause
+  # string. Lower 16 bits = currently-active reasons; upper 16 (log/sticky) read
+  # then cleared so each tick reports reasons since the previous tick.
+  # Bits (Intel SDM): 0 PROCHOT, 1 Thermal, 4 ResidencyState, 5 RATL,
+  # 6 VR-Therm, 7 VR-IccMax(current), 10 PL1, 11 PL2, 12 MaxTurbo, 13 TurboAtten.
+  # Needs rdmsr/wrmsr (msr-tools) + root. Returns "-" if unavailable.
+  read_limit_reasons() {
+    command -v rdmsr >/dev/null 2>&1 || { echo "-"; return; }
+    local raw
+    raw=$(rdmsr -p0 0x64F 2>/dev/null) || { echo "-"; return; }
+    [ -z "$raw" ] && { echo "-"; return; }
+    local v=$((16#$raw))
+    # Use log bits (16..29) so we catch transient throttles between samples,
+    # OR active bits (0..13). Combine both into one 14-bit view.
+    local act=$(( v & 0x3FFF ))
+    local log=$(( (v >> 16) & 0x3FFF ))
+    local r=$(( act | log ))
+    # Clear sticky log bits for next tick (write back with log bits zeroed).
+    wrmsr -p0 0x64F $(( v & 0xFFFF )) 2>/dev/null || true
+    # MAXTURBO(12)/TURBOATTN(13)/RESIDENCY(4)/bit8 are NORMAL operating states
+    # (turbo hit its allowed ceiling / EDP companion flag, not a forced clock
+    # cut). On this 155H, bit8 fires together with bit12 constantly under load.
+    # Exclude them so only real forced-throttle reasons (current/power/thermal)
+    # surface in the alert tag.
+    local r=$(( r & ~((1<<12)|(1<<13)|(1<<8)|(1<<4)) ))
+    [ "$r" -eq 0 ] && { echo "-"; return; }
+    local s=""
+    (( r & (1<<7) ))  && s+="ICCMAX "    # VR Therm Design Current = current limit
+    (( r & (1<<11) )) && s+="PL2 "
+    (( r & (1<<10) )) && s+="PL1 "
+    (( r & (1<<1) ))  && s+="THERMAL "
+    (( r & (1<<6) ))  && s+="VRTHERM "
+    (( r & (1<<5) ))  && s+="RATL "
+    (( r & (1<<0) ))  && s+="PROCHOT "
+    echo "${s% }"
+  }
+
+  # Read live_monitor.py's latest-slice JSON and emit a compact 5-axis string:
+  #   "rsl=9.8/103  glim=4ms  base=99/21  sm=5ms  cm=2ms"
+  # rsl/base = hz/max_gap_ms ; glim/sm/cm = max wait_ms in slice.
+  # A node that is down shows "-" for its wait. Missing/stale file => "" (caller
+  # prints nothing). Uses python3 to parse (no jq dependency).
+  read_live_axes() {
+    [ -f "$lm_json" ] || { echo ""; return; }
+    python3 - "$lm_json" "$lm_stale_s" <<'PY' 2>/dev/null || echo ""
+import json, sys, time
+try:
+    p, stale = sys.argv[1], float(sys.argv[2])
+    d = json.load(open(p))
+    if time.time() - d.get("t", 0) > stale:
+        print(""); sys.exit(0)
+    def w(v): return "-" if v is None else f"{v:g}ms"
+    print(f"rsl={d['rsl_hz']:g}/{d['rsl_gap']:g}  glim={w(d['glim'])}  "
+          f"base={d['base_hz']:g}/{d['base_gap']:g}  sm={w(d['sm'])}  cm={w(d['cm'])}")
+except Exception:
+    print("")
+PY
+  }
+
   # baseline counters
   local prev_thr_pkg prev_thr_core prev_e prev_t
   prev_thr_pkg=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count 2>/dev/null || echo 0)
@@ -184,7 +250,7 @@ monitor_loop() {
   read _ prev_user prev_nice prev_sys prev_idle prev_iow prev_irq prev_sirq prev_steal _ < /proc/stat
 
   # CSV header (PSI + loadN appended at end so old log parsers still work)
-  local header="ts,PL1_W,PL2_W,pct,pkg_C,core_max_C,nvme_C,freq_avg_MHz,freq_max_MHz,thr_pkg_dt,thr_core_dt,pkg_W,usr%,sys%,iowait%,soft%,load1,mem_used%,top1,top1_pct,psi_cpu_some,psi_io_full,psi_mem_some,loadN"
+  local header="ts,PL1_W,PL2_W,pct,pkg_C,core_max_C,nvme_C,freq_avg_MHz,freq_max_MHz,thr_pkg_dt,thr_core_dt,pkg_W,usr%,sys%,iowait%,soft%,load1,mem_used%,top1,top1_pct,psi_cpu_some,psi_io_full,psi_mem_some,loadN,limit_reason"
   echo "$header" | tee "$logfile"
 
   # Auto-spawn per-pid attribution tool (3-axis + spike dump) in background.
@@ -208,6 +274,27 @@ monitor_loop() {
   else
     echo "[INFO] load_attribute auto-spawn disabled (NO_ATTR=1)"
   fi
+
+  # Auto-spawn live_monitor.py (5 ROS axes: rslidar/glim/base_odom/sm/cm).
+  # We always run inside the docker container where ROS is sourced, so just
+  # launch it directly. Its stdout/stderr is discarded (set_pl merges the JSON
+  # into its own line); it writes the latest slice to $lm_json which read_live_axes
+  # picks up. Disable with NO_LIVE=1.
+  local live_pid="" live_script
+  live_script="$(dirname "$0")/../../HJ_docs/debug/live_monitor.py"
+  if [ "${NO_LIVE:-0}" != "1" ]; then
+    if [ -f "$live_script" ] && command -v python3 >/dev/null 2>&1; then
+      rm -f "$lm_json" 2>/dev/null
+      python3 -u "$live_script" --json-out "$lm_json" >/dev/null 2>&1 &
+      live_pid=$!
+      echo "[INFO] live_monitor auto-spawned pid=$live_pid (5 ROS axes -> cyan tail; json=$lm_json)"
+      echo "[INFO]   nodes down => their wait shows '-'; restarts auto-tracked."
+    else
+      echo "[WARN] live_monitor.py not found at $live_script — 5-axis columns disabled"
+    fi
+  else
+    echo "[INFO] live_monitor auto-spawn disabled (NO_LIVE=1)"
+  fi
   echo
 
   # Single-quoted action: $attr_pid expands at trap-fire time (it is a local
@@ -218,6 +305,11 @@ if [ -n "${attr_pid:-}" ] && kill -0 "$attr_pid" 2>/dev/null; then
   kill "$attr_pid" 2>/dev/null
   wait "$attr_pid" 2>/dev/null
   echo "[INFO] load_attribute stopped (pid=$attr_pid)"
+fi
+if [ -n "${live_pid:-}" ] && kill -0 "$live_pid" 2>/dev/null; then
+  kill "$live_pid" 2>/dev/null
+  wait "$live_pid" 2>/dev/null
+  echo "[INFO] live_monitor stopped (pid=$live_pid)"
 fi
 echo "[INFO] monitor stopped. log: '"$logfile"'"
 exit 0' INT TERM
@@ -247,6 +339,12 @@ exit 0' INT TERM
     thr_pkg_dt=$((thr_pkg - prev_thr_pkg)); prev_thr_pkg=$thr_pkg
     thr_core=$(awk '{s+=$1} END{print s+0}' /sys/devices/system/cpu/cpu*/thermal_throttle/core_throttle_count 2>/dev/null)
     thr_core_dt=$((thr_core - prev_thr_core)); prev_thr_core=$thr_core
+
+    # MSR 0x64F decoded throttle reason (ICCMAX / PL1 / PL2 / THERMAL / ...)
+    limit_reason=$(read_limit_reasons)
+
+    # 5 ROS axes from live_monitor.py (rslidar/glim/base_odom/sm/cm). "" if down.
+    live_axes=$(read_live_axes)
 
     # Package power from RAPL energy counter (uJ -> J -> avg W over interval)
     e=$(read_energy)
@@ -364,7 +462,7 @@ exit 0' INT TERM
     fi
 
     # CSV line — full data (parseable; loadN appended at end for backward compat)
-    line="$ts,$pl1,$pl2,$pct,$pkg_c,$core_max,${nvme:-?},$favg,$fmx,$thr_pkg_dt,$thr_core_dt,${pkg_w:-?},$p_usr,$p_sys,$p_iow,$p_soft,$load1,$mem_used,${t1n:-?},${t1c:-?},${psi_cpu_some:-?},${psi_io_full:-?},${psi_mem_some:-?},$loadN"
+    line="$ts,$pl1,$pl2,$pct,$pkg_c,$core_max,${nvme:-?},$favg,$fmx,$thr_pkg_dt,$thr_core_dt,${pkg_w:-?},$p_usr,$p_sys,$p_iow,$p_soft,$load1,$mem_used,${t1n:-?},${t1c:-?},${psi_cpu_some:-?},${psi_io_full:-?},${psi_mem_some:-?},$loadN,${limit_reason:--}"
     echo "$line" >> "$logfile"
 
     # Periodic header for stdout readability (every 20 ticks)
@@ -374,15 +472,26 @@ exit 0' INT TERM
     fi
     tick_n=$((tick_n+1))
 
+    # Throttle reason tag (red) — only shown when a reason is present this tick.
+    local rtag=""
+    if [ -n "$limit_reason" ] && [ "$limit_reason" != "-" ]; then
+      rtag=$' \e[31m['"$limit_reason"$']\e[0m'
+    fi
+    # 5 ROS axes tag (cyan) — appended when live_monitor JSON is fresh.
+    local atag=""
+    if [ -n "$live_axes" ]; then
+      atag=$' \e[36m'"$live_axes"$'\e[0m'
+    fi
+
     if [ "${MON_VERBOSE:-0}" = "1" ]; then
       # Original full format (includes freq, pkg_W, usr/sys/iow/soft, core°C)
-      printf "%s [%s] PL=%s/%s pct=%s%%  pkg=%s°C core=%s°C  freq=%s/%s  thr=%s/%s  W=%s  usr=%s%% sys=%s%% iow=%s%% soft=%s%%  load%ss=%s load1=%s  mem=%s%%  psi=%s/%s/%s  top=%s(%s%%)\n" \
-        "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_c" "$core_max" "$favg" "$fmx" "$thr_pkg_dt" "$thr_core_dt" "${pkg_w:-?}" "$p_usr" "$p_sys" "$p_iow" "$p_soft" "${MON_LOADN:-5}" "$loadN" "$load1" "$mem_used" "${psi_cpu_some:-?}" "${psi_io_full:-?}" "${psi_mem_some:-?}" "${t1n:-?}" "${t1c:-?}"
+      printf "%s [%s] PL=%s/%s pct=%s%%  pkg=%s°C core=%s°C  freq=%s/%s  thr=%s/%s  W=%s  usr=%s%% sys=%s%% iow=%s%% soft=%s%%  load%ss=%s load1=%s  mem=%s%%  psi=%s/%s/%s  top=%s(%s%%)%s%s\n" \
+        "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_c" "$core_max" "$favg" "$fmx" "$thr_pkg_dt" "$thr_core_dt" "${pkg_w:-?}" "$p_usr" "$p_sys" "$p_iow" "$p_soft" "${MON_LOADN:-5}" "$loadN" "$load1" "$mem_used" "${psi_cpu_some:-?}" "${psi_io_full:-?}" "${psi_mem_some:-?}" "${t1n:-?}" "${t1c:-?}" "$rtag" "$atag"
     else
       # Compact format (default) — column widths aligned with header.
       # pkg_col / load_col already include ANSI + padding; use %s for them.
-      printf "%s %s  %3s/%-2s %2s%% %s %s %5s %s %s %5s %5s/%s/%s  %s(%s%%)\n" \
-        "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_col" "$w_col" "${thr_pkg_dt}/${thr_core_dt}" "$load_col" "$load1_col" "$mem_used" "${psi_cpu_some:-?}" "${psi_io_full:-?}" "${psi_mem_some:-?}" "${t1n:-?}" "${t1c:-?}"
+      printf "%s %s  %3s/%-2s %2s%% %s %s %5s %s %s %5s %5s/%s/%s  %s(%s%%)%s%s\n" \
+        "$ts" "$mark" "$pl1" "$pl2" "$pct" "$pkg_col" "$w_col" "${thr_pkg_dt}/${thr_core_dt}" "$load_col" "$load1_col" "$mem_used" "${psi_cpu_some:-?}" "${psi_io_full:-?}" "${psi_mem_some:-?}" "${t1n:-?}" "${t1c:-?}" "$rtag" "$atag"
     fi
   done
 }
@@ -419,7 +528,7 @@ case "$cmd" in
     need_root "$@"
     ensure_tools
     echo "=== before ==="; show; echo
-    apply_pl 200 40
+    apply_pl 200 64
     apply_pct 100
     echo "=== after (reset) ==="; show
     ;;

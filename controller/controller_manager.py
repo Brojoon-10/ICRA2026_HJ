@@ -53,9 +53,14 @@ class Controller_manager:
         self.ros_time = rospy.Time()
         self.scan = None
 
-        ### HJ : loop gap instrumentation — detect cycle stall (GC, mutex, scheduler delay)
-        self._last_cyc_t = None
-        self._cyc_gap_thresh_ms = 40.0  # log if gap > 40ms (= 2 cycles at 50Hz)
+        ### HJ : run_delay instrumentation — same metric as live_monitor (sum of
+        ### sched_info.run_delay across all threads = time runnable-but-not-on-CPU).
+        ### Accumulated over a 100ms window (matches live_monitor's slice) and
+        ### logged only when CPU-wait in that window exceeds threshold.
+        self._rd_window_start_ns = None  # run_delay at window start
+        self._rd_window_t0 = None        # wall-clock at window start
+        self._rd_log_period_s = 0.1      # 100ms window, same as live_monitor
+        self._run_delay_thresh_ms = 30.0 # warn if CPU-wait in window > 30ms
         
         self.mapping = rospy.get_param('controller_manager/mapping', False)
         if self.mapping:
@@ -652,8 +657,23 @@ class Controller_manager:
 
     ############################################MAIN LOOP############################################
 
+    ### HJ : sum sched_info.run_delay (ns) across all threads of this process.
+    ### Identical to live_monitor's read_wait_ns: field [1] of each task's schedstat.
+    def _read_run_delay_ns(self):
+        total = 0
+        try:
+            for tid in os.listdir("/proc/self/task"):
+                try:
+                    with open(f"/proc/self/task/{tid}/schedstat") as f:
+                        total += int(f.read().split()[1])
+                except (FileNotFoundError, IndexError, ValueError):
+                    pass
+        except FileNotFoundError:
+            pass
+        return total
+
     def control_loop(self):
-        rate = rospy.Rate(self.loop_rate)  
+        rate = rospy.Rate(self.loop_rate)
         if self.mapping:
             self.mapping_loop(rate)
         else:
@@ -685,13 +705,18 @@ class Controller_manager:
         rospy.loginfo(f"[{self.name}] Ready!")
 
         while not rospy.is_shutdown():
-            ### HJ : cycle gap detect
-            _now_cyc = time.perf_counter()
-            if self._last_cyc_t is not None:
-                _gap_ms = (_now_cyc - self._last_cyc_t) * 1000.0
-                if _gap_ms > self._cyc_gap_thresh_ms:
-                    rospy.logwarn(f"[cm] cycle gap: {_gap_ms:.1f}ms (expected ~{1000.0/self.loop_rate:.1f}ms)")
-            self._last_cyc_t = _now_cyc
+            ### HJ : run_delay detect — accumulate summed sched_info.run_delay over
+            ### a 100ms window (same metric/window as live_monitor). Pure CPU-
+            ### starvation time. Warn only when window CPU-wait exceeds threshold.
+            _rd = self._read_run_delay_ns()
+            _now_rd = time.perf_counter()
+            if self._rd_window_start_ns is None:
+                self._rd_window_start_ns, self._rd_window_t0 = _rd, _now_rd
+            elif _now_rd - self._rd_window_t0 >= self._rd_log_period_s:
+                _wait_ms = (_rd - self._rd_window_start_ns) / 1e6
+                if _wait_ms > self._run_delay_thresh_ms:
+                    rospy.logwarn(f"[cm] run_delay: {_wait_ms:.1f}ms/100ms CPU-wait")
+                self._rd_window_start_ns, self._rd_window_t0 = _rd, _now_rd
 
             if self.measuring:
                 start = time.perf_counter()
