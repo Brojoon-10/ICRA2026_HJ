@@ -1,7 +1,7 @@
 <!-- 3D headtohead with real C++ FBGA state_machine
-     IY 2026-05-17 : RECOVERY + SMART_STATIC local_waypoints vx_mps via libs/FBGA.
-     OT keeps fast_sqp_planner's velocity_mode setting (use '3d' for real FBGA on OT too).
-     Identical to 3d_headtohead.launch except the state_machine node. -->
+     IY 2026-05-17 : RECOVERY / OVERTAKE / START local_waypoints vx_mps via libs/FBGA.
+     IY 2026-05-29 : per-mode v_scale / gg_scale live-tunable via rqt (FBGATuner.cfg);
+                     paths / solver hypers fall back to node defaults — no launch args needed. -->
 <launch>
   <arg name="racecar_version" default="$(env CAR_NAME)" />
   <arg name="ctrl_algo" default="PP" />
@@ -16,22 +16,10 @@
   <arg name="map_name" default="$(optenv MAP_NAME '')" />
   <arg name="vehicle_name" default="rc_car_10th" />
 
-  <!-- IY 2026-05-17 : FBGA-specific args -->
-  <arg name="fbga_states"     default="['RECOVERY', 'OVERTAKE', 'START']"
+  <!-- IY : only structural arg left. Tuning (v_scale / gg_scale per mode)
+       lives in rqt_reconfigure + maps/<map>/fbga_tuner.yaml. -->
+  <arg name="fbga_states" default="['RECOVERY', 'OVERTAKE', 'START']"
        doc="StateType names that use real C++ FBGA velocity profile." />
-  <arg name="fbga_bin"        default=""
-       doc="abs path to libs/FBGA/bin/GIGI_test_unicorn.exe (empty = node default)." />
-  <arg name="fbga_gg_bin"     default=""
-       doc="abs path to gg.bin (empty = rc_car_10th_latest default)." />
-  <arg name="fbga_params_yml" default=""
-       doc="abs path to params_&lt;vehicle&gt;.yml (empty = rc_car_10th_latest default)." />
-  <arg name="bridge_effect"   default="1.0" />
-  <arg name="fbga_v_scale"    default="1.0"
-       doc="state_machine publish-time uniform vx_mps scale." />
-  <arg name="fbga_gg_scale"   default="1.0"
-       doc="ax_max/ay_max multiplier applied to a scaled copy of the GGV (written under &lt;vehicle&gt;_fbga_latest/)." />
-  <arg name="fbga_max_iter"   default="3"
-       doc="fixed-point iteration cap for local cycle." />
 
   <param name="measure" value="False" />
 
@@ -55,15 +43,7 @@
   <node pkg="state_machine" type="dynamic_statemachine_server.py" name="dyn_statemachine" output="screen" />
   <node pkg="state_machine" type="fbga_state_machine_node.py" name="state_machine" output="screen">
     <rosparam file="$(find stack_master)/config/state_machine_params.yaml" />
-    <!-- FBGA wiring -->
     <rosparam param="fbga_states" subst_value="True">$(arg fbga_states)</rosparam>
-    <param name="fbga_bin"        value="$(arg fbga_bin)" />
-    <param name="fbga_gg_bin"     value="$(arg fbga_gg_bin)" />
-    <param name="fbga_params_yml" value="$(arg fbga_params_yml)" />
-    <param name="bridge_effect"   value="$(arg bridge_effect)" />
-    <param name="v_scale"         value="$(arg fbga_v_scale)" />
-    <param name="gg_scale"        value="$(arg fbga_gg_scale)" />
-    <param name="fbga_max_iter"   value="$(arg fbga_max_iter)" />
   </node>
 
   <!-- ══════════════════ STATE MACHINE PLANNER PARAMS ══════════════════ -->
