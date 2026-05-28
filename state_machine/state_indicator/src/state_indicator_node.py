@@ -66,17 +66,21 @@ class StateIndicatorNode:
     ### HJ : end
 
     ### HJ : track launch (current) mode and repaint the LED every heartbeat. simple_mux
-    # publishes /launch_controller/debug at 50Hz with active true AND false (idle
-    # heartbeat), so we just paint the current intent each tick — no edge detection,
-    # no timer. This is also the single repaint source that makes the override robust:
-    # if a frame is lost or a concurrent state_callback briefly clobbers the colour,
-    # the next heartbeat (20ms) repaints it. When active is false we repaint
-    # last_state_rgb, which is the real state colour if state_machine is running, or
-    # the OFF default if it is not (so the LED goes dark after launch without
-    # state_machine).
+    # publishes /launch_controller/debug at 50Hz (active/armed flags both present in
+    # idle and live messages), so we just paint the current intent each tick — no
+    # edge detection, no timer. Override is on while EITHER armed or active is true:
+    # armed is the prerequisite for active in simple_mux, so this covers the full
+    # "user intends current mode" window — A-toggle press (armed True) right through
+    # fire (active True) until completion/abort. This is also the single repaint
+    # source that makes the override robust: if a frame is lost or a concurrent
+    # state_callback briefly clobbers the colour, the next heartbeat (20ms) repaints
+    # it. When both flags are false we repaint last_state_rgb, which is the real
+    # state colour if state_machine is running, or the OFF default if it is not (so
+    # the LED goes dark after launch without state_machine).
     def launch_debug_callback(self, msg):
         try:
-            self.launch_active = bool(json.loads(msg.data).get("active", False))
+            payload = json.loads(msg.data)
+            self.launch_active = bool(payload.get("active", False) or payload.get("armed", False))
         except (ValueError, TypeError):
             # Malformed payload — leave the last known flag untouched.
             return

@@ -141,7 +141,12 @@ class SimpleMuxNode:
         # state_machine is up and emits TRAILING, the launch current-injection is
         # force-aborted so the controller's speed command reaches VESC.
         self.state_topic = rospy.get_param("~state_topic", "/state_machine")
-        self.state_stale_sec = float(rospy.get_param("~state_stale_sec", 0.5))
+        ### HJ : how long /state_machine can be silent before _active_state() returns
+        # None (= launch gate opens). Long enough to absorb brief publisher hiccups in
+        # mid-race so the gate does not flap; short enough that "really dead"
+        # state_machine eventually frees standalone/test rigs.
+        self.state_stale_sec = float(rospy.get_param("~state_stale_sec", 5.0))
+        ### HJ : end
         self._cur_state = None       # last string received, e.g. 'TRAILING'
         self._state_stamp = None     # rospy.Time of last reception; None == never received
         self._trailing_abort_logged = False  # log-once per trailing-abort event
@@ -376,7 +381,7 @@ class SimpleMuxNode:
         ### HJ : safety gate. If state_machine reports TRAILING, abort launch and
         # fall through so the controller's speed command reaches VESC. No-op when
         # state_machine is absent or state is fresh-but-non-TRAILING.
-        self._maybe_abort_launch_for_trailing()
+        self._enforce_launch_state_gate()
         if self.launch_active and self.launch_t0 is not None:
             t = (rospy.Time.now() - self.launch_t0).to_sec()
             if t >= self.launch_t_total:
@@ -445,6 +450,15 @@ class SimpleMuxNode:
         self.launch_debug_pub.publish(String(data=json.dumps(d)))
 
     def timer_callback(self, event):
+        ### HJ : state safety abort runs at 50Hz from the timer, NOT only from
+        # _apply_launch_override (which fires only when an autodrive ackermann is
+        # flowing). This closes the gap where armed=True survives because no
+        # autodrive is yet streaming (e.g. armed set before headtohead, or during
+        # humandrive). With this here, the moment state becomes non-None and
+        # non-START, armed/active are wiped in the very next tick.
+        self._enforce_launch_state_gate()
+        ### HJ : end
+
         ### HJ : always publish armed/active heartbeat at 50Hz so test_publisher / debug subs never go stale.
         # _apply_launch_override path will publish a richer message during launch ACTIVE/POST.
         if not self.launch_active and not self.launch_post_done:
@@ -514,19 +528,34 @@ class SimpleMuxNode:
             return None
         return self._cur_state
 
-    ### HJ : if active state == TRAILING, kill any in-flight or armed launch.
-    # Called every tick from _apply_launch_override before injecting current.
-    # Returns True if a launch was just aborted (so override path bails out and
-    # falls through to controller speed command).
-    def _maybe_abort_launch_for_trailing(self):
-        if self._active_state() != 'TRAILING':
+    ### HJ : ELRS-noise safety gate. Launch current may ONLY be issued when:
+    #   (a) state_machine never published (standalone simple_mux / test rigs), or
+    #   (b) state_machine is alive and reports START.
+    # Any other live state (GB_TRACK, TRAILING, OVERTAKE, RECOVERY, FTGONLY,
+    # SMART_STATIC, ATTACK, ...) means we are mid-race, and a current injection
+    # there can only be the result of a corrupted ELRS packet flipping A/RB. Used
+    # to gate BOTH armed (A toggle) and active (RB fire) transitions, and to
+    # force-abort any armed/active that survives a state change away from START.
+    def _launch_allowed_by_state(self):
+        s = self._active_state()
+        return s is None or s == 'START'
+
+    ### HJ : if state forbids launch, kill any in-flight or armed launch. Called every
+    # tick from both timer_callback (50Hz, runs even without autodrive ackermann) and
+    # _apply_launch_override (in-flight path). Returns True if a launch was just
+    # aborted so the override path bails out and falls through to controller speed
+    # command. State whitelist (allowed): None or 'START'. Anything else, including
+    # TRAILING, GB_TRACK, OVERTAKE, RECOVERY, FTGONLY, SMART_STATIC, ATTACK, ...,
+    # forces armed=False and active=False.
+    def _enforce_launch_state_gate(self):
+        if self._launch_allowed_by_state():
             self._trailing_abort_logged = False
             return False
         if not (self.launch_active or self.launch_armed):
             return False
         if not self._trailing_abort_logged:
-            rospy.logwarn("[launch] ABORT(TRAILING) armed=%s active=%s -> speed control",
-                          self.launch_armed, self.launch_active)
+            rospy.logwarn("[launch] ABORT(state=%s) armed=%s active=%s -> speed control",
+                          self._active_state(), self.launch_armed, self.launch_active)
             self._trailing_abort_logged = True
         self.launch_armed = False
         self.launch_active = False
@@ -581,12 +610,20 @@ class SimpleMuxNode:
             a_rising = a_pressed and not self.a_prev
             self.a_prev = a_pressed
             if a_rising and not self.launch_active:
-                old = self.launch_armed
-                self.launch_armed = not self.launch_armed
-                ### HJ : full button snapshot to identify cross-channel triggers
-                btn_snap = ",".join(str(b) for b in msg.buttons[:8])
-                rospy.loginfo("[launch] A_TOGGLE %s->%s (a_pressed=%d a_prev_was=%d, btns0-7=[%s])",
-                              old, self.launch_armed, int(a_pressed), int(not a_pressed) ^ 0, btn_snap)
+                ### HJ : state safety gate — block ARMING entirely when the car is
+                # mid-race (state != None and != START). Disarming (T→F) is always
+                # allowed so the user / safety paths can clear an unwanted armed.
+                if not self.launch_armed and not self._launch_allowed_by_state():
+                    rospy.logwarn("[launch] A_TOGGLE BLOCKED: state=%s (only None/START allowed)",
+                                  self._active_state())
+                else:
+                ### HJ : end
+                    old = self.launch_armed
+                    self.launch_armed = not self.launch_armed
+                    ### HJ : full button snapshot to identify cross-channel triggers
+                    btn_snap = ",".join(str(b) for b in msg.buttons[:8])
+                    rospy.loginfo("[launch] A_TOGGLE %s->%s (a_pressed=%d a_prev_was=%d, btns0-7=[%s])",
+                                  old, self.launch_armed, int(a_pressed), int(not a_pressed) ^ 0, btn_snap)
 
         if use_human_drive:
             drive_msg = AckermannDriveStamped()
@@ -612,6 +649,11 @@ class SimpleMuxNode:
             rospy.loginfo("[launch] RB_RISING armed=%s active=%s (btns0-7=[%s])",
                           self.launch_armed, self.launch_active, btn_snap)
             ### HJ : if armed, fire launch one-shot. armed -> False, active -> True at this exact tick.
+            # Note: no state gate here on purpose — armed transition is already gated
+            # by _launch_allowed_by_state in the A-toggle block above, so anything
+            # that survived to RB rising was permitted then. The per-tick abort in
+            # _enforce_launch_state_gate still catches state changes during the
+            # in-flight window.
             if self.launch_armed and not self.launch_active:
                 self.launch_armed = False
                 self.launch_active = True
