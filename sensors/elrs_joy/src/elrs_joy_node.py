@@ -109,11 +109,20 @@ class ELRSJoyNode:
         self.lb_idle_min     = int(rospy.get_param('~lb_idle_min',     700))
         self.lb_idle_max     = int(rospy.get_param('~lb_idle_max',    1300))
         self.lb_released_min = int(rospy.get_param('~lb_released_min', 1600))
-        self.lb_debounce_frames = int(rospy.get_param('~lb_debounce_frames', 3))
+        self.lb_debounce_frames = int(rospy.get_param('~lb_debounce_frames', 5))
         # State held across publish_joy calls
         self.lb_state = 0          # last published LB button value (0=released, 1=pressed)
         self.lb_pending = 0        # candidate value currently accumulating
         self.lb_pending_count = 0  # consecutive trusted samples agreeing with lb_pending
+
+        ### HJ : A button (joy_idx==0, momentary/latched switch on CH7, invert=1)
+        ### HJ : also gets an asymmetric N-frame debounce so a transient high
+        ### HJ : sample cannot fake an A press. 0 -> 1 requires N consecutive
+        ### HJ : "pressed" samples; 1 -> 0 commits immediately on first
+        ### HJ : "released" sample (user is never trapped in a stuck press).
+        self.a_debounce_frames = int(rospy.get_param('~a_debounce_frames', 5))
+        self.a_state = 0
+        self.a_pending_count = 0
 
     def normalize_axis(self, value, cal_min=None, cal_mid=None, cal_max=None):
         ### HJ : asymmetric normalization around per-axis calibrated mid.
@@ -261,6 +270,9 @@ class ELRSJoyNode:
             ### HJ : consecutive trusted samples before flipping lb_state.
             if joy_idx == 4:
                 msg.buttons[joy_idx] = self._lb_filtered_button(self.channels[crsf_ch], inv)
+            elif joy_idx == 0:
+                ### HJ : A button asymmetric N-frame debounce (see __init__)
+                msg.buttons[joy_idx] = self._a_filtered_button(self.channels[crsf_ch], inv)
             else:
                 msg.buttons[joy_idx] = self.channel_to_button(self.channels[crsf_ch], invert=inv)
         self.joy_pub.publish(msg)
@@ -332,6 +344,34 @@ class ELRSJoyNode:
 
         return self.lb_state
 
+    def _a_filtered_button(self, raw_value, invert):
+        ### HJ : asymmetric N-frame debounce for the A button. Uses the same
+        ### HJ : threshold-based instantaneous decision as channel_to_button to
+        ### HJ : pick a candidate, then requires a_debounce_frames consecutive
+        ### HJ : "pressed" samples to commit 0 -> 1, but releases (1 -> 0)
+        ### HJ : immediately on the first "released" sample.
+        candidate = self.channel_to_button(raw_value, invert=invert)
+
+        if candidate == self.a_state:
+            self.a_pending_count = 0
+            return self.a_state
+
+        if self.a_state == 1 and candidate == 0:
+            self.a_state = 0
+            self.a_pending_count = 0
+            rospy.loginfo("[elrs_joy] A 1 -> 0 (released, immediate)")
+            return self.a_state
+
+        ### HJ : 0 -> 1 path: accumulate consecutive "pressed" samples.
+        self.a_pending_count += 1
+        if self.a_pending_count >= self.a_debounce_frames:
+            self.a_state = 1
+            self.a_pending_count = 0
+            rospy.loginfo("[elrs_joy] A 0 -> 1 (debounced over %d frames)",
+                          self.a_debounce_frames)
+
+        return self.a_state
+
     def check_failsafe(self):
         elapsed = time.time() - self.last_valid_time
         if elapsed > self.failsafe_timeout:
@@ -343,6 +383,9 @@ class ELRSJoyNode:
                 self.lb_state = 0
                 self.lb_pending = 0
                 self.lb_pending_count = 0
+                ### HJ : same idea for A — don't carry a stale press across a gap.
+                self.a_state = 0
+                self.a_pending_count = 0
                 msg = Joy()
                 msg.header.stamp = rospy.Time.now()
                 msg.header.frame_id = self.frame_id

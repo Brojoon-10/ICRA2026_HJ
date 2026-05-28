@@ -55,7 +55,11 @@
         <param name="lb_idle_min"        value="700"/>
         <param name="lb_idle_max"        value="1300"/>
         <param name="lb_released_min"    value="1600"/>
-        <param name="lb_debounce_frames" value="3"/>
+        <param name="lb_debounce_frames" value="5"/>
+
+        <!-- ### HJ : A button (buttons[0]) needs 5 consecutive "pressed" samples
+             before flipping 0->1. Release (1->0) is immediate. -->
+        <param name="a_debounce_frames"  value="5"/>
 
         <param name="frame_id" value="elrs_joy"/>
     </node>
