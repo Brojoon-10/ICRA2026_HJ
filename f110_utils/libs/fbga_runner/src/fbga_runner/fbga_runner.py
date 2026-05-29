@@ -56,8 +56,14 @@ class FBGARunner:
                  alpha=0.5, max_iter=50, tol=0.05,
                  slope_brake_margin=0.0, slope_brake_vmax=5.0,
                  gg_scale=1.0,
+                 tag='latest',
                  logger=None):
         self._log = logger if logger is not None else (lambda *a, **k: None)
+
+        ## IY : tag isolates the scaled gg.bin destination (and params.txt)
+        ## so multiple FBGARunner instances (per state_machine mode) don't
+        ## collide on the same disk file.
+        self.tag = str(tag)
 
         self.fbga_bin       = fbga_bin
         self.gg_bin_source  = gg_bin          # original (untouched)
@@ -73,11 +79,11 @@ class FBGARunner:
             self._generate_gg_bin(self.gg_bin_source)
 
         # Materialise a scaled copy (ax_max, ay_max scaled by gg_scale)
-        # under <vehicle>_fbga_latest/ alongside the source vehicle folder.
-        # When gg_scale == 1.0 we reuse the source path directly.
+        # under <vehicle>_fbga_<tag>/ alongside the source vehicle folder.
         self.gg_bin = self._materialize_scaled_gg(self.gg_bin_source, self.gg_scale)
 
-        self.params_txt = os.path.join(tempfile.gettempdir(), 'fbga_params.txt')
+        self.params_txt = os.path.join(tempfile.gettempdir(),
+                                       f'fbga_params_{self.tag}.txt')
         self.v_max = 12.0
         self._convert_params_yml(self.params_yml)
 
@@ -150,7 +156,7 @@ class FBGARunner:
         gg_diagrams  = os.path.dirname(src_vehicle)          # .../gg_diagrams
         src_name     = os.path.basename(src_vehicle)         # rc_car_10th_latest
 
-        dst_name     = f"{src_name}_fbga_latest"             # rc_car_10th_latest_fbga_latest
+        dst_name     = f"{src_name}_fbga_{self.tag}"         # rc_car_10th_latest_fbga_<tag>
         dst_velocity = os.path.join(gg_diagrams, dst_name, 'velocity_frame')
         os.makedirs(dst_velocity, exist_ok=True)
 
@@ -337,12 +343,14 @@ class FBGARunner:
             pass
         return np.array(v_out), np.array(ax_out)
 
-    def solve_open(self, s, kappa, mu, *, v_seed=None,
+    def solve_open(self, s, kappa, mu, *, v_seed=None, v_start=None,
                    max_iter=None, tol=None):
         """Local-cycle solve on an OPEN path (no lap stacking).
 
         s, kappa, mu : length-N arrays (s monotone)
-        v_seed       : optional warm-start, length N
+        v_seed       : optional warm-start shape, length N
+        v_start      : optional start-speed boundary [m/s] (e.g. current speed);
+                       overrides v_seed[0] as the v0 anchor when given
         returns (v, ax) length N, or None on failure
         """
         n = len(s)
@@ -360,10 +368,14 @@ class FBGARunner:
         else:
             v_prev = self.initial_speed_estimate(kappa_s, mu_s, dmu_ds)
 
+        # anchor the warm-start head to the given start speed
+        if v_start is not None:
+            v_prev[0] = float(v_start)
+
         v_new = ax_new = None
         for _ in range(max_iter):
             g_tilde = self.compute_g_tilde(mu_s, v_prev, dmu_ds)
-            v0 = max(float(v_prev[0]), 1.0)
+            v0 = max(float(v_start) if v_start is not None else float(v_prev[0]), 1.0)
             res = self.run_once(np.asarray(s, dtype=float),
                                 kappa_s, g_tilde, mu_s, dmu_ds, v0)
             if res is None:
