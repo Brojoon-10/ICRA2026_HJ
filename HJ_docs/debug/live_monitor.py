@@ -24,15 +24,22 @@ ap.add_argument("--json-out", default=os.environ.get("LIVE_MONITOR_JSON", ""),
                 help="path to write latest-slice JSON (one line, overwritten each report)")
 args = ap.parse_args()
 
-# Substrings that must ALL be present in a process's cmdline for it to count as
-# the real node. Using "__name:=<node>" (set by roslaunch on the actual node)
-# plus the script/binary token rules out the launch parent, wrapper shells, and
-# our own pgrep/grep — those were matching the loose patterns and getting picked
-# by head -1, which is why sm/cm sometimes read 0ms.
+# Per-key match rule: (required_tokens, alt_script_tokens).
+# A process qualifies iff its cmdline contains ALL of required_tokens AND ANY
+# of alt_script_tokens. The required token (`__name:=...`) is the unambiguous
+# roslaunch-assigned ROS node name. The alt list covers script variants of the
+# *same logical node* across launch files — they are never up simultaneously,
+# so picking whichever one is currently running is unambiguous.
+# Demanding a script token (and not just `__name:=`) excludes the launch parent
+# and wrapper shells (they print the node name as an argument but don't carry
+# the script path) — this is what fixed the prior sm/cm 0ms bug.
 NODE_MATCH = {
-    "sm":   ["__name:=state_machine", "3d_state_machine_node"],
-    "cm":   ["__name:=controller_manager", "controller_manager.py"],
-    "glim": ["__name:=glim_ros", "glim_rosnode"],
+    # sm has two script variants: 3d_state_machine_node.py (standard headtohead
+    # launch) vs fbga_state_machine_node.py (3d_headtohead_fbga.launch with the
+    # C++ FBGA state machine). Both register under __name:=state_machine.
+    "sm":   (["__name:=state_machine"],     ["3d_state_machine_node", "fbga_state_machine_node"]),
+    "cm":   (["__name:=controller_manager"], ["controller_manager.py"]),
+    "glim": (["__name:=glim_ros"],          ["glim_rosnode"]),
 }
 SELF_PID = os.getpid()
 
@@ -46,10 +53,10 @@ def _cmdline(pid):
 
 
 def find_pid(key):
-    """Return the pid of the real node for `key`, or None. A process qualifies
-    only if its cmdline contains ALL required tokens (so launch/bash/pgrep that
-    merely mention the node name are excluded)."""
-    toks = NODE_MATCH[key]
+    """Return the pid of the real node for `key`, or None. Matches a process iff
+    its cmdline contains ALL required tokens AND ANY of the alt script tokens.
+    """
+    required, alts = NODE_MATCH[key]
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
@@ -57,7 +64,7 @@ def find_pid(key):
         if p == SELF_PID:
             continue
         cl = _cmdline(p)
-        if cl and all(t in cl for t in toks):
+        if cl and all(t in cl for t in required) and any(t in cl for t in alts):
             return p
     return None
 

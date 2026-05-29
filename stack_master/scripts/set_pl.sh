@@ -286,6 +286,16 @@ PY
   live_log="$logdir/live_monitor.out"
   if [ "${NO_LIVE:-0}" != "1" ]; then
     if [ -f "$live_script" ] && command -v python3 >/dev/null 2>&1; then
+      # Kill any leftover live_monitor instances from previous runs (orphaned by
+      # SIGHUP / SIGKILL / sudo-detached process group). Without this, every
+      # set_pl restart leaks another live_monitor and they race-overwrite the
+      # same JSON, causing the "base_odom tracked sometimes" symptom.
+      pkill -9 -f "live_monitor\.py.*--json-out" 2>/dev/null
+      # And clear ROS-master ghost-node registrations from those dead processes
+      # so /rosnode list doesn't accumulate hj_live_monitor_* entries.
+      if command -v rosnode >/dev/null 2>&1; then
+        timeout 5 bash -c 'yes | rosnode cleanup' >/dev/null 2>&1 || true
+      fi
       rm -f "$lm_json" 2>/dev/null
       # Build a command that re-sources ROS then runs live_monitor.
       local ros_setup="${ROS_SETUP:-$HOME/catkin_ws/devel/setup.bash}"
@@ -313,6 +323,12 @@ PY
   # Single-quoted action: $attr_pid expands at trap-fire time (it is a local
   # of monitor_loop and exists when the trap actually runs). $logfile is
   # briefly unquoted so it expands NOW (at trap-set time).
+  # We trap INT/TERM/HUP/EXIT so that whether the user Ctrl-C's, the terminal
+  # is closed (HUP), a parent script kills us (TERM), or this shell falls off
+  # the end (EXIT), the spawned children are reaped.
+  # We also fall back to pkill on live_monitor.py because $live_pid points at
+  # the sudo wrapper, not the python3 grandchild — killing sudo may not always
+  # propagate; pkill on the script path guarantees the python process dies too.
   trap 'echo
 if [ -n "${attr_pid:-}" ] && kill -0 "$attr_pid" 2>/dev/null; then
   kill "$attr_pid" 2>/dev/null
@@ -322,10 +338,13 @@ fi
 if [ -n "${live_pid:-}" ] && kill -0 "$live_pid" 2>/dev/null; then
   kill "$live_pid" 2>/dev/null
   wait "$live_pid" 2>/dev/null
-  echo "[INFO] live_monitor stopped (pid=$live_pid)"
+  echo "[INFO] live_monitor wrapper stopped (pid=$live_pid)"
 fi
+# Belt-and-suspenders: nuke any straggling python3 live_monitor.py (grandchild
+# of sudo, or leftover from a previous unclean shutdown).
+pkill -9 -f "live_monitor\.py.*--json-out" 2>/dev/null && echo "[INFO] live_monitor python child force-killed"
 echo "[INFO] monitor stopped. log: '"$logfile"'"
-exit 0' INT TERM
+exit 0' INT TERM HUP EXIT
 
   local tick_n=0
   local -a procR_hist=()
