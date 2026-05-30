@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple, List
 
+import numpy as np
+
 from states_types import StateType
 import rospy
 from f110_msgs.msg import Wpnt
@@ -223,7 +225,26 @@ def StartTransition(state_machine: StateMachine) -> Tuple[StateType, StateType]:
     # the start spline + slow, hold START (trailing-proof launch); once we run off the
     # end of the spline (on_spline False, now correct thanks to the signed-gap fix),
     # the grace no longer applies and we graduate to GB_TRACK even at low speed.
-    if abs(state_machine.cur_vs) < START_LOW_SPEED_GRACE_MPS and on_spline:
+    ### HJ : ALSO gate grace on spline PROGRESS — grace is for the launch transient
+    # (race grid, ego still settling). Without a progress gate, grace re-fires when
+    # ego naturally decelerates near the end of the spline (gap still > 0.5 m so
+    # on_spline=True, cur_vs<1 because of profile slowdown) — that produced a stuck
+    # "arrived late at end" state because grace skipped the normal exit checks.
+    # Restrict grace to the first half of the spline by nearest-wpnt index.
+    if (state_machine.cur_start_wpnts.is_init
+            and state_machine.cur_start_wpnts.array is not None
+            and len(state_machine.cur_start_wpnts.array) > 0):
+        diff = np.linalg.norm(
+            state_machine.cur_start_wpnts.array[:, 0:2]
+                - state_machine.current_position[:2],
+            axis=1)
+        min_idx = int(np.argmin(diff))
+        n_spline = len(state_machine.cur_start_wpnts.list)
+        in_launch_zone = (min_idx < n_spline // 2)
+    else:
+        in_launch_zone = False
+    if (abs(state_machine.cur_vs) < START_LOW_SPEED_GRACE_MPS
+            and on_spline and in_launch_zone):
         return StateType.START, StateType.START
     ### HJ : end
 
