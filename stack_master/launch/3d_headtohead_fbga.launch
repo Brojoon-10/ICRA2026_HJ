@@ -67,7 +67,7 @@
           output="screen" />
 
     <!-- Start planner -->
-    <node pkg="spliner" type="start_spline_node_v2.py" name="start_planner" output="screen"/>
+    <node pkg="spliner" type="start_quintic_node.py" name="start_planner_v3" output="screen"/>
 
     <!-- Static Avoidance (3D) — feeds /planner/avoidance/static_otwpnts (SMART_STATIC state) -->
     <node pkg="spliner" type="3d_static_avoidance_node.py" name="planner_spline" output="screen">

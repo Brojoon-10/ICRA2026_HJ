@@ -8,6 +8,8 @@
     doc="Physical racecar used. Possible values: UNICORNx" />
   <arg name="sim"                  default="false"
     doc="True for Gazebo sim on remote machine. Disables hardware + SE." />
+  <arg name="detection"                  default="false"
+    doc="True for enable Detection and Tracking" />
   <!-- <arg name="fake_odom"            default="false"
     doc="True to publish fake odom following waypoints (testing without hardware/gazebo)." /> -->
   <arg name="algo"                 default="slam"
@@ -25,6 +27,7 @@
     doc="Enable servo calibration sweep: forces linear map, runs recorder+fitter, updates vesc.yaml." />
 
   <param name="map"             value="$(arg map)" />
+  <param name="detection"             value="$(arg detection)" />
   <param name="racecar_version" value="$(arg racecar_version)" />
   <param name="sim"             value="$(arg sim)" />
 
@@ -72,7 +75,10 @@
   </group> -->
 
   <!-- ══════════════════ COMMON (real + sim) ══════════════════ -->
-
+  <group if="$(arg detection)">
+    <include file="$(find ra_imm)/launch/detection.launch"/>
+    <arg name="map"                   value="$(arg map)"/>
+  </group>  
   <!-- Global waypoints publisher (from JSON) -->
   <node name="global_republisher" pkg="gb_optimizer" type="global_trajectory_publisher.py" output="screen">
     <param name="map" value="$(arg map)" />

@@ -1,4 +1,6 @@
-<!-- 3D headtohead — controller + state machine + planners -->
+<!-- 3D headtohead — FBGA SM base, dynamic obstacle transitions overridden by fast_sqp_planner.
+     RECOVERY / START / SMART_STATIC unchanged. FBGA vx overlay still applies on OVERTAKE.
+     IY 2026-05-29. -->
 <launch>
   <arg name="racecar_version" default="$(env CAR_NAME)" />
   <arg name="ctrl_algo" default="PP" />
@@ -7,22 +9,14 @@
   <arg name="perception" default="False" />
   <arg name="enable_planners" default="True" />
   <arg name="enable_prediction" default="True" />
-  <arg name="dynamic_avoidance_mode" default="NONE" />
+  <arg name="dynamic_avoidance_mode" default="FAST_SQP" />
   <arg name="use_vd_prediction" default="False" />
-  <!-- ### HJ : when true, replace spliner / sqp / recovery_spliner with
-       sampling_based_planner_3d (state-aware OT + RECOVERY). Default false
-       keeps 2D-style planners wired as today. -->
-  <arg name="sampling_planner_enable" default="False" />
-  ## IY : state_machine_type — "original" or "overtaking"
-  <arg name="state_machine_type" default="overtaking" />
-  <!-- ### HJ : When empty, sampling_planner reads /map rosparam set by 3d_base_system.launch.
-       Set MAP_NAME env var to override. -->
-  <arg name="map_name" default="$(optenv MAP_NAME '')"
-       doc="Optional map override. Empty → sampling_planner reads /map rosparam set by 3d_base_system.launch." />
-  <!-- ### HJ : 3D physics model id (gg_diagrams + vehicle_params + time-optimal raceline).
-       Independent of racecar_version (hardware id). Default rc_car_10th_latest. -->
-  <arg name="vehicle_name" default="rc_car_10th"
-       doc="3D vehicle model id for gg_diagrams / params / raceline. NOT the same as racecar_version." />
+  <arg name="map_name" default="$(optenv MAP_NAME '')" />
+  <arg name="vehicle_name" default="rc_car_10th" />
+
+  <!-- FBGA-controlled velocity modes. OVERTAKE kept = fast_sqp path + FBGA vx hybrid. -->
+  <arg name="fbga_states" default="['RECOVERY', 'OVERTAKE', 'START']"
+       doc="StateType names that use real C++ FBGA velocity profile." />
 
   <param name="measure" value="False" />
 
@@ -42,22 +36,13 @@
     <param name="ctrl_algo" value="$(arg ctrl_algo)" />
   </node>
 
-  <!-- ══════════════════ STATE MACHINE (3D: 2.5D vel planner) ══════════════════ -->
-  <!-- ## IY : original state machine (default) -->
-  <group if="$(eval arg('state_machine_type') == 'original')">
-    <node pkg="state_machine" type="dynamic_statemachine_server.py" name="dyn_statemachine" output="screen" />
-    <node pkg="state_machine" type="3d_state_machine_node.py" name="state_machine">
-      <rosparam file="$(find stack_master)/config/state_machine_params.yaml" />
-    </node>
-  </group>
-  <!-- ## IY : lightweight overtaking SM -->
-  <group if="$(eval arg('state_machine_type') == 'overtaking')">
-    <node pkg="state_machine" type="dynamic_statemachine_server.py" name="dyn_statemachine" output="screen" />
-    <node pkg="state_machine" type="fast_sqp_planner_sm.py" name="state_machine" output="screen">
-      <rosparam file="$(find stack_master)/config/state_machine_params.yaml" />
-      <rosparam file="$(find fast_sqp_planner)/config/state_machine_overtake.yaml" />
-    </node>
-  </group>
+  <!-- ══════════════════ STATE MACHINE (FBGA + fast_sqp dynamic OT transitions) ══════════════════ -->
+  <node pkg="state_machine" type="dynamic_statemachine_server.py" name="dyn_statemachine" output="screen" />
+  <node pkg="state_machine" type="fbga_sm_fast_sqp_node.py" name="state_machine" output="screen">
+    <rosparam file="$(find stack_master)/config/state_machine_params.yaml" />
+    <rosparam file="$(find fast_sqp_planner)/config/state_machine_overtake.yaml" />
+    <rosparam param="fbga_states" subst_value="True">$(arg fbga_states)</rosparam>
+  </node>
 
   <!-- ══════════════════ STATE MACHINE PLANNER PARAMS ══════════════════ -->
   <group ns="dyn_planners_statemachine">
@@ -69,10 +54,7 @@
   </group>
 
   <!-- ══════════════════ 3D PLANNERS (enable_planners:=True) ══════════════════ -->
-  <!-- ### HJ : legacy planners always active. sampling planner는 observation 전용으로 병렬 기동. -->
   <group if="$(arg enable_planners)">
-
-    <!-- Planner tuning servers (rqt: dyn_planner_tuner/) -->
     <group ns="dyn_planner_tuner">
       <node pkg="recovery_spliner" type="dynamic_recovery_spline_server.py" name="recovery" output="screen" />
       <node pkg="spliner" type="dynamic_spline_server.py" name="static_avoidance" output="screen" />
@@ -82,41 +64,31 @@
     <node pkg="recovery_spliner" type="3d_recovery_spliner_node.py" name="recovery_planner_spline"
           output="screen" />
 
-    <!-- Start planner -->
-    <node pkg="spliner" type="start_spline_node_v2.py" name="start_planner" output="screen"/>
+    <!-- Start planner (same as fbga launch) -->
+    <node pkg="spliner" type="start_quintic_node.py" name="start_planner_v3" output="screen"/>
 
     <!-- Static Avoidance (3D) — feeds /planner/avoidance/static_otwpnts (SMART_STATIC state) -->
     <node pkg="spliner" type="3d_static_avoidance_node.py" name="planner_spline" output="screen">
       <remap from="/planner/avoidance/otwpnts" to="/planner/avoidance/static_otwpnts"/>
     </node>
-
   </group>
 
-  <!-- ══════════════════ DYNAMIC AVOIDANCE (3D SQP, enable_planners:=True) ══════════════════ -->
-  <!-- ### HJ : SQP owns /planner/avoidance/otwpnts. /sampling_planner/overtake publishes
-       to *_observation topics only until trajectory continuity is resolved. -->
+  <!-- ══════════════════ DYNAMIC AVOIDANCE (default: FAST_SQP) ══════════════════ -->
   <group if="$(arg enable_planners)">
     <group if="$(eval dynamic_avoidance_mode == 'SQP')">
       <node pkg="sqp_planner" type="dynamic_sqp_server.py" name="dynamic_sqp_tuner_node" output="screen"/>
       <node pkg="sqp_planner" type="3d_sqp_avoidance_node.py" name="planner_sqp" output="screen"/>
       <node pkg="sqp_planner" type="update_waypoints.py" name="waypoint_updater" output="screen"/>
     </group>
+    <group if="$(eval dynamic_avoidance_mode == 'FAST_SQP')">
+      <include file="$(find fast_sqp_planner)/launch/fast_sqp_planner_state.launch">
+        <arg name="state"                  value="overtake"/>
+        <arg name="attach_to_statemachine" value="true"/>
+      </include>
+    </group>
   </group>
 
-  <!-- ══════════════════ SAMPLING-BASED PLANNER 3D (observation-only) ══════════════════ -->
-  <!-- ### HJ : Observation-only until trajectory continuity is resolved. When
-       sampling_planner_enable:=true, /sampling_planner/{overtake,recovery} instances publish
-       to /planner/{avoidance/otwpnts,recovery/wpnts}_observation only. Actual driving is owned
-       by the legacy sqp / recovery_spliner planners. rqt_reconfigure groups both instances
-       under /sampling_planner/ for unified cost / sampling-grid tuning. -->
-  <group if="$(arg sampling_planner_enable)">
-    <include file="$(find sampling_based_planner_3d)/launch/sampling_planner_multi.launch">
-      <arg name="map_name"     value="$(arg map_name)"/>
-      <arg name="vehicle_name" value="$(arg vehicle_name)"/>
-    </include>
-  </group>
-
-  <!-- ══════════════════ GP PREDICTION (3D, enable_prediction:=True) ══════════════════ -->
+  <!-- ══════════════════ GP PREDICTION ══════════════════ -->
   <group if="$(arg enable_prediction)">
     <node pkg="gp_traj_predictor" type="dynamic_prediction_server.py" name="dynamic_prediction_tuner_node" output="screen"/>
     <node pkg="gp_traj_predictor" type="3d_opp_prediction.py" name="opponent_propagation_predictor" output="screen">

@@ -182,6 +182,7 @@ catkin_install_python(PROGRAMS
 ## IY 2026-05-17 : install FBGA-enabled state machine
 catkin_install_python(PROGRAMS
   src/fbga/fbga_state_machine_node.py
+  src/fbga/fbga_sm_fast_sqp_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

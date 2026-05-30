@@ -71,6 +71,13 @@ def GlobalTrackingTransition(state_machine) -> Tuple[StateType, StateType]:
     if has_near and state_machine._check_enemy_in_front():
         return StateType.TRAILING, StateType.GB_TRACK
 
+    ### IY : no obstacle but off raceline → RECOVERY (quintic re-join)
+    if not has_near:
+        close_to_gb = state_machine._check_close_to_raceline(
+            state_machine._get_adaptive_close_threshold())
+        if not close_to_gb:
+            return StateType.RECOVERY, StateType.RECOVERY
+
     return StateType.GB_TRACK, StateType.GB_TRACK
 
 
@@ -107,15 +114,15 @@ def OvertakingTransition(state_machine) -> Tuple[StateType, StateType]:
     if state_machine.overtaking_ttl_count < state_machine.overtaking_ttl_count_threshold:
         return StateType.OVERTAKE, StateType.OVERTAKE
 
-    # sustained clear → GB_TRACK
+    # sustained clear → GB_TRACK (on raceline) or RECOVERY (off raceline)
     state_machine.overtaking_ttl_count = 0
     close_to_gb = state_machine._check_close_to_raceline(
         state_machine._get_adaptive_close_threshold())
     if close_to_gb:
         return StateType.GB_TRACK, StateType.GB_TRACK
 
-    # still off raceline → stay OVERTAKE
-    return StateType.OVERTAKE, StateType.OVERTAKE
+    ### IY : obstacle gone but off raceline → RECOVERY (quintic re-join)
+    return StateType.RECOVERY, StateType.RECOVERY
 
 
 def TrailingTransition(state_machine) -> Tuple[StateType, StateType]:
@@ -124,19 +131,14 @@ def TrailingTransition(state_machine) -> Tuple[StateType, StateType]:
     has_nearby = _has_obs_nearby(state_machine)
     ot_sector = state_machine._check_ot_sector()
 
-    # stuck → FTG
-    if state_machine._check_ftg():
-        return StateType.FTGONLY, StateType.FTGONLY
-
-    # no obstacle nearby → back to appropriate state
+    # no obstacle nearby → GB_TRACK (on raceline) or RECOVERY (off raceline)
     if not has_nearby:
-        if ot_sector:
-            close_to_gb = state_machine._check_close_to_raceline(
-                state_machine._get_adaptive_close_threshold())
-            if close_to_gb:
-                return StateType.GB_TRACK, StateType.GB_TRACK
-            return StateType.OVERTAKE, StateType.OVERTAKE
-        return StateType.GB_TRACK, StateType.GB_TRACK
+        close_to_gb = state_machine._check_close_to_raceline(
+            state_machine._get_adaptive_close_threshold())
+        if close_to_gb:
+            return StateType.GB_TRACK, StateType.GB_TRACK
+        ### IY : off raceline → RECOVERY (quintic re-join)
+        return StateType.RECOVERY, StateType.RECOVERY
 
     # obstacle ahead + path clear → back to OVERTAKE
     if has_ahead and ot_sector and state_machine._ot_iy_wpnts is not None:
@@ -152,17 +154,6 @@ def TrailingTransition(state_machine) -> Tuple[StateType, StateType]:
     if ot_sector and state_machine._ot_iy_wpnts is not None:
         return StateType.TRAILING, StateType.OVERTAKE
     return StateType.TRAILING, StateType.GB_TRACK
-
-
-def FTGOnlyTransition(state_machine) -> Tuple[StateType, StateType]:
-    """FTG recovery."""
-    if not _has_obs_nearby(state_machine):
-        close_to_gb = state_machine._check_close_to_raceline(
-            state_machine._get_adaptive_close_threshold())
-        if close_to_gb:
-            return StateType.GB_TRACK, StateType.GB_TRACK
-
-    return StateType.FTGONLY, StateType.FTGONLY
 
 
 def StartTransition(state_machine) -> Tuple[StateType, StateType]:
