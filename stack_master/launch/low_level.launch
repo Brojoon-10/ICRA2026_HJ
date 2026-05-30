@@ -132,7 +132,28 @@
   <node pkg="stack_master" type="relay_node.py" name="relay_node" output="screen"/>
 
   <node pkg="joy" type="joy_node" name="joy_node" output="screen"/>
-  <!-- ### HJ : use ELRS receiver instead of USB joystick -->
-  <include file="$(find elrs_joy)/launch/elrs_joy.launch"/>
+  <!-- ### HJ : use ELRS receiver instead of USB joystick.
+       Two ELRS adapter variants are supported — pick exactly ONE (dual
+       publisher on /joy will race). Both expose identical Joy layout, so
+       simple_mux / state_machine / controller see no API change.
+
+         (A) CP2102 USB-TTL @ /dev/ELRS, 115200 baud, NO CRC (range-check
+             validation only). Legacy adapter — known to leak garbage frames
+             through to /joy under vibration / loose connector, which is the
+             original "RB phantom -> autodrive_latched" mechanism. Keep for
+             fallback if FT232 hardware is unavailable.
+
+         (B) FT232RL USB-TTL @ /dev/ELRS_FT232, 420000 baud, CRC-8 (poly 0xD5)
+             ENABLED. Native CRSF baud + real protocol checksum kill 99.6% of
+             garbage frames before they reach /joy. Adds two latency-zero RB
+             safety predicates (PRE-stability + cross-channel jerk) so single
+             garbage frames that slip past CRC can't toggle autodrive_latched.
+             Debug stats on /elrs_joy_node/debug_stats (1Hz JSON).
+
+       To switch: comment out the active line and uncomment the other. The
+       udev rule (.devcontainer/.install_utils/udev_rules_elrs.sh) already
+       maps both chips to their respective symlinks. -->
+  <!-- <include file="$(find elrs_joy)/launch/elrs_joy.launch"/> -->
+  <include file="$(find elrs_joy)/launch/elrs_joy_ft232.launch"/>
 
 </launch>
