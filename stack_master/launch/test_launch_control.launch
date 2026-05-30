@@ -33,9 +33,14 @@
     </node>
   </group>
 
-  <!-- ===== Joy inputs (USB + ELRS) ===== -->
+  <!-- ===== Joy inputs (USB + ELRS) =====
+       ### HJ : ELRS adapter = FT232RL @ /dev/ELRS_FT232, 420000 baud, CRC ON,
+       ### HJ : with RB stability + cross-channel jerk safety. To fall back to
+       ### HJ : the legacy CP2102 path (no CRC, range-check only), swap the two
+       ### HJ : include lines below. See low_level.launch for the full rationale. -->
   <node pkg="joy" type="joy_node" name="joy_node" output="screen"/>
-  <include file="$(find elrs_joy)/launch/elrs_joy.launch"/>
+  <!-- <include file="$(find elrs_joy)/launch/elrs_joy.launch"/> -->
+  <include file="$(find elrs_joy)/launch/elrs_joy_ft232.launch"/>
 
   <!-- ===== Manual ackermann source (replaces autonomy stack) ===== -->
   <node pkg="stack_master" type="test_control_publisher.py" name="test_control_publisher" output="screen" required="true"/>

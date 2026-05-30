@@ -10,6 +10,7 @@ catkin_package()
 
 catkin_install_python(PROGRAMS
   src/elrs_joy_node.py
+  src/elrs_joy_ft232_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
