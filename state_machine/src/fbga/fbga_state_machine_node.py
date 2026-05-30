@@ -132,10 +132,13 @@ class FBGAStateMachine(sm3d.StateMachine):
 
         ## IY : YAML save/load path is per-map so different tracks keep
         ## independent tuning. Falls back to ~/.ros if /map is unset.
-        try:
-            map_name = rospy.get_param('/map', None)
-        except Exception:
-            map_name = None
+        ### HJ : /map can be clobbered into a dict when a perception node is
+        ### launched as name="map" (its private params land under /map/*),
+        ### which made os.path.join crash with a dict. Resolve the map name
+        ### robustly: accept /map only if it's a string, otherwise recover it
+        ### from another node's private 'map' param, else fall back to ~/.ros.
+        map_name = self._resolve_map_name()
+        self._map_name = map_name   ### HJ : keep for health-check logging
         if map_name:
             self._yaml_path = os.path.join(
                 RosPack().get_path('stack_master'),
@@ -143,13 +146,73 @@ class FBGAStateMachine(sm3d.StateMachine):
         else:
             self._yaml_path = os.path.join(
                 os.path.expanduser('~'), '.ros', 'fbga_tuner.yaml')
-        rospy.loginfo(f'[FBGAStateMachine] yaml={self._yaml_path}')
+        ### HJ : log the map-name resolution path once, right here.
+        self._check_map_src()
 
         ## dynamic_reconfigure : live per-mode v_scale / gg_scale.
         ## Note: dyn_reconfigure first call fires with defaults, which may
         ## clobber any rosparams loaded from yaml. We deal with that by
         ## auto-loading the yaml AFTER the server is up (below).
         self._dyn_srv = DynServer(FBGATunerConfig, self._fbga_dyn_cb)
+
+    # ── map-name resolution ───────────────────────────────────────
+    ### HJ : robustly resolve the current map name as a plain string.
+    ### Records how it was resolved in self._map_src so the main loop can
+    ### periodically warn/err whether we are on the normal or fallback path.
+    def _resolve_map_name(self):
+        ## 1) /map as a string is the normal case.
+        try:
+            m = rospy.get_param('/map', None)
+        except Exception:
+            m = None
+        if isinstance(m, str) and m.strip():
+            self._map_src = 'direct'   # /map was a clean string
+            self._map_src_detail = '/map'
+            return m.strip()
+
+        ## 2) /map got clobbered into a dict (e.g. a perception node named
+        ##    "map" parked its private params under /map/*). Recover the map
+        ##    name from another node that stores it as a private 'map' param.
+        for p in ('/global_republisher/map', '/bridge_sector_node_3d/map',
+                  '/friction/map', '/gg_tuner/map'):
+            try:
+                v = rospy.get_param(p, None)
+            except Exception:
+                v = None
+            if isinstance(v, str) and v.strip():
+                self._map_src = 'fallback'   # recovered from another node
+                self._map_src_detail = p
+                return v.strip()   # _check_map_src() logs this once
+
+        ## 3) nothing usable -> caller falls back to ~/.ros.
+        self._map_src = 'none'   # could not resolve at all
+        self._map_src_detail = f'/map type={type(m).__name__}'
+        return None   # _check_map_src() logs this once
+
+    # ── map-source health check (once, at startup) ────────────────
+    ### HJ : log the resolution path exactly ONCE so we can confirm the
+    ### map name was found correctly without spamming the console.
+    ### 'direct'   -> /map was a clean string (normal).
+    ### 'fallback' -> map name recovered from a sibling node (WARN).
+    ### 'none'     -> no map name at all (~/.ros yaml) (ERROR).
+    def _check_map_src(self):
+        src = getattr(self, '_map_src', 'direct')
+        detail = getattr(self, '_map_src_detail', '?')
+        if src == 'direct':
+            ## node log_level is WARN, so use logwarn to make the
+            ## "did we find the right map name?" line actually visible.
+            rospy.logwarn(
+                f'[FBGAStateMachine] map OK: name="{self._map_name}" '
+                f'via {detail} -> {self._yaml_path}')
+        elif src == 'fallback':
+            rospy.logwarn(
+                f'[FBGAStateMachine] map via FALLBACK: /map was clobbered, '
+                f'using name="{self._map_name}" recovered from {detail} '
+                f'-> {self._yaml_path}')
+        else:  # 'none'
+            rospy.logerr(
+                f'[FBGAStateMachine] map UNRESOLVED ({detail}); '
+                f'tuner yaml falls back to {self._yaml_path}')
 
     # ── reload service ────────────────────────────────────────────
     def _fbga_reload_cb(self, req):
