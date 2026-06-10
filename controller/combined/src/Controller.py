@@ -14,8 +14,7 @@ import rospy
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 
-# ===== HJ ADDED: Global flag for differential trailing control for static sector obstacles =====
-
+# Global flag for differential trailing control for static sector obstacles
 DISABLE_TRAILING_CONTROL_FOR_STATIC_SECTOR = False
 
 # Speed multiplier for static sector obstacles when trailing control is disabled
@@ -23,7 +22,6 @@ DISABLE_TRAILING_CONTROL_FOR_STATIC_SECTOR = False
 # 0.8 = use 80% of global_speed (slight deceleration)
 # Values < 1.0 allow tuning deceleration amount
 STATIC_SECTOR_SPEED_MULTIPLIER = 1.0
-# ===== HJ ADDED END =====
 
 class Controller:
     """This class implements a MAP controller for autonomous driving.
@@ -158,7 +156,7 @@ class Controller:
         self.lat_acc = 0.0
         self.boost_mode = False
 
-        ### HJ : lateral correction params (updated via dyn_reconfigure)
+        # lateral correction params (updated via dyn_reconfigure)
         lat_mode_int = rospy.get_param('L1_controller/lat_correction_mode', 0)
         self.lat_correction_mode = ['none', 'stanley', 'predictive'][lat_mode_int]
         self.lat_K_stanley = rospy.get_param('L1_controller/lat_K_stanley', 1.5)
@@ -170,7 +168,7 @@ class Controller:
         self.ff_accel_lookahead = rospy.get_param('L1_controller/ff_accel_lookahead', 0.0)
         self.ff_brake_lookahead = rospy.get_param('L1_controller/ff_brake_lookahead', 0.0)
 
-        ### HJ : friction-ellipse accel limiter params
+        # friction-ellipse accel limiter params
         self.accel_limiter_enabled = rospy.get_param('L1_controller/accel_limiter_enabled', True)
         self.accel_lim_ax_max = rospy.get_param('L1_controller/accel_lim_ax_max', 5.0)
         self.accel_lim_ay_max = rospy.get_param('L1_controller/accel_lim_ay_max', 4.5)
@@ -179,9 +177,8 @@ class Controller:
         self.accel_lim_activate_speed_thres = rospy.get_param('L1_controller/accel_lim_activate_speed_thres', 2.0)
         self.accel_lim_deactivate_gap_thres = rospy.get_param('L1_controller/accel_lim_deactivate_gap_thres', 1.0)
         self._accel_lim_active = False  # hysteresis state
-        ### HJ : end
 
-        ### HJ : raceline-deceleration curvature boost
+        # raceline-deceleration curvature boost
         # If the local waypoint at idx_nearest has ax_mps2 < 0 (raceline is asking
         # for deceleration here), apply an additive curvature term so L1 shortens
         # while braking into a corner. Works on any waypoint source (GB tracking,
@@ -189,31 +186,15 @@ class Controller:
         # k_eff = curvature_factor + (decel_curvature_factor if ax<0 else 0)
         self.enable_straight_deceleration = rospy.get_param('L1_controller/enable_straight_deceleration', False)
         self.decel_curvature_factor = rospy.get_param('L1_controller/decel_curvature_factor', 2.5)
-        self.acc_now_rslidar = np.zeros(10)  # legacy buffer, kept for future IMU-based gating
-        ### HJ : end
 
-        ### HJ : yaw rate feedback (oversteer/understeer compensation)
+        # yaw rate feedback (oversteer/understeer compensation)
         self.K_yr = rospy.get_param('L1_controller/K_yr', 0.0)
-        self.K_yr_sat = rospy.get_param('L1_controller/K_yr_sat', 0.05)  ### HJ : corr clip [rad]
-        self.K_us = rospy.get_param('L1_controller/K_us', 0.0)  ### HJ : understeer gradient [s^2/m] (0=kinematic)
-        ### HJ : end
+        self.K_yr_sat = rospy.get_param('L1_controller/K_yr_sat', 0.05)  # corr clip [rad]
+        self.K_us = rospy.get_param('L1_controller/K_us', 0.0)  # understeer gradient [s^2/m] (0=kinematic)
 
-        ### HJ : GP steering correction
-        self.gp_steer_enabled = False
-        self.gp_steer_model = None
-        self._load_gp_model()
-        self._gp_reload_counter = 0
-        ### HJ : end
-        self.future_position_z = 0.0  ### HJ : z from track spline for future position
+        self.future_position_z = 0.0  # z from track spline for future position
 
     def main_loop(self, state, position_in_map, waypoint_array_in_map, speed_now, opponent, position_in_map_frenet, acc_now, track_length):
-        ### HJ : GP hot-reload check (~every 2s at 40Hz)
-        self._gp_reload_counter += 1
-        if self._gp_reload_counter >= 80:
-            self._gp_reload_counter = 0
-            self._try_reload_gp()
-        ### HJ : end
-
         # Updating parameters from manager
         self.state = state
         self.position_in_map = position_in_map
@@ -250,7 +231,7 @@ class Controller:
         
         if len(self.waypoint_array_in_map[self.idx_nearest_waypoint:]) > 2:
             # calculate curvature of global optimizer waypoints
-            # ===== HJ MODIFIED: Add safety check for empty slice =====
+            # safety check for empty slice
             curvature_slice = self.waypoint_array_in_map[self.idx_nearest_waypoint+10:self.idx_nearest_waypoint+20,6]
             if len(curvature_slice) > 0:
                 self.curvature_waypoints = np.mean(abs(curvature_slice))
@@ -260,8 +241,7 @@ class Controller:
                     self.curvature_waypoints = abs(self.waypoint_array_in_map[self.idx_nearest_waypoint, 6])
                 else:
                     self.curvature_waypoints = 0.0
-            # ===== HJ MODIFIED END =====
-                    
+
         # calculate future lateral error and future lateral error norm
  
         self.future_lat_e_norm, self.future_lat_err = self.calc_future_lateral_error_norm()
@@ -320,17 +300,6 @@ class Controller:
         else :
             return speed
 
-    #-------------------------HJ Emergency Editing--------------------------
-    # def AEB_for_weird_local_wpnt(self, speed):
-    #     dists = np.linalg.norm(self.waypoint_array_in_map[:, :2] - self.position_in_map[0, :2], axis=1)
-    #     local_wpnt_dist = np.min(dists)
-    #
-    #     if local_wpnt_dist >= self.AEB_thres:
-    #         return speed
-    #     else :
-    #         return speed
-    #-------------------------HJ Emergency Editing--------------------------
-
     def calc_steering_angle_for_future(self, future_L1_point, L1_distance, yaw, furture_lat_e_norm, v):
         """
         The purpose of this function is to calculate the steering angle based on the L1 point, desired lateral acceleration and velocity
@@ -361,7 +330,7 @@ class Controller:
             mrk.id = i
             mrk.pose.position.x = self.future_position[0, 0]
             mrk.pose.position.y = self.future_position[0, 1]
-            ### HJ : use spline-interpolated z for 3D marker
+            # use spline-interpolated z for 3D marker
             mrk.pose.position.z = self.future_position_z
             mrk.pose.orientation.w = 1
             marks.markers.append(mrk)
@@ -410,10 +379,9 @@ class Controller:
  
         steering_angle += self.compute_future_heading_correction(Future_L1_vector, yaw, dt, self.speed_now)
 
-        ### HJ : lateral error correction modes (Stanley / Model-predictive)
+        # lateral error correction modes (Stanley / Model-predictive)
         signed_d = self.get_signed_lateral_error()
         steering_angle = self.apply_lateral_correction(steering_angle, signed_d, yaw)
-        ### HJ : end
 
         # modifying steer based on acceleration
         #########################################
@@ -432,11 +400,11 @@ class Controller:
  
         steering_angle = self.steer_scaling_for_lat_err(steering_angle, self.future_lat_err)
 
-        ### HJ : yaw rate feedback — compute always (for observation),
-        ### apply only if K_yr > 0. Lets K_us be tuned safely with K_yr=0.
+        # yaw rate feedback: compute always (for observation), apply only if
+        # K_yr > 0. Lets K_us be tuned safely with K_yr=0.
         if abs(self.speed_now) > 0.5:
             v = self.speed_now
-            # Dynamic bicycle (K_us=0 → kinematic): yr = v·tan(δ) / (L + K_us·v²)
+            # Dynamic bicycle (K_us=0 -> kinematic): yr = v*tan(delta) / (L + K_us*v^2)
             wb_eff = self.wheelbase + self.K_us * v * v
             expected_yr = v * np.tan(steering_angle) / wb_eff
             yr_error = expected_yr - self.yaw_rate  # >0: understeer, <0: oversteer
@@ -444,17 +412,6 @@ class Controller:
             corr = np.clip(corr_raw, -self.K_yr_sat, self.K_yr_sat)
             if self.K_yr > 0:
                 steering_angle += corr
-            applied = "ON " if self.K_yr > 0 else "obs"
-            # rospy.loginfo_throttle(0.3,
-            #     f"[YawFB {applied}] v={v:.2f} δ={steering_angle - (corr if self.K_yr > 0 else 0.0):+.4f} "
-            #     f"K_us={self.K_us:.3f} exp_yr={expected_yr:+.3f} act_yr={self.yaw_rate:+.3f} "
-            #     f"err={yr_error:+.3f} corr_raw={corr_raw:+.4f} corr={corr:+.4f}")
-        ### HJ : end
-
-        ### HJ : GP steering correction
-        if self.gp_steer_enabled and self.gp_steer_model is not None:
-            steering_angle = self._apply_gp_correction(steering_angle, yaw)
-        ### HJ : end
 
         #-------------------------Steering Scaling-----------------------------
 
@@ -465,17 +422,10 @@ class Controller:
         steering_angle = np.clip(steering_angle, self.curr_steering_angle - threshold, self.curr_steering_angle + threshold)
         steering_angle = np.clip(steering_angle,-0.53,0.53)
         
-        #-------------------------0329 HJ-----------------------------
-        # For HOBAO
-        # steering_angle = np.clip(steering_angle,-0.6632,0.6632)
-        #-------------------------0329 HJ-----------------------------
-
-
-        # ===== HJ ADDED: Final NaN check before returning =====
+        # Final NaN check before returning
         if np.isnan(steering_angle):
             rospy.logerr_throttle(1.0, "[Controller] NaN in steering_angle, using previous value")
             steering_angle = self.curr_steering_angle if not np.isnan(self.curr_steering_angle) else 0.0
-        # ===== HJ ADDED END =====
 
         self.curr_steering_angle = steering_angle
  
@@ -494,7 +444,7 @@ class Controller:
  
             speed_scaler = self.m_l1 * self.speed_now
             
-        ### HJ : raceline-deceleration curvature boost
+        # raceline-deceleration curvature boost
         # When the nearest local waypoint's ax_mps2 (column 8) is negative, the
         # raceline is asking us to decelerate at this point — add a curvature term
         # so the lookahead shortens. Works on any waypoint source.
@@ -512,7 +462,6 @@ class Controller:
             except Exception as e:
                 rospy.logwarn_throttle(2.0, f"[DecelBoost] disabled this tick: {e}")
                 k_factor_eff = self.curvature_factor
-        ### HJ : end
 
         if self.state == "START":
             curvature_scaler = self.start_curvature_factor*self.curvature_waypoints
@@ -567,7 +516,7 @@ class Controller:
         else:
             self.boost_mode = False
  
-        # ===== HJ MODIFIED: Differential trailing control for static sector obstacles =====
+        # Differential trailing control for static sector obstacles
         if((self.state == "TRAILING") and (self.opponent is not None)): #Trailing controller
             # Check if opponent is static obstacle in static sector
             is_static_in_static_sector = (len(self.opponent) > 5 and
@@ -588,12 +537,11 @@ class Controller:
             self.trailing_speed = global_speed
             self.i_gap = 0
             speed_command = global_speed
-        # ===== HJ MODIFIED END =====
- 
+
         speed_command = self.speed_adjust_lat_err(speed_command, lat_e_norm)
 
-        ### HJ : acceleration feedforward — independent lookahead & gain for accel/brake
-        # accel lookahead: 0 → fall back to speed_lookahead (idx_la_position)
+        # acceleration feedforward: independent lookahead & gain for accel/brake
+        # accel lookahead: 0 -> fall back to speed_lookahead (idx_la_position)
         if self.ff_accel_lookahead > 0:
             la_acc = [self.position_in_map[0, 0] + v[0]*self.ff_accel_lookahead,
                       self.position_in_map[0, 1] + v[1]*self.ff_accel_lookahead]
@@ -602,7 +550,7 @@ class Controller:
         else:
             idx_ff_accel = idx_la_position
 
-        # brake lookahead: 0 → fall back to speed_lookahead (idx_la_position)
+        # brake lookahead: 0 -> fall back to speed_lookahead (idx_la_position)
         if self.ff_brake_lookahead > 0:
             la_brk = [self.position_in_map[0, 0] + v[0]*self.ff_brake_lookahead,
                       self.position_in_map[0, 1] + v[1]*self.ff_brake_lookahead]
@@ -618,9 +566,8 @@ class Controller:
             speed_command += self.speed_ff_gain_accel * ax_accel
         if ax_brake < 0 and self.speed_ff_gain_brake > 0:
             speed_command += self.speed_ff_gain_brake * ax_brake
-        ### HJ : end
 
-        ### HJ : friction-ellipse based accel limiter
+        # friction-ellipse based accel limiter
         # Only active when accelerating (speed_command > cur_speed).
         # Two caps applied together:
         #   (1) v_max_lat   — pure cornering limit at lookahead waypoint
@@ -628,13 +575,13 @@ class Controller:
         #   (2) v_max_long  — reference headroom over current speed, sized by
         #                     remaining longitudinal grip and a control horizon
         #                     T_ref (accel_lim_horizon). Using T_ref instead of
-        #                     the loop dt leaves VESC's inner loop enough
+        #                     the loop dt leaves the VESC inner loop enough
         #                     headroom to chase at full throttle.
         # Friction ellipse: (ay/ay_max)^2 + (ax/ax_max)^2 <= 1
-        ### HJ : hysteresis start-phase gate
-        # OFF -> ON: cur_speed <= activate_speed_thres AND gap > deactivate_gap_thres
-        # ON  -> OFF: gap <= deactivate_gap_thres (target reached)
-        # Anti-flap: activation requires both low cur_speed AND large gap.
+        # Hysteresis start-phase gate:
+        #   OFF -> ON: cur_speed <= activate_speed_thres AND gap > deactivate_gap_thres
+        #   ON  -> OFF: gap <= deactivate_gap_thres (target reached)
+        #   Anti-flap: activation requires both low cur_speed AND large gap.
         gap = speed_command - cur_speed
         if not self._accel_lim_active:
             if (cur_speed <= self.accel_lim_activate_speed_thres
@@ -673,7 +620,6 @@ class Controller:
                 f"[AccelLim] v={cur_speed:.2f} cmd={speed_before:.2f}->{speed_command:.2f} "
                 f"k_now={kappa_now:.3f} k_ref={kappa_ref:.3f} "
                 f"v_lat={v_max_lat:.2f} v_long={v_max_long:.2f} ax_av={ax_available:.2f}")
-        ### HJ : end
 
         return speed_command
     
@@ -692,7 +638,7 @@ class Controller:
         self.gap_actual = self.gap
         self.gap_should = self.trailing_vel_gain * self.speed_now + self.trailing_gap
 
-        ### HJ : clamp negative opp_vs (tracker sign/noise guard — prevents trailing acceleration blowup)
+        # clamp negative opp_vs (tracker sign/noise guard, prevents trailing acceleration blowup)
         opp_vs_raw = self.opponent[2]
         opp_vs = max(opp_vs_raw, 0.0)
         if opp_vs_raw < 0.0:
@@ -752,7 +698,7 @@ class Controller:
         steer *= factor
         return steer
  
-    ### HJ : lateral error correction ========================================
+    # ===== lateral error correction =====
 
     def get_signed_lateral_error(self):
         """Get signed lateral error (d) from frenet coordinates.
@@ -776,19 +722,13 @@ class Controller:
             out = self._predictive_correction(steering_angle, signed_d, yaw)
         else:
             out = steering_angle  # 'none' — no correction
-        # rospy.loginfo_throttle(0.5,
-        #     f"[LatCorr] mode={self.lat_correction_mode} "
-        #     f"d={signed_d:+.3f} v={self.speed_now:.2f} "
-        #     f"δ_in={steering_angle:+.4f} δ_out={out:+.4f} Δ={out-steering_angle:+.4f}")
         return out
 
     def _stanley_correction(self, steering_angle, signed_d, yaw):
-        """Stanley crosstrack correction at front axle (current position).
-        ### HJ : front-axle = current pos + wheelbase along yaw
-        """
+        """Stanley crosstrack correction at front axle (current position = pos + wheelbase along yaw)."""
         v = max(self.speed_now, 0.5)
 
-        ### HJ : front-axle d from current position (Stanley original)
+        # front-axle d from current position (Stanley original)
         fx = self.position_in_map[0, 0] + self.wheelbase * np.cos(yaw)
         fy = self.position_in_map[0, 1] + self.wheelbase * np.sin(yaw)
         try:
@@ -802,7 +742,7 @@ class Controller:
             d_front = signed_d
         d_use = d_front
 
-        # ### HJ : future_position 기반 d 사용 시 아래 주석 해제
+        # to use future_position-based d instead, uncomment the line below
         # d_use = signed_d
 
         correction = np.arctan(self.lat_K_stanley * (-d_use) / v)
@@ -810,10 +750,11 @@ class Controller:
 
     def _predictive_correction(self, steering_angle, signed_d, yaw):
         """Model-predictive lateral correction using bicycle model.
-        ### HJ : additive correction (NOT blend) — delta_correction represents
-        the extra steering needed to zero d in the frenet-relative frame
-        (raceline assumed straight within horizon T). Adding it to PP keeps
-        PP's curve-following intact; blending would steal from the curve term.
+
+        Additive correction (NOT blend): delta_correction represents the extra
+        steering needed to zero d in the frenet-relative frame (raceline assumed
+        straight within horizon T). Adding it to PP keeps PP's curve-following
+        intact; blending would steal from the curve term.
         """
         v = max(self.speed_now, 0.5)
         T = self.lat_pred_horizon
@@ -833,76 +774,10 @@ class Controller:
             return steering_angle
 
         tan_delta_corr = -(signed_d + v * np.sin(heading_err) * T) * L / denom
-        tan_delta_corr = np.clip(tan_delta_corr, -0.3, 0.3)   ### HJ : tighter clip for additive gain
+        tan_delta_corr = np.clip(tan_delta_corr, -0.3, 0.3)   # tighter clip for additive gain
         delta_correction = np.arctan(tan_delta_corr)
 
         return steering_angle + alpha * delta_correction
-
-    ### HJ : end lateral error correction ====================================
-
-    ### HJ : GP steering correction ==========================================
-
-    ### HJ : fixed GP model path + hot-reload
-    GP_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                 'gp_residual', 'models', 'gp_model.pkl')
-
-    def _load_gp_model(self):
-        """Init GP model tracking. Actual load happens via _try_reload_gp()."""
-        self._gp_model_mtime = 0.0
-        self.gp_max_correction = rospy.get_param('L1_controller/gp_max_correction', 0.05)
-        self.gp_uncertainty_thres = rospy.get_param('L1_controller/gp_uncertainty_thres', 0.1)
-        self._try_reload_gp()
-
-    def _try_reload_gp(self):
-        """Reload GP model if file changed. Called periodically."""
-        try:
-            if not os.path.exists(self.GP_MODEL_PATH):
-                return
-            mtime = os.path.getmtime(self.GP_MODEL_PATH)
-            if mtime <= self._gp_model_mtime:
-                return
-            import pickle
-            import sys
-            gp_scripts_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                          'gp_residual', 'scripts')
-            if gp_scripts_dir not in sys.path:
-                sys.path.insert(0, gp_scripts_dir)
-            from gp_train import SparseGPModel  # noqa: F401 — needed for pickle
-            with open(self.GP_MODEL_PATH, 'rb') as f:
-                self.gp_steer_model = pickle.load(f)
-            self._gp_model_mtime = mtime
-            self._gp_load_warned = False
-            rospy.loginfo(f"[Controller] GP model hot-reloaded: {self.GP_MODEL_PATH}")
-        except Exception as e:
-            if not hasattr(self, '_gp_load_warned') or not self._gp_load_warned:
-                rospy.logwarn(f"[Controller] GP reload failed: {e}")
-                self._gp_load_warned = True
-
-    def _apply_gp_correction(self, steering_angle, yaw):
-        """Apply GP steering correction with safety guards."""
-        try:
-            v = max(self.speed_now, 0.5)
-            idx = self.nearest_waypoint(self.position_in_map[0, :2], self.waypoint_array_in_map[:, :2])
-            kappa = self.waypoint_array_in_map[idx, 6]
-            ax = np.mean(self.acc_now) if hasattr(self, 'acc_now') else 0.0
-            state = np.array([[v, steering_angle, kappa, self.yaw_rate, ax]])
-
-            pred, sigma = self.gp_steer_model.predict(state)
-            delta_gp = float(pred[0])
-
-            # uncertainty guard: fade out if uncertain
-            if sigma is not None and float(sigma[0]) > self.gp_uncertainty_thres:
-                delta_gp = 0.0
-
-            # clamp: speed-dependent max correction
-            max_corr = self.gp_max_correction / (1.0 + 0.1 * v)
-            delta_gp = np.clip(delta_gp, -max_corr, max_corr)
-
-            return steering_angle + delta_gp
-        except Exception:
-            return steering_angle
-
-    ### HJ : end GP steering correction ======================================
 
     def steer_scaling_for_lat_err(self, steer, lateral_error):
 
@@ -922,18 +797,17 @@ class Controller:
            future lat_e_norm: normalization of the future lateral error
            future lateral_error: future distance from car's position to nearest waypoint
         """
-        # ===== HJ ADDED: NaN safety check =====
+        # NaN safety check
         if np.any(np.isnan(self.future_position)):
             rospy.logwarn_throttle(1.0, "[Controller] NaN in future_position, returning 0 for lateral error norm")
             return 0.0, 0.0
-        # ===== HJ ADDED END =====
 
         future_position = self.future_position[0, :2]
         idx_future_local_wpnts = self.nearest_waypoint(future_position, self.waypoint_array_in_map[:, :2])
-        # ===== HJ MODIFIED: Use signed d values, take abs() of difference =====
+        # use signed d values, take abs() of difference
         future_local_wpnts_d = self.waypoint_array_in_map[idx_future_local_wpnts,9]  # Keep sign
 
-        ### HJ : use 3D frenet conversion for lateral error (z-aware nearest search)
+        # use 3D frenet conversion for lateral error (z-aware nearest search)
         try:
             future_potision_s, future_position_d = self.converter.get_frenet_3d(
                 np.array([self.future_position[0,0]]),
@@ -944,8 +818,6 @@ class Controller:
         except (ValueError, Exception) as e:
             rospy.logwarn_throttle(1.0, f"[Controller] Frenet conversion failed: {e}, returning 0 for lateral error norm")
             return 0.0, 0.0
-        ### HJ : end
-        # ===== HJ MODIFIED END =====
 
         max_lat_e = 1
         min_lat_e = 0.
@@ -1002,13 +874,12 @@ class Controller:
 
         target_heading = np.arctan2(L1_vector[1], L1_vector[0])
         heading_error = target_heading - yaw
-        # ===== HJ MODIFIED: Add NaN check before modulo operation =====
+        # NaN check before modulo operation
         if np.isnan(heading_error):
             rospy.logerr_throttle(1.0, "[Controller] NaN in heading_error, setting to 0")
             heading_error = 0.0
         else:
             heading_error = (heading_error + np.pi) % (2 * np.pi) - np.pi
-        # ===== HJ MODIFIED END =====
 
         if use_filter:
             if not hasattr(self, 'filtered_heading_error'):
@@ -1066,7 +937,7 @@ class Controller:
         v = self.speed_now
         delta = self.current_steer_command  # Steering input
 
-        # ===== HJ ADDED: Input validation =====
+        # Input validation
         if np.any(np.isnan([x_current, y_current, psi_current, v, delta])):
             nan_sources = []
             if np.isnan(x_current): nan_sources.append(f"x={x_current}")
@@ -1081,7 +952,6 @@ class Controller:
             future_position[0, 1] = y_current if not np.isnan(y_current) else 0.0
             future_position[0, 2] = psi_current if not np.isnan(psi_current) else 0.0
             return future_position
-        # ===== HJ ADDED END =====
 
         # Vehicle geometry parameters.
         # Here, L_f and L_r are assumed to be 52% and 48% of the total wheelbase respectively.
@@ -1089,47 +959,26 @@ class Controller:
         L_f = 0.52 * L_total
         L_r = 0.48 * L_total
 
-        # 1. Compute geometric slip angle (basic model)
-        # ===== HJ MODIFIED: Clip delta to avoid tan explosion =====
+        # 1. Compute geometric slip angle (basic model).
+        #    delta clipped to avoid tan explosion.
         delta_clipped = np.clip(delta, -np.pi/2 + 0.1, np.pi/2 - 0.1)
         beta_model = np.arctan((L_r / (L_f + L_r)) * np.tan(delta_clipped))
-        # ===== HJ MODIFIED END =====
+        beta_fused = beta_model  # model-based only (no IMU fusion)
 
-        # ===== HJ MODIFIED: Use model-based prediction only (no IMU fusion) =====
-        # 2. Estimate slip angle indirectly using IMU yaw rate data
-        # if abs(v) > 2.0:
-        #     # If speed is sufficient, estimate slip angle from IMU yaw rate
-        #     beta_imu = np.arcsin(np.clip(((L_f + L_r) * self.yaw_rate / v), -1.0, 1.0))
-        # else:
-        #     beta_imu = beta_model  # Maintain basic model when speed is very low
-
-        # 3. Fuse the geometric and IMU-based slip angles using weighted average
-        # lambda_weight = 1.0
-        # beta_fused = lambda_weight * beta_model + (1 - lambda_weight) * beta_imu
-        beta_fused = beta_model  # Use model-based only
-
-        # 4. Predict future position using the fused slip angle
+        # 2. Predict future position using the slip angle
         future_x = x_current + v * np.cos(psi_current + beta_fused) * T
         future_y = y_current + v * np.sin(psi_current + beta_fused) * T
 
-        ### HJ : estimate future z from track spline (vehicle follows track surface)
+        # estimate future z from track spline (vehicle follows track surface)
         try:
             future_s = self.converter.get_approx_s(np.array([future_x]), np.array([future_y]))
             self.future_position_z = float(self.converter.spline_z(future_s[0]))
         except Exception:
             self.future_position_z = 0.0
-        ### HJ : end
 
-        # 5. Predict future heading:
-        # Option A: Model-based prediction
+        # 3. Predict future heading (model-based)
         future_psi_model = psi_current + (v / (L_f + L_r)) * np.sin(beta_fused) * T
-        # Option B: IMU-based prediction
-        # future_psi_imu = psi_current + self.yaw_rate * T
-        # Fuse the two heading predictions using a weighted average
-        # gamma_weight = 1.0
-        # future_psi = gamma_weight * future_psi_model + (1 - gamma_weight) * future_psi_imu
-        future_psi = future_psi_model  # Use model-based only
-        # ===== HJ MODIFIED END =====
+        future_psi = future_psi_model
         # Normalize heading to the range [-pi, pi]
         future_psi = np.arctan2(np.sin(future_psi), np.cos(future_psi))
         
@@ -1166,10 +1015,10 @@ class Controller:
             distance = self.t_clip_min
         d_distance = distance
 
-        ### HJ : use 3D distance for lookahead accumulation on sloped tracks
+        # use 3D distance for lookahead accumulation on sloped tracks
         waypoints_ahead = waypoints[idx_waypoint_behind_car:]
 
-        ### HJ : x=0, y=1, z=2 — compute 3D segment distances
+        # x=0, y=1, z=2 — compute 3D segment distances
         if waypoints_ahead.shape[1] > 2:
             deltas = np.diff(waypoints_ahead[:, :3], axis=0)
         else:
@@ -1179,7 +1028,7 @@ class Controller:
         # Compute cumulative distances
         cum_lengths = np.cumsum(seg_lengths)
 
-        ### HJ : linear interpolation between adjacent waypoints for L1 point
+        # linear interpolation between adjacent waypoints for L1 point.
         # eliminates ~10 cm quantization that was producing tick-to-tick eta jumps.
         # idx_seg is the segment index such that cum_lengths[idx_seg-1] < d <= cum_lengths[idx_seg].
         n_seg = len(seg_lengths)
@@ -1205,4 +1054,3 @@ class Controller:
         p_start = waypoints_ahead[idx_seg, :3]
         p_end = waypoints_ahead[idx_seg + 1, :3]
         return (1.0 - t) * p_start + t * p_end
-        ### HJ : end

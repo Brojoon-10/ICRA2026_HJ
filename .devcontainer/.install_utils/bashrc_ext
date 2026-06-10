@@ -26,25 +26,21 @@ echo "ROS_DISTRO $ROS_DISTRO"
 # export ROS_HOSTNAME=localhost
 # export ROS_IP=localhost
 
-# export ROS_HOSTNAME='192.168.70.3'
-# export ROS_IP='192.168.70.3'
-# export CAR_NAME="SRX1"
-
-export ROS_HOSTNAME='192.168.70.2'
-export ROS_IP='192.168.70.2'
-export CAR_NAME="SRX2"
+# export ROS_HOSTNAME='192.168.70.*'
+# export ROS_IP='192.168.70.*'
+# export CAR_NAME="SRX_R_1"
 
 
 export ROS_MASTER_URI="http://${ROS_HOSTNAME}:11311"
 
-### HJ : permanently switch settings in ~/.bashrc
+# permanently switch settings in ~/.bashrc
 # usage: set_car HOBAO
 set_car() {
   sed -i "s/^export CAR_NAME=.*/export CAR_NAME=\"$1\"/" ~/.bashrc
   export CAR_NAME="$1"
   echo "CAR_NAME permanently set to $1"
 }
-# usage: set_ip 192.168.70.3
+# usage: set_ip 192.168.70.*
 set_ip() {
   sed -i "s/^export ROS_HOSTNAME=.*/export ROS_HOSTNAME='$1'/" ~/.bashrc
   sed -i "s/^export ROS_IP=.*/export ROS_IP='$1'/" ~/.bashrc

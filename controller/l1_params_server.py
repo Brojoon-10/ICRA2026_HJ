@@ -57,7 +57,7 @@ class DynamicControllerConfigServer:
             self.yaml_data["trailing_d_gain"] = config.trailing_d_gain
             self.yaml_data["blind_trailing_speed"] = config.blind_trailing_speed
 
-            ### HJ : new params
+            # lateral correction / accel feedforward / accel limiter / yaw rate / brake / decel boost
             self.yaml_data["lat_correction_mode"] = config.lat_correction_mode
             self.yaml_data["lat_K_stanley"] = config.lat_K_stanley
             self.yaml_data["lat_pred_horizon"] = config.lat_pred_horizon
@@ -74,8 +74,6 @@ class DynamicControllerConfigServer:
             self.yaml_data["K_yr"] = config.K_yr
             self.yaml_data["K_yr_sat"] = config.K_yr_sat
             self.yaml_data["K_us"] = config.K_us
-            self.yaml_data["gp_max_correction"] = config.gp_max_correction
-            self.yaml_data["gp_uncertainty_thres"] = config.gp_uncertainty_thres
             self.yaml_data["enable_brake_ctrl"] = config.enable_brake_ctrl
             self.yaml_data["brake_mode"] = config.brake_mode
             self.yaml_data["brake_speed_diff_thres"] = config.brake_speed_diff_thres
@@ -83,7 +81,6 @@ class DynamicControllerConfigServer:
             self.yaml_data["brake_current_min"] = config.brake_current_min
             self.yaml_data["enable_straight_deceleration"] = config.enable_straight_deceleration
             self.yaml_data["decel_curvature_factor"] = config.decel_curvature_factor
-            ### HJ : end
 
             with open(self.yaml_file_path, "w") as yaml_file:
                 yaml.dump(self.yaml_data, yaml_file, default_flow_style=False)
@@ -139,7 +136,7 @@ class DynamicControllerConfigServer:
             "trailing_d_gain": float(yaml_data["trailing_d_gain"]),
             "blind_trailing_speed": float(yaml_data["blind_trailing_speed"]),
 
-            ### HJ : new params (safe defaults for old yaml files)
+            # safe defaults for yaml files that predate these params
             "lat_correction_mode": int(yaml_data.get("lat_correction_mode", 0)),
             "lat_K_stanley": float(yaml_data.get("lat_K_stanley", 1.5)),
             "lat_pred_horizon": float(yaml_data.get("lat_pred_horizon", 0.3)),
@@ -156,8 +153,6 @@ class DynamicControllerConfigServer:
             "K_yr": float(yaml_data.get("K_yr", 0.0)),
             "K_yr_sat": float(yaml_data.get("K_yr_sat", 0.05)),
             "K_us": float(yaml_data.get("K_us", 0.0)),
-            "gp_max_correction": float(yaml_data.get("gp_max_correction", 0.05)),
-            "gp_uncertainty_thres": float(yaml_data.get("gp_uncertainty_thres", 0.1)),
             "enable_brake_ctrl": bool(yaml_data.get("enable_brake_ctrl", False)),
             "brake_mode": int(yaml_data.get("brake_mode", 0)),
             "brake_speed_diff_thres": float(yaml_data.get("brake_speed_diff_thres", 0.5)),
@@ -165,8 +160,7 @@ class DynamicControllerConfigServer:
             "brake_current_min": float(yaml_data.get("brake_current_min", 3.0)),
             "enable_straight_deceleration": bool(yaml_data.get("enable_straight_deceleration", False)),
             "decel_curvature_factor": float(yaml_data.get("decel_curvature_factor", 2.5)),
-            ### HJ : end
-        }          
+        }
         return default_config
 
     # Set l1 parameter values to the values of the corresponding .yaml file

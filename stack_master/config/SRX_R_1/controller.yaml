@@ -33,8 +33,6 @@ end_scale_speed: 10.0
 ff_accel_lookahead: 0.0
 ff_brake_lookahead: 0.0
 future_constant: 0.05
-gp_max_correction: 0.05
-gp_uncertainty_thres: 0.1
 heading_error_thres: 10.0
 lat_K_stanley: 1.5
 lat_correction_mode: 0

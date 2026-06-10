@@ -23,26 +23,30 @@ from combined.src.Controller import Controller
 from ftg.ftg import FTG
 
 class Controller_manager:
-    """This class is the main controller manager for the car. It is responsible for selecting the correct controller $
+    """This class is the main controller manager for the car. It is responsible for selecting the correct controller
     and publishing the corresponding commands to the actuators.
-    
+
     It subscribes to the following topics:
-    - /car_state/odom:  get ego car speed
-    - /car_state/pose:  get ego car position (x, y, theta)
-    - /local_waypoints: get waypoints starting at car's position in map frame
-    - /vesc/sensors/imu/raw: get acceleration for steer scaling
-    - /car_state/odom_frenet: get ego car frenet coordinates
-    - /tracking/obstacles: get opponent information (position, speed, static/dynamic)
-    - /state_machine: get state of the car
+    - /behavior_strategy: get local waypoints, opponent/trailing targets, and behavior state
+    - /car_state/odom: get ego car speed
+    - /car_state/pose: get ego car position (x, y, theta)
+    - /imu/data: get acceleration for steer scaling
+    - /car_state/odom_frenet: get ego car GB frenet coordinates
+    - /car_state/odom_frenet_fixed: get ego car Fixed frenet coordinates
+    - /smart_static_active: switch between GB and Fixed frenet
+    - /smart_static_avoidance_wpnts: get Fixed path waypoints
+    - /dyn_controller/parameter_updates: dynamically update controller parameters
     - /scan: get lidar scan data
+    - /vesc/odom: get wheelspeed
+    - /save_start_traj: trigger START state boost
 
     It publishes the following topics:
     - /lookahead_point: publish the lookahead point for visualization
+    - /future_position: publish the predicted future position for visualization
     - /trailing_opponent_marker: publish the trailing opponent marker for visualization
-    - /my_waypoints: publish the waypoints for visualization
     - /l1_distance: publish the l1 distance from the Controller for visualization
     - /vesc/high_level/ackermann_cmd_mux/input/nav_1: publish the steering and speed command
-    - /controller/latency: publish the latency of the controller for measuring if launched with measure:=true
+    - /controller/latency: publish the latency of the controller if launched with measure:=true
 
     """
     def __init__(self):
@@ -53,13 +57,12 @@ class Controller_manager:
         self.ros_time = rospy.Time()
         self.scan = None
 
-        ### HJ : run_delay instrumentation — same metric as live_monitor (sum of
-        ### sched_info.run_delay across all threads = time runnable-but-not-on-CPU).
-        ### Accumulated over a 100ms window (matches live_monitor's slice) and
-        ### logged only when CPU-wait in that window exceeds threshold.
+        # run_delay instrumentation: sum of sched_info.run_delay across all threads
+        # = time runnable-but-not-on-CPU. Accumulated over a 100ms window, logged
+        # only when CPU-wait in that window exceeds threshold.
         self._rd_window_start_ns = None  # run_delay at window start
         self._rd_window_t0 = None        # wall-clock at window start
-        self._rd_log_period_s = 0.1      # 100ms window, same as live_monitor
+        self._rd_log_period_s = 0.1      # 100ms window
         self._run_delay_thresh_ms = 30.0 # warn if CPU-wait in window > 30ms
         
         self.mapping = rospy.get_param('controller_manager/mapping', False)
@@ -83,20 +86,14 @@ class Controller_manager:
         
         self.state_machine_rate = rospy.get_param('state_machine/rate') #rate in hertz
         self.position_in_map = [] # current position in map frame
-        self.position_z = 0.0  # ### HJ : z coordinate for 3D nearest waypoint search
-        # ===== HJ MODIFIED: Dual Frenet position system =====
+        self.position_z = 0.0  # z coordinate for 3D nearest waypoint search
+        # Dual Frenet position system
         self.position_in_map_frenet = [] # current position in frenet coordinates (GB or Fixed depending on mode)
         self.position_in_map_frenet_gb = [] # GB Frenet position
         self.position_in_map_frenet_fixed = [] # Fixed Frenet position
-        # ===== HJ MODIFIED END =====
         self.waypoint_list_in_map = [] # waypoints starting at car's position in map frame
         self.speed_now = 0 # current speed
-        self.acc_now = np.zeros(10) # last 5 accleration values
-        ### HJ : rslidar IMU ax buffer — m/s^2, longitudinal (forward+ when sign correct).
-        # Populated by rslidar_imu_cb (currently commented out). Keep buffer always so
-        # downstream code can read it safely (stays 0 → decel_gate=0 → no effect).
-        self.acc_now_rslidar = np.zeros(10)
-        ### HJ : end
+        self.acc_now = np.zeros(10) # last acceleration values
         self.speed_now_y =0
         self.yaw_rate = 0
         self.waypoint_safety_counter = 0
@@ -107,13 +104,12 @@ class Controller_manager:
         self.trailing_command = 2
         self.i_gap = 0
 
-        # ===== HJ ADDED: Dual Frenet converter system =====
+        # Dual Frenet converter system
         self.converter = None  # GB Frenet converter (will be converter_gb)
         self.converter_gb = None  # GB raceline converter
         self.converter_fixed = None  # Smart Static Fixed path converter
         self.smart_static_active = False  # Current Smart Static mode state
         self._prev_smart_static_active = False  # Track mode changes
-        # ===== HJ ADDED END =====
 
         # initializing l1 parameter
         # This step could be removed with rospy.wait_for_message() in control loop
@@ -165,18 +161,16 @@ class Controller_manager:
             waypoints = rospy.wait_for_message('/global_waypoints', WpntArray)
         self.waypoints = np.array([[wpnt.x_m, wpnt.y_m, wpnt.z_m] for wpnt in waypoints.wpnts])
 
-        # ===== HJ MODIFIED: Dual track length for GB and Fixed =====
+        # Dual track length for GB and Fixed
         self.track_length_gb = rospy.get_param("/global_republisher/track_length")
         self.track_length_fixed = 0.0  # Will be set when Fixed path arrives
         self.track_length = self.track_length_gb  # Default to GB, updated dynamically in controller_cycle
         rospy.loginfo(f"[{self.name}] GB track length: {self.track_length_gb:.2f}m")
-        # ===== HJ MODIFIED END =====
 
-        # ===== HJ MODIFIED: Initialize GB converter and set as default =====
+        # Initialize GB converter and set as default
         self.converter_gb = FrenetConverter(self.waypoints[:, 0], self.waypoints[:, 1], self.waypoints[:, 2])
         self.converter = self.converter_gb  # Default to GB
         rospy.loginfo(f"[{self.name}] Initialized GB Frenet converter")
-        # ===== HJ MODIFIED END =====
 
 
         # FTG
@@ -248,7 +242,7 @@ class Controller_manager:
         if self.measuring:
             self.measure_pub = rospy.Publisher('/controller/latency', Float32, queue_size=10)
 
-        ### HJ : current_brake control
+        # brake control
         self.enable_brake_ctrl = False
         self.brake_mode = 0  # 0=jerk512, 1=direct brake topic
         self.brake_speed_diff_thres = 0.5  # [m/s]
@@ -261,31 +255,21 @@ class Controller_manager:
         self.servo_pub = rospy.Publisher('/vesc/commands/servo/position', Float64Msg, queue_size=10)
         self.steering_to_servo_gain = rospy.get_param('/vesc/steering_angle_to_servo_gain', -1.2135)
         self.steering_to_servo_offset = rospy.get_param('/vesc/steering_angle_to_servo_offset', 0.5304)
-        ### HJ : end
 
-        ### HJ : friction sector → accel limiter ay_max sync
+        # friction sector -> accel limiter ay_max sync
         from dynamic_reconfigure.msg import Config as DynConfig
         rospy.Subscriber('/dyn_sector_tuner/friction/parameter_updates', DynConfig, self.friction_sector_cb)
-        ### HJ : end
 
         # Subscribers
         rospy.Subscriber('/behavior_strategy', BehaviorStrategy, self.behavior_cb) # waypoints (x, y, v, norm trackbound, s, kappa)
         rospy.Subscriber('/car_state/odom', Odometry, self.odom_cb) # car speed
         rospy.Subscriber('/car_state/pose', PoseStamped, self.car_state_cb) # car position (x, y, theta)
         rospy.Subscriber('/imu/data', Imu, self.imu_cb) # acceleration subscriber for steer change
-        ### HJ : rslidar IMU (alive when /imu/data is dead). Bag 2026-05-16-09-41-42
-        # confirms axes: gravity along -z, longitudinal motion along +x,
-        # lateral/cornering along y. Sign of x vs car forward not yet validated —
-        # if forward acceleration shows up as negative ax, flip sign in rslidar_imu_cb.
-        # Uncomment when ready to use for decel-gated curvature_factor boost.
-        # rospy.Subscriber('/rslidar_imu_data', Imu, self.rslidar_imu_cb)
-        ### HJ : end
-        # ===== HJ MODIFIED: Dual Frenet odom subscribers =====
+        # Dual Frenet odom subscribers
         rospy.Subscriber('/car_state/odom_frenet', Odometry, self.car_state_frenet_gb_cb) # GB frenet coordinates
         rospy.Subscriber('/car_state/odom_frenet_fixed', Odometry, self.car_state_frenet_fixed_cb) # Fixed frenet coordinates
         rospy.Subscriber('/smart_static_active', Bool, self.smart_static_active_cb) # Smart Static mode flag
         rospy.Subscriber('/smart_static_avoidance_wpnts', WpntArray, self.smart_static_wpnts_cb) # Fixed path waypoints
-        # ===== HJ MODIFIED END =====
         rospy.Subscriber("/dyn_controller/parameter_updates", Config, self.l1_params_cb) #l1 param tuning/updating
         rospy.Subscriber("/scan", LaserScan, self.scan_cb)
         rospy.Subscriber("/vesc/odom", Odometry, self.vesc_odom_cb)
@@ -398,7 +382,7 @@ class Controller_manager:
 
         self.controller.AEB_thres = self.AEB_thres
 
-        ### HJ : lateral correction params from dyn_reconfigure
+        # lateral correction params from dyn_reconfigure
         lat_mode_int = rospy.get_param('dyn_controller/lat_correction_mode', 0)
         self.controller.lat_correction_mode = ['none', 'stanley', 'predictive'][lat_mode_int]
         self.controller.lat_K_stanley = rospy.get_param('dyn_controller/lat_K_stanley', 1.5)
@@ -408,7 +392,7 @@ class Controller_manager:
         self.controller.speed_ff_gain_brake = rospy.get_param('dyn_controller/speed_ff_gain_brake', 0.0)
         self.controller.ff_accel_lookahead = rospy.get_param('dyn_controller/ff_accel_lookahead', 0.0)
         self.controller.ff_brake_lookahead = rospy.get_param('dyn_controller/ff_brake_lookahead', 0.0)
-        ### HJ : friction-ellipse accel limiter (scale both axes by sector friction)
+        # friction-ellipse accel limiter (scale both axes by sector friction)
         self.controller.accel_limiter_enabled = rospy.get_param('dyn_controller/accel_limiter_enabled', True)
         friction = self._get_current_friction()
         self.controller.accel_lim_ax_max = rospy.get_param('dyn_controller/accel_lim_ax_max', 5.0) * friction
@@ -417,29 +401,22 @@ class Controller_manager:
         self.controller.accel_lim_lookahead = rospy.get_param('dyn_controller/accel_lim_lookahead', 0.3)
         self.controller.accel_lim_activate_speed_thres = rospy.get_param('dyn_controller/accel_lim_activate_speed_thres', 2.0)
         self.controller.accel_lim_deactivate_gap_thres = rospy.get_param('dyn_controller/accel_lim_deactivate_gap_thres', 1.0)
-        ### HJ : end
 
-        ### HJ : GP residual + yaw rate feedback from dyn_reconfigure
-        self.controller.gp_steer_enabled = rospy.get_param('dyn_controller/gp_steer_enabled', False)
-        self.controller.gp_max_correction = rospy.get_param('dyn_controller/gp_max_correction', 0.05)
-        self.controller.gp_uncertainty_thres = rospy.get_param('dyn_controller/gp_uncertainty_thres', 0.1)
+        # yaw rate feedback from dyn_reconfigure
         self.controller.K_yr = rospy.get_param('dyn_controller/K_yr', 0.0)
         self.controller.K_yr_sat = rospy.get_param('dyn_controller/K_yr_sat', 0.05)
         self.controller.K_us = rospy.get_param('dyn_controller/K_us', 0.0)
-        ### HJ : end
 
-        ### HJ : brake control params from dyn_reconfigure
+        # brake control params from dyn_reconfigure
         self.enable_brake_ctrl = rospy.get_param('dyn_controller/enable_brake_ctrl', False)
         self.brake_mode = rospy.get_param('dyn_controller/brake_mode', 0)
         self.brake_speed_diff_thres = rospy.get_param('dyn_controller/brake_speed_diff_thres', 0.5)
         self.brake_current = rospy.get_param('dyn_controller/brake_current', 15.0)
         self.brake_current_min = rospy.get_param('dyn_controller/brake_current_min', 3.0)
-        ### HJ : end
 
-        ### HJ : raceline-deceleration curvature boost params from dyn_reconfigure
+        # raceline-deceleration curvature boost params from dyn_reconfigure
         self.controller.enable_straight_deceleration = rospy.get_param('dyn_controller/enable_straight_deceleration', False)
         self.controller.decel_curvature_factor = rospy.get_param('dyn_controller/decel_curvature_factor', 2.5)
-        ### HJ : end
 
         ## Trailing Control Parameters
         self.controller.trailing_gap = self.trailing_gap # Distance in meters
@@ -458,14 +435,13 @@ class Controller_manager:
         self.speed_now_y = data.twist.twist.linear.y
         self.controller.speed_now = self.speed_now
 
-        ### HJ : yaw rate from odom (IMU /imu/data dead) — ENU, left+
+        # yaw rate from odom (ENU, left+)
         self.yaw_rate = data.twist.twist.angular.z
         self.controller.yaw_rate = self.yaw_rate
-        ### HJ : end
 
         # velocity for follow the gap (needed to set gap radius)
         self.ftg_controller.set_vel(data.twist.twist.linear.x)
-        
+
     def vesc_odom_cb(self, data: Odometry):
         self.wheelspeed_now = data.twist.twist.linear.x
         
@@ -478,11 +454,10 @@ class Controller_manager:
         theta = euler_from_quaternion([data.pose.orientation.x, data.pose.orientation.y,
                                        data.pose.orientation.z, data.pose.orientation.w])[2]
         self.position_in_map = np.array([x, y, theta])[np.newaxis]
-        ### HJ : store z separately for 3D nearest waypoint search
+        # store z separately for 3D nearest waypoint search
         self.position_z = data.pose.position.z
-        ### HJ : end
 
-    # ===== HJ MODIFIED: Split Frenet callbacks for GB and Fixed =====
+    # Split Frenet callbacks for GB and Fixed
     def car_state_frenet_gb_cb(self, data: Odometry):
         """GB Frenet odom callback"""
         s = data.pose.pose.position.x
@@ -551,7 +526,6 @@ class Controller_manager:
                 self.controller.converter = self.converter_fixed
                 self.track_length = self.track_length_fixed
                 rospy.loginfo(f"[{self.name}] Applied Fixed Frenet converter (Smart mode active)")
-    # ===== HJ MODIFIED END ===== 
 
 
     def behavior_cb(self, data: BehaviorStrategy):
@@ -562,18 +536,17 @@ class Controller_manager:
             opponent_vs = opponent.vs
             opponent_visible = opponent.is_visible
             opponent_static = opponent.is_static
-            # ===== HJ ADDED: Add static sector info for differential trailing control =====
+            # static sector info for differential trailing control
             opponent_in_static_sector = opponent.in_static_obs_sector
             self.opponent = [opponent_s, opponent_d, opponent_vs, opponent_static, opponent_visible, opponent_in_static_sector]
             # Index:          [0]        [1]        [2]       [3]              [4]               [5]
-            # ===== HJ ADDED END =====
         else:
             self.opponent = None
 
         self.waypoint_list_in_map = []
         
-        ### HJ : waypoint layout [x, y, z, speed, safety_ratio, s, kappa, psi, ax, d]
-        ###       indices:        0  1  2  3      4              5  6      7    8   9
+        # waypoint layout [x, y, z, speed, safety_ratio, s, kappa, psi, ax, d]
+        #       indices:    0  1  2  3      4              5  6      7    8   9
         for waypoint in data.local_wpnts:
             speed = waypoint.vx_mps
             if waypoint.d_right + waypoint.d_left != 0:
@@ -592,14 +565,13 @@ class Controller_manager:
                 waypoint.ax_mps2,     # 8
                 waypoint.d_m,         # 9
             ])
-        ### HJ : end
         self.waypoint_array_in_map = np.array(self.waypoint_list_in_map)
         self.waypoint_safety_counter = 0
         self.state = data.state
         
-    ### HJ : friction sector → update accel limiter ay_max per sector
+    # friction sector -> update accel limiter ay_max per sector
     def friction_sector_cb(self, msg):
-        """Friction sector params changed — reload from rosparam"""
+        """Friction sector params changed, reload from rosparam"""
         try:
             n_sec = rospy.get_param('/friction_map_params/n_sectors', 0)
             if n_sec > 0:
@@ -631,7 +603,6 @@ class Controller_manager:
                 # fallback: index-based (cannot use here, return global)
                 return 1.0
         return 1.0
-    ### HJ : end
 
     def imu_cb(self, data):
         self.acc_now[1:] = self.acc_now[:-1]
@@ -642,23 +613,10 @@ class Controller_manager:
         self.yaw_rate = -data.angular_velocity.z # vesc is rotated 90 deg, so (-acc_y) == (long_acc)
         self.controller.yaw_rate = self.yaw_rate
 
-    ### HJ : rslidar IMU callback — fills self.acc_now_rslidar (m/s^2, +forward).
-    # /rslidar_imu_data publishes in "g" units (az ≈ -1.0 g at rest). On this sensor,
-    # longitudinal motion is along x (verified with bag 2026-05-16-09-41-42),
-    # lateral along y, gravity along -z. Multiply by g to get m/s^2.
-    # Sign: tentatively +ax_raw → +forward; flip if needed after live verification.
-    # The buffer is read by Controller.calc_future_L1_point's decel_gate.
-    # def rslidar_imu_cb(self, data):
-    #     G = 9.81
-    #     self.acc_now_rslidar[1:] = self.acc_now_rslidar[:-1]
-    #     self.acc_now_rslidar[0] = data.linear_acceleration.x * G  # flip sign here if forward is -x
-    #     self.controller.acc_now_rslidar = self.acc_now_rslidar
-    ### HJ : end
-
     ############################################MAIN LOOP############################################
 
-    ### HJ : sum sched_info.run_delay (ns) across all threads of this process.
-    ### Identical to live_monitor's read_wait_ns: field [1] of each task's schedstat.
+    # sum sched_info.run_delay (ns) across all threads of this process
+    # (field [1] of each task's schedstat).
     def _read_run_delay_ns(self):
         total = 0
         try:
@@ -705,9 +663,9 @@ class Controller_manager:
         rospy.loginfo(f"[{self.name}] Ready!")
 
         while not rospy.is_shutdown():
-            ### HJ : run_delay detect — accumulate summed sched_info.run_delay over
-            ### a 100ms window (same metric/window as live_monitor). Pure CPU-
-            ### starvation time. Warn only when window CPU-wait exceeds threshold.
+            # run_delay detect: accumulate summed sched_info.run_delay over a 100ms
+            # window (pure CPU-starvation time). Warn only when window CPU-wait
+            # exceeds threshold.
             _rd = self._read_run_delay_ns()
             _now_rd = time.perf_counter()
             if self._rd_window_start_ns is None:
@@ -733,9 +691,9 @@ class Controller_manager:
                 end = time.perf_counter()
                 self.measure_pub.publish(end-start)
                 
-            ### HJ : current_brake switching logic
-            # brake_mode 0 = jerk512 (acceleration → current via ackermann pipeline)
-            # brake_mode 1 = direct /vesc/commands/motor/brake (exact current you set)
+            # brake switching logic
+            # brake_mode 0 = jerk512 (acceleration -> current via ackermann pipeline)
+            # brake_mode 1 = direct /vesc/commands/motor/brake (exact current set)
             brake_active = False
             if self.enable_brake_ctrl and self.speed_now > 0.3:
                 speed_diff = self.speed_now - speed  # positive when need to decelerate
@@ -754,7 +712,6 @@ class Controller_manager:
                         servo_msg = self.Float64Msg(
                             data=self.steering_to_servo_gain * steering_angle + self.steering_to_servo_offset)
                         self.servo_pub.publish(servo_msg)
-            ### HJ : end
 
             if not brake_active:
                 ack_msg = self.create_ack_msg(speed, acceleration, jerk, steering_angle)
@@ -856,7 +813,7 @@ class Controller_manager:
         lookahead_marker.color.a = 1.0
         lookahead_marker.pose.position.x = lookahead_point[0]
         lookahead_marker.pose.position.y = lookahead_point[1]
-        ### HJ : use actual z from L1 point for 3D visualization
+        # use actual z from L1 point for 3D visualization
         lookahead_marker.pose.position.z = lookahead_point[2] if len(lookahead_point) > 2 else 0
 
         lookahead_marker.pose.orientation.x = 0
@@ -884,7 +841,7 @@ class Controller_manager:
         future_position_marker.color.a = 1.0
         future_position_marker.pose.position.x = future_position[0,0]
         future_position_marker.pose.position.y = future_position[0,1]
-        ### HJ : use spline-interpolated z for 3D visualization
+        # use spline-interpolated z for 3D visualization
         future_position_marker.pose.position.z = self.controller.future_position_z
 
         future_position_marker.pose.orientation.x = quaternions[0]
@@ -911,7 +868,7 @@ class Controller_manager:
         lookahead_marker.color.a = 1.0
         lookahead_marker.pose.position.x = lookahead_point[0]
         lookahead_marker.pose.position.y = lookahead_point[1]
-        ### HJ : use actual z for 3D visualization
+        # use actual z for 3D visualization
         lookahead_marker.pose.position.z = lookahead_point[2] if len(lookahead_point) > 2 else 0
         lookahead_marker.pose.orientation.x = 0
         lookahead_marker.pose.orientation.y = 0
@@ -936,7 +893,7 @@ class Controller_manager:
         opponent_marker.color.b = 0.0
         opponent_marker.color.a = 1.0
         if self.opponent is not None:
-            ### HJ : use 3D cartesian for opponent marker visualization
+            # use 3D cartesian for opponent marker visualization
             pos = self.converter.get_cartesian_3d([self.opponent[0]], [self.opponent[1]])
             opponent_marker.pose.position.x = pos[0]
             opponent_marker.pose.position.y = pos[1]

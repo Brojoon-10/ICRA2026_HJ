@@ -35,11 +35,11 @@ services:
       dockerfile: .docker_utils/Dockerfile.base_x86
     image: base_x86
     
-  base_x86_2nd_car: 
+  base_x86_3d: 
     build: 
       context: .
       dockerfile: .docker_utils/Dockerfile.base_x86
-    image: base_x86_2nd_car
+    image: base_x86_3d
 
   sim_x86:
     build:
@@ -66,7 +66,7 @@ services:
     depends_on:
       - base_x86
       
-  nuc_2nd_car:
+  nuc_3d:
     build:
       context: .
       dockerfile: .docker_utils/Dockerfile.nuc
@@ -74,6 +74,6 @@ services:
         - USER=${USER} 
         - UID=${UID} # user id must be saved to an environment variable, can be done with `export UID=$(id -u)`
         - GID=${GID} # group id must be saved to an environment variable, can be done with `export GID=$(id -g)`
-    image: race_stack_nuc_2nd_car
+    image: race_stack_nuc_3d
     depends_on:
-      - base_x86_2nd_car
+      - base_x86_3d
