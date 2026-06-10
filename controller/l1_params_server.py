@@ -71,6 +71,8 @@ class DynamicControllerConfigServer:
             self.yaml_data["accel_lim_ay_max"] = config.accel_lim_ay_max
             self.yaml_data["accel_lim_horizon"] = config.accel_lim_horizon
             self.yaml_data["accel_lim_lookahead"] = config.accel_lim_lookahead
+            self.yaml_data["accel_lim_activate_speed_thres"] = config.accel_lim_activate_speed_thres
+            self.yaml_data["accel_lim_deactivate_gap_thres"] = config.accel_lim_deactivate_gap_thres
             self.yaml_data["K_yr"] = config.K_yr
             self.yaml_data["K_yr_sat"] = config.K_yr_sat
             self.yaml_data["K_us"] = config.K_us
@@ -150,6 +152,8 @@ class DynamicControllerConfigServer:
             "accel_lim_ay_max": float(yaml_data.get("accel_lim_ay_max", 4.5)),
             "accel_lim_horizon": float(yaml_data.get("accel_lim_horizon", 0.3)),
             "accel_lim_lookahead": float(yaml_data.get("accel_lim_lookahead", 0.3)),
+            "accel_lim_activate_speed_thres": float(yaml_data.get("accel_lim_activate_speed_thres", 2.0)),
+            "accel_lim_deactivate_gap_thres": float(yaml_data.get("accel_lim_deactivate_gap_thres", 1.0)),
             "K_yr": float(yaml_data.get("K_yr", 0.0)),
             "K_yr_sat": float(yaml_data.get("K_yr_sat", 0.05)),
             "K_us": float(yaml_data.get("K_us", 0.0)),
