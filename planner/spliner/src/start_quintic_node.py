@@ -279,6 +279,11 @@ class StartQuinticNode:
         return config
 
     def point_cb(self, msg: PoseStamped):
+        ### HJ : only consume RViz "2D Nav Goal" clicks in VIAPOINTS mode.
+        ### Other nodes share /move_base_simple/goal; ignore it unless we are
+        ### actively in POINTS mode so we don't accumulate foreign goals.
+        if self.path_mode != 1:
+            return
         q = msg.pose.orientation
         yaw = tft.euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
         self.points.append((float(msg.pose.position.x),
