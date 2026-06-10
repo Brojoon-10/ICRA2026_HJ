@@ -16,7 +16,7 @@ RUN apt-get update && xargs apt-get install -y < /.install_utils/linux_req_car.t
 
 # install python packages
 RUN --mount=type=cache,target=/root/.cache/pip pip3 install -r /.install_utils/requirements.txt && \
-        pip3 install numpy casadi open3d
+        pip3 install numpy casadi open3d pybind11
 
 
 # install catkin build tools
