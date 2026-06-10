@@ -42,12 +42,15 @@ class TopicRelay:
                 continue
 
             try:
-                pub = rospy.Publisher(out_topic, msg_class, queue_size=1, latch=latch)
+                ### HJ : bump queue for heavy PointCloud2 only, so RViz over WiFi drops fewer frames.
+                ### Other (markers/grids) stay at 1. Relay is viz-only -> no effect on control loop.
+                q = 2 if msg_type_str == "sensor_msgs/PointCloud2" else 1
+                pub = rospy.Publisher(out_topic, msg_class, queue_size=q, latch=latch)
                 sub = rospy.Subscriber(
                     in_topic,
                     msg_class,
                     self.make_callback(pub),
-                    queue_size=1,
+                    queue_size=q,
                     tcp_nodelay=True
                 )
                 self.relay_list.append((sub, pub))
