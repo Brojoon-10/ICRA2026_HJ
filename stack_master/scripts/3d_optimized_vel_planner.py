@@ -100,6 +100,9 @@ def _read_friction_sectors():
                 'start': int(rospy.get_param(f'/friction_map_params/Sector{i}/start', 0)),
                 'end':   int(rospy.get_param(f'/friction_map_params/Sector{i}/end', 0)),
                 'friction': float(rospy.get_param(f'/friction_map_params/Sector{i}/friction', -1.0)),
+                ## IY 0603 : raceline-s (m) bounds for real arclen sector->grid mapping
+                's_start': float(rospy.get_param(f'/friction_map_params/Sector{i}/s_start', -1.0)),
+                's_end':   float(rospy.get_param(f'/friction_map_params/Sector{i}/s_end', -1.0)),
                 ### IY : per-sector mu_scale_x / mu_scale_y on top of sector mu.
                 ###      Default 1.0 if not set ⇒ legacy isotropic behavior.
                 'mu_scale_x': float(rospy.get_param(f'/friction_map_params/Sector{i}/mu_scale_x', 1.0)),
@@ -520,6 +523,148 @@ def build_and_solve(track, gg, vehicle_params,
     return V_opt, ax_opt, laptime, success
 
 
+## IY 0603 : same-ruler NLP on the raceline grid (kappa from wpnts, 1:1 output).
+##   no banking: ay=V^2*kappa, ax_tilde=ax-g*sin(mu), g_tilde=g*cos(mu)-V^2*dmu_ds.
+def build_and_solve_rl(s_grid, kappa_arr, mu_arr, gg, vehicle_params,
+                       v_init, ax_init,
+                       w_T=1.0, w_jx=1e-2, V_min=0.0, RK4_steps=1, sol_opt=None,
+                       mu_scale_x_k=None, mu_scale_y_k=None,
+                       w_jx_acc=None, w_jx_brk=None,
+                       w_jx_curv_alpha_acc=0.0, w_jx_curv_alpha_brk=0.0,
+                       w_jx_curv_k_alpha=0.2,
+                       w_jx_curv_beta_acc=0.0, w_jx_curv_beta_brk=0.0,
+                       w_jx_curv_k_beta=0.5,
+                       w_ax_corner_acc=0.0, w_ax_corner_k=0.2):
+    G = 9.81
+    if w_jx_acc is None:
+        w_jx_acc = w_jx
+    if w_jx_brk is None:
+        w_jx_brk = w_jx
+    N = s_grid.size
+    ds = float(np.mean(np.diff(s_grid)))
+    V_max_gg = float(gg.V_max)
+
+    def concat_arr(a):
+        return np.concatenate((a, a[1:], a[1:]))
+    s_aug = np.concatenate((s_grid, s_grid[-1] + s_grid[1:], 2 * s_grid[-1] + s_grid[1:]))
+    dmu_arr = np.gradient(mu_arr, ds)
+    dkappa_arr = np.gradient(kappa_arr, ds)
+    kappa_fn = ca.interpolant('kappa', 'linear', [s_aug], concat_arr(kappa_arr))
+    dkappa_fn = ca.interpolant('dkappa', 'linear', [s_aug], concat_arr(dkappa_arr))
+
+    # dynamics: s_dot = V (integrate along raceline arc length)
+    V = ca.MX.sym('V'); ax = ca.MX.sym('ax')
+    x = ca.vertcat(V, ax); nx_ = 2
+    jx = ca.MX.sym('jx'); u = jx; nu_ = 1
+    s_sym = ca.MX.sym('s')
+    s_dot = V
+    dV = ax / s_dot
+    dax = jx / s_dot
+    dx = ca.vertcat(dV, dax)
+    L_t = w_T * 1.0 / s_dot
+    kap_s = kappa_fn(s_sym)
+    dkap_s = dkappa_fn(s_sym)
+    omega_term  = ca.tanh(ca.fabs(kap_s)  / w_jx_curv_k_alpha)
+    domega_term = ca.tanh(ca.fabs(dkap_s) / w_jx_curv_k_beta)
+    weight_acc = 1.0 + w_jx_curv_alpha_acc * omega_term + w_jx_curv_beta_acc * domega_term
+    weight_brk = 1.0 + w_jx_curv_alpha_brk * omega_term + w_jx_curv_beta_brk * domega_term
+    jx_pos = ca.fmax(jx, 0.0); jx_neg = ca.fmax(-jx, 0.0)
+    L_reg = (weight_acc * w_jx_acc * jx_pos ** 2
+           + weight_brk * w_jx_brk * jx_neg ** 2) / (s_dot ** 2)
+    ax_corner_term = ca.tanh(ca.fabs(kap_s) / w_ax_corner_k)
+    ax_pos = ca.fmax(ax, 0.0)
+    w_T_corner = max(float(w_T), 1e-6)
+    L_reg = L_reg + w_T_corner * w_ax_corner_acc * ax_corner_term * (ax_pos ** 2) / (s_dot ** 2)
+
+    M = RK4_steps; ds_rk = ds / M
+    f = ca.Function('f', [x, u, s_sym], [dx, L_t, L_reg])
+    X0 = ca.MX.sym('X0', nx_); U = ca.MX.sym('U', nu_); S0 = ca.MX.sym('S0')
+    X = X0; S = S0; Q_t = 0; Q_reg = 0
+    for j in range(M):
+        k1, k1t, k1r = f(X, U, S)
+        k2, k2t, k2r = f(X + ds_rk/2 * k1, U, S + ds_rk/2)
+        k3, k3t, k3r = f(X + ds_rk/2 * k2, U, S + ds_rk/2)
+        k4, k4t, k4r = f(X + ds_rk * k3, U, S + ds_rk)
+        X = X + ds_rk/6 * (k1 + 2*k2 + 2*k3 + k4)
+        Q_t = Q_t + ds_rk/6 * (k1t + 2*k2t + 2*k3t + k4t)
+        Q_reg = Q_reg + ds_rk/6 * (k1r + 2*k2r + 2*k3r + k4r)
+        S = S + ds_rk
+    F = ca.Function('F', [X0, U, S0], [X, Q_t, Q_reg], ['x0','u','s0'], ['xf','q_t','q_reg'])
+
+    w=[]; w0=[]; lbw=[]; ubw=[]; J_t=0.0; J_reg=0.0; g=[]; lbg=[]; ubg=[]
+    Xk = ca.MX.sym('X0', nx_)
+    w += [Xk]; lbw += [V_min, -np.inf]; ubw += [V_max_gg, np.inf]
+    w0 += [max(float(v_init[0]), max(V_min, 0.5)), float(ax_init[0])]
+    for k in range(N):
+        s_k = k * ds
+        kap_k = float(kappa_arr[k]); mu_k = float(mu_arr[k]); dmu_k = float(dmu_arr[k])
+        Vk = Xk[0]
+        ay_k = Vk * Vk * kap_k
+        axt_k = Xk[1] - G * np.sin(mu_k)
+        ayt_k = ay_k
+        gt_k = ca.fmax(G * np.cos(mu_k) - Vk * Vk * dmu_k, 0.0)
+        gg_exp, ax_min, ax_max, ay_max = ca.vertsplit(
+            gg.acc_interpolator(ca.vertcat(Vk, gt_k)))
+        if mu_scale_x_k is not None or mu_scale_y_k is not None:
+            sx = float(mu_scale_x_k[k]) if mu_scale_x_k is not None else 1.0
+            sy = float(mu_scale_y_k[k]) if mu_scale_y_k is not None else 1.0
+            ax_max = ax_max * sx; ay_max = ay_max * sy; ax_min = ax_min * sx
+        g += [ay_max - ca.fabs(ayt_k)]; lbg += [0.0]; ubg += [np.inf]
+        g += [ca.fabs(ax_min) * ca.power(
+            ca.fmax(1.0 - ca.power(ca.fmin(ca.fabs(ayt_k) / ay_max, 1.0), gg_exp), 1e-3),
+            1.0 / gg_exp) - ca.fabs(axt_k)]
+        lbg += [0.0]; ubg += [np.inf]
+        g += [ax_max - axt_k]; lbg += [0.0]; ubg += [np.inf]
+        if k == N - 1:
+            break
+        Uk = ca.MX.sym('U_' + str(k), nu_)
+        w += [Uk]; lbw += [-np.inf] * nu_; ubw += [np.inf] * nu_; w0 += [0.0] * nu_
+        Fk = F(x0=Xk, u=Uk, s0=s_k)
+        Xk_end = Fk['xf']; J_t = J_t + Fk['q_t']; J_reg = J_reg + Fk['q_reg']
+        Xk = ca.MX.sym('X_' + str(k+1), nx_)
+        w += [Xk]; lbw += [V_min, -np.inf]; ubw += [V_max_gg, np.inf]
+        w0 += [max(float(v_init[k+1]), max(V_min, 0.5)), float(ax_init[k+1])]
+        g += [Xk_end - Xk]; lbg += [0.0] * nx_; ubg += [0.0] * nx_
+    g += [w[0] - Xk]; lbg += [0.0] * nx_; ubg += [0.0] * nx_
+
+    w_vec = ca.vertcat(*w); g_vec = ca.vertcat(*g)
+    w0_vec = ca.vertcat(*w0); lbw_vec = ca.vertcat(*lbw); ubw_vec = ca.vertcat(*ubw)
+    lbg_vec = ca.vertcat(*lbg); ubg_vec = ca.vertcat(*ubg)
+    if sol_opt is None:
+        sol_opt = {
+            'ipopt.max_iter': 100,
+            'ipopt.hessian_approximation': 'limited-memory',
+            'ipopt.line_search_method': 'cg-penalty',
+            'ipopt.tol': 1e-4, 'ipopt.dual_inf_tol': 1e-1,
+            'ipopt.constr_viol_tol': 1e-4, 'ipopt.compl_inf_tol': 1e-4,
+            'ipopt.acceptable_tol': 1e-3, 'ipopt.acceptable_dual_inf_tol': 5.0,
+            'ipopt.acceptable_constr_viol_tol': 1e-3, 'ipopt.acceptable_iter': 10,
+            'ipopt.linear_solver': _LINEAR_SOLVER,
+        }
+    sol_opt = dict(sol_opt)
+    sol_opt.setdefault('print_time', 0)
+    sol_opt.setdefault('ipopt.print_level', 5)
+    nlp = {'f': J_t + J_reg, 'x': w_vec, 'g': g_vec}
+    rospy.loginfo(f'[velopt-rl] NLP: {int(w_vec.shape[0])} vars, '
+                  f'{int(g_vec.shape[0])} constraints, {N} points')
+    solver = ca.nlpsol('solver', 'ipopt', nlp, sol_opt)
+    t_solve = time.time()
+    sol = solver(x0=w0_vec, lbx=lbw_vec, ubx=ubw_vec, lbg=lbg_vec, ubg=ubg_vec)
+    t_solve = time.time() - t_solve
+    J_t_val = float(ca.Function('f_Jt', [w_vec], [J_t])(sol['x']))
+    laptime = J_t_val / max(float(w_T), 1e-6)
+    success = solver.stats()['success']
+    rospy.loginfo(f'[velopt-rl] IPOPT: {t_solve:.2f}s, success={success}, '
+                  f'laptime={laptime:.4f}s')
+    sol_x = np.array(sol['x']).flatten(); stride = nx_ + nu_
+    V_opt = np.zeros(N); ax_opt = np.zeros(N)
+    for k in range(N):
+        off = k * stride
+        V_opt[k] = sol_x[off]; ax_opt[k] = sol_x[off + 1]
+    return V_opt, ax_opt, laptime, success
+## IY 0603 : end
+
+
 class VelOptNode:
 
     def __init__(self, map_name, raceline_variant, vehicle_yml_file, gg_dir_name,
@@ -664,6 +809,24 @@ class VelOptNode:
         with open(self.vehicle_yml) as _f:
             _full_params = yaml.safe_load(_f)
         _base_p_Dx_1 = _full_params.get('tire_params', {}).get('p_Dx_1', 0.56)
+
+        ## IY 0603 : load fixed path + build arclen remap BEFORE friction, so the
+        ##           friction sector->grid mapping reuses the same real arclen map.
+        rl = pd.read_csv(self.raceline_csv)
+        s_rl = rl['s_opt'].to_numpy()
+        n_rl = rl['n_opt'].to_numpy()
+        chi_rl = rl['chi_opt'].to_numpy()
+        v_rl = rl['v_opt'].to_numpy() if 'v_opt' in rl.columns else None
+        ax_rl = rl['ax_opt'].to_numpy() if 'ax_opt' in rl.columns else None
+        s_period = s_rl[-1] + (s_rl[-1] - s_rl[-2])
+        s_q = self.track.s % s_period
+        self.n_fixed = np.interp(s_q, s_rl, n_rl)
+        self.chi_fixed = np.interp(s_q, s_rl, np.unwrap(chi_rl))
+        self.v_init = np.interp(s_q, s_rl, v_rl) if v_rl is not None else np.full_like(self.track.s, 3.0)
+        self.ax_init = np.interp(s_q, s_rl, ax_rl) if ax_rl is not None else np.zeros_like(self.track.s)
+        self._build_raceline_arclen_map()
+        ## IY 0603 : end
+
         friction_sectors = _read_friction_sectors()
         ### HJ : when per-point friction scaling is on, skip multi-GGV
         ###      directory lookup entirely (avoid double-application). Sector
@@ -704,10 +867,13 @@ class VelOptNode:
                 total_original = max(s['end'] for s in valid) + 1
                 for sec in valid:
                     ratio = sec['friction'] / max(_base_p_Dx_1, 1e-6)
-                    grid_start = int(round(sec['start'] / total_original * n_grid))
-                    grid_end   = int(round((sec['end'] + 1) / total_original * n_grid))
-                    grid_start = max(0, min(grid_start, n_grid - 1))
-                    grid_end   = max(0, min(grid_end, n_grid))
+                    ## IY 0603 : real arclen sector->grid (was proportional idx below)
+                    # grid_start = int(round(sec['start'] / total_original * n_grid))
+                    # grid_end   = int(round((sec['end'] + 1) / total_original * n_grid))
+                    # grid_start = max(0, min(grid_start, n_grid - 1))
+                    # grid_end   = max(0, min(grid_end, n_grid))
+                    grid_start, grid_end = self._sector_grid_range(sec, n_grid, total_original)
+                    ## IY 0603 : end
                     self.mu_scale_k[grid_start:grid_end] = ratio
                     ### IY : fill per-sector x/y scale in the same grid range
                     self.mu_scale_x_k[grid_start:grid_end] = float(sec.get('mu_scale_x', 1.0))
@@ -729,27 +895,93 @@ class VelOptNode:
         ### HJ : end
         ## IY(0416) : end
 
-        # Load fixed path (n_opt, chi_opt) + warm-start v/ax from timeoptimal csv
-        rl = pd.read_csv(self.raceline_csv)
-        s_rl = rl['s_opt'].to_numpy()
-        n_rl = rl['n_opt'].to_numpy()
-        chi_rl = rl['chi_opt'].to_numpy()
-        v_rl = rl['v_opt'].to_numpy() if 'v_opt' in rl.columns else None
-        ax_rl = rl['ax_opt'].to_numpy() if 'ax_opt' in rl.columns else None
-
-        s_period = s_rl[-1] + (s_rl[-1] - s_rl[-2])
-        s_q = self.track.s % s_period
-        self.n_fixed = np.interp(s_q, s_rl, n_rl)
-        self.chi_fixed = np.interp(s_q, s_rl, np.unwrap(chi_rl))
-        self.v_init = np.interp(s_q, s_rl, v_rl) if v_rl is not None else np.full_like(self.track.s, 3.0)
-        self.ax_init = np.interp(s_q, s_rl, ax_rl) if ax_rl is not None else np.zeros_like(self.track.s)
+        ## IY 0603 : block below moved above (before friction). Kept as comment.
+        # # Load fixed path (n_opt, chi_opt) + warm-start v/ax from timeoptimal csv
+        # rl = pd.read_csv(self.raceline_csv)
+        # s_rl = rl['s_opt'].to_numpy()
+        # n_rl = rl['n_opt'].to_numpy()
+        # chi_rl = rl['chi_opt'].to_numpy()
+        # v_rl = rl['v_opt'].to_numpy() if 'v_opt' in rl.columns else None
+        # ax_rl = rl['ax_opt'].to_numpy() if 'ax_opt' in rl.columns else None
+        #
+        # s_period = s_rl[-1] + (s_rl[-1] - s_rl[-2])
+        # s_q = self.track.s % s_period
+        # self.n_fixed = np.interp(s_q, s_rl, n_rl)
+        # self.chi_fixed = np.interp(s_q, s_rl, np.unwrap(chi_rl))
+        # self.v_init = np.interp(s_q, s_rl, v_rl) if v_rl is not None else np.full_like(self.track.s, 3.0)
+        # self.ax_init = np.interp(s_q, s_rl, ax_rl) if ax_rl is not None else np.zeros_like(self.track.s)
+        #
+        # self._build_raceline_arclen_map()
+        ## IY 0603 : end
 
         rospy.loginfo(f'[velopt] Track3D + GGManager + raceline ready, grid={self.track.s.size} pts')
         rospy.loginfo(f'[velopt] fixed n  : [{self.n_fixed.min():.3f}, {self.n_fixed.max():.3f}] m')
         rospy.loginfo(f'[velopt] fixed chi: [{self.chi_fixed.min():.3f}, {self.chi_fixed.max():.3f}] rad')
 
-        self._solve_once()
+        ## IY 0603 : same-ruler solve on raceline grid (was centerline _solve_once)
+        # self._solve_once()
+        self._solve_once_rl()
+        ## IY 0603 : end
     ## IY : end
+
+    def _solve_once_rl(self):
+        """Same-ruler solve: NLP on the raceline grid from /global_waypoints."""
+        rospy.loginfo('[velopt-rl] waiting for /global_waypoints template ...')
+        msg = rospy.wait_for_message('/global_waypoints', WpntArray)
+        wp = msg.wpnts
+        s_wp  = np.array([p.s_m for p in wp], dtype=float)
+        kap_wp = np.array([p.kappa_radpm for p in wp], dtype=float)
+        mu_wp  = np.array([p.mu_rad for p in wp], dtype=float)
+        vx_wp  = np.array([p.vx_mps for p in wp], dtype=float)
+        ax_wp  = np.array([p.ax_mps2 for p in wp], dtype=float)
+        L = s_wp[-1] + (s_wp[-1] - s_wp[-2])
+        N = max(10, int(round(L / self.step_size_opt)))
+        s_grid = np.linspace(0.0, L, N, endpoint=False)
+        ds_rl = L / N
+        kappa_arr = np.interp(s_grid, s_wp, kap_wp, period=L)
+        mu_arr = np.interp(s_grid, s_wp, mu_wp, period=L)
+        # smooth mu (periodic moving avg) to stabilise dmu/ds (crest/dip term)
+        win = max(3, int(round(1.5 / ds_rl)) | 1)
+        ker = np.ones(win) / win
+        pad = np.concatenate([mu_arr[-win:], mu_arr, mu_arr[:win]])
+        mu_arr = np.convolve(pad, ker, 'same')[win:-win]
+        v_init = np.clip(np.interp(s_grid, s_wp, vx_wp, period=L), max(self.V_min, 0.5), None)
+        ax_init = np.interp(s_grid, s_wp, ax_wp, period=L)
+
+        # friction sectors -> mu_scale on raceline grid (1:1 via s_start/s_end)
+        mu_scale_x_k = mu_scale_y_k = None
+        if self.use_friction_scaling:
+            valid = [s for s in _read_friction_sectors() if s['friction'] > 0]
+            if valid:
+                mu_scale_x_k = np.ones(N); mu_scale_y_k = np.ones(N)
+                for sec in valid:
+                    s0, s1 = sec.get('s_start', -1.0), sec.get('s_end', -1.0)
+                    if s0 < 0 or s1 < 0:
+                        continue
+                    gs = max(0, min(int(round(s0 / ds_rl)), N - 1))
+                    ge = max(0, min(int(round(s1 / ds_rl)) + 1, N))
+                    mu_scale_x_k[gs:ge] = float(sec.get('mu_scale_x', 1.0))
+                    mu_scale_y_k[gs:ge] = float(sec.get('mu_scale_y', 1.0))
+                rospy.loginfo(f'[velopt-rl] friction mu_scale_x '
+                              f'[{mu_scale_x_k.min():.3f},{mu_scale_x_k.max():.3f}]')
+
+        self.s_grid_rl = s_grid
+        self.V_opt, self.ax_opt, laptime, success = build_and_solve_rl(
+            s_grid, kappa_arr, mu_arr, self.gg, self.vehicle_params,
+            v_init, ax_init,
+            w_T=self.w_T, w_jx=self.w_jx, V_min=self.V_min,
+            mu_scale_x_k=mu_scale_x_k, mu_scale_y_k=mu_scale_y_k,
+            w_jx_acc=self.w_jx_acc, w_jx_brk=self.w_jx_brk,
+            w_jx_curv_alpha_acc=self.w_jx_curv_alpha_acc,
+            w_jx_curv_alpha_brk=self.w_jx_curv_alpha_brk,
+            w_jx_curv_k_alpha=self.w_jx_curv_k_alpha,
+            w_jx_curv_beta_acc=self.w_jx_curv_beta_acc,
+            w_jx_curv_beta_brk=self.w_jx_curv_beta_brk,
+            w_jx_curv_k_beta=self.w_jx_curv_k_beta,
+            w_ax_corner_acc=self.w_ax_corner_acc,
+            w_ax_corner_k=self.w_ax_corner_k)
+        rospy.loginfo(f'[velopt-rl] solved: laptime={laptime:.3f}s '
+                      f'V[{self.V_opt.min():.2f},{self.V_opt.max():.2f}] success={success}')
 
     def _solve_once(self):
         """Run the reduced-state NLP once using csv-based fixed path."""
@@ -809,24 +1041,62 @@ class VelOptNode:
             self._publish_solution(msg)
     ## IY : end
 
+    ## IY 0603 : reconstruct raceline (centerline + n_fixed) on the NLP grid and
+    ##           integrate its cumulative arc length, paired with centerline s.
+    ##           Inverting this maps a wpnt's raceline-s to its true centerline-s.
+    def _build_raceline_arclen_map(self):
+        try:
+            cx = np.asarray(self.track.x, dtype=float)
+            cy = np.asarray(self.track.y, dtype=float)
+            th = np.asarray(self.track.theta, dtype=float)
+            cs = np.asarray(self.track.s, dtype=float)
+            n = np.asarray(self.n_fixed, dtype=float)
+            # raceline xy = centerline + n * left-normal(-sin, cos)
+            rx = cx - n * np.sin(th)
+            ry = cy + n * np.cos(th)
+            seg = np.hypot(np.diff(rx, append=rx[0]), np.diff(ry, append=ry[0]))
+            S_rl = np.concatenate(([0.0], np.cumsum(seg)[:-1]))
+            L_rl = float(S_rl[-1] + seg[-1])
+            self._S_rl_wrap = np.concatenate((S_rl, [L_rl]))          # raceline s
+            self._track_s_wrap = np.concatenate((cs, [cs[-1] + self.track.ds]))  # center s
+            rospy.loginfo(f'[velopt] arclen map: L_raceline={L_rl:.2f}m '
+                          f'L_center={cs[-1] + self.track.ds:.2f}m')
+        except Exception as e:
+            self._S_rl_wrap = None
+            self._track_s_wrap = None
+            rospy.logwarn(f'[velopt] arclen map build failed: {e} -> linear fallback')
+    ## IY 0603 : end
+
+    ## IY 0603 : map a friction sector to NLP grid indices via real raceline
+    ##           arclen (raceline-s -> centerline-s -> grid). Falls back to the
+    ##           legacy proportional-index mapping if s bounds / map unavailable.
+    def _sector_grid_range(self, sec, n_grid, total_original):
+        s0, s1 = sec.get('s_start', -1.0), sec.get('s_end', -1.0)
+        if s0 >= 0.0 and s1 >= 0.0 and getattr(self, '_S_rl_wrap', None) is not None:
+            cs0 = float(np.interp(s0, self._S_rl_wrap, self._track_s_wrap))
+            cs1 = float(np.interp(s1, self._S_rl_wrap, self._track_s_wrap))
+            gs = int(round(cs0 / self.track.ds))
+            ge = int(round(cs1 / self.track.ds)) + 1
+        else:
+            gs = int(round(sec['start'] / total_original * n_grid))
+            ge = int(round((sec['end'] + 1) / total_original * n_grid))
+        return max(0, min(gs, n_grid - 1)), max(0, min(ge, n_grid))
+    ## IY 0603 : end
+
     def _publish_solution(self, msg):
         # Determine the message's own track length (for periodic wrap of our V_opt)
         s_msg = np.array([w.s_m for w in msg.wpnts], dtype=np.float64)
         L_msg = s_msg[-1] + (s_msg[-1] - s_msg[-2])  # total track length from wpnts spacing
 
-        # build PERIODIC interpolation arrays for V_opt and ax_opt.
-        # NLP enforces V[0] == V[N-1] at s = 0 and s = (N-1)*ds.
-        s_nlp_max = self.track.s[-1]
-        ds_nlp = self.track.ds
-        s_wrap = np.concatenate((self.track.s, [s_nlp_max + ds_nlp]))
+        ## IY 0603 : same-ruler — V_opt is on the raceline grid, same ruler as the
+        ##           wpnts, so map 1:1 by raceline-s (no remap, no corner shift).
+        ds_rl = self.s_grid_rl[1] - self.s_grid_rl[0]
+        s_wrap = np.concatenate((self.s_grid_rl, [self.s_grid_rl[-1] + ds_rl]))
         V_wrap = np.concatenate((self.V_opt, [self.V_opt[0]]))
         ax_wrap = np.concatenate((self.ax_opt, [self.ax_opt[0]]))
-
-        scale = (s_nlp_max + ds_nlp) / L_msg
-        s_query = s_msg * scale
-
-        V_out = np.interp(s_query, s_wrap, V_wrap)
-        ax_out = np.interp(s_query, s_wrap, ax_wrap)
+        V_out = np.interp(s_msg, s_wrap, V_wrap)
+        ax_out = np.interp(s_msg, s_wrap, ax_wrap)
+        ## IY 0603 : end
 
         out = WpntArray()
         out.header = msg.header
@@ -850,7 +1120,7 @@ class VelOptNode:
 
         self.pub.publish(out)
         rospy.loginfo(f'[velopt] published /global_waypoints '
-                      f'(msg L={L_msg:.2f}m, NLP L={s_nlp_max + ds_nlp:.2f}m, '
+                      f'(msg L={L_msg:.2f}m, grid L={s_wrap[-1]:.2f}m, '
                       f'V[0]={V_out[0]:.2f}, V[-1]={V_out[-1]:.2f})')
     ## IY : end
 
