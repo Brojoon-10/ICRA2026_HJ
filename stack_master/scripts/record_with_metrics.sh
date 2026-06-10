@@ -36,12 +36,18 @@ ROSBAG_LOG="$RUN_DIR/rosbag.log"
 # Built from analysis of bag/2026-05-08-14-22-32.bag (HJ_docs/debug/...).
 case "$PROFILE" in
   light|overtake)
-    # Drop: /relay/* duplicates, all PointCloud2 (lidar/camera/glim_ros), gazebo,
-    #       camera, markers (most are RViz-only), parameter_*, joint_states, blink.
+    # Drop: /relay/* duplicates, heavy PointCloud2 (lidar/camera/aligned), gazebo,
+    #       camera, RViz-only markers, parameter_*, joint_states, blink.
     # Keep: VESC, car_state, glim_ros base_odom (control-essential), state_machine,
     #       behavior_strategy, local/global waypoint bodies, planner/{avoidance,recovery,start_wpnts}
     #       bodies, mpc_auto/*, opponent_prediction body topics, lap, joy, tf, rosout.
-    EXCLUDE='(/relay/.*|/.*_corrected|/.*/raw_aligned_points.*|/rslidar_points|/rslidar_imu_data|/livox/(lidar|imu)|/glim_ros/(points|aligned_points|prior_map|raw_aligned_points)|/pcd_map|/camera/.*|/gazebo/.*|/clock|/joint_states|/unicorn/.*|.*/markers|.*_marker|.*/parameter_(descriptions|updates)|/rosout_agg|/.*/update_full|/.*/update|/opponent_predict/(beginn|end)|/opponent_prediction_markerarray|/blink1/blink|/diagnostics)'
+    ### HJ : keep prior_map (latched, once), odom_corrected, lookahead, lap_*, mux vesc cmds
+    #   - prior_map kept (NOT mini): /glim_ros/prior_map is latched -> recorded once in run_0.bag
+    #   - odom_corrected kept: only the heavy *aligned_points*_corrected clouds are dropped,
+    #     not /glim_ros/odom_corrected (was previously killed by the broad /.*_corrected rule)
+    #   - lap_marker kept: narrowed /.*_marker so it no longer eats /lap_marker / /lap_marker_array
+    #   - lookahead_point + vesc high_level(nav_1) + low_level output pass through -a (not excluded)
+    EXCLUDE='(/relay/.*|/.*aligned_points.*_corrected|/.*/raw_aligned_points.*|/rslidar_points|/rslidar_imu_data|/livox/(lidar|imu)|/glim_ros/(points|aligned_points|mini_prior_map|raw_aligned_points)|/pcd_map|/camera/.*|/gazebo/.*|/clock|/joint_states|/unicorn/.*|.*/markers|/opponent_prediction_markerarray|.*/parameter_(descriptions|updates)|/rosout_agg|/.*/update_full|/.*/update|/opponent_predict/(beginn|end)|/blink1/blink|/diagnostics)'
     ;;
   slam)
     # Keep one lidar (rslidar_points) + one corrected aligned cloud for SLAM debugging.
